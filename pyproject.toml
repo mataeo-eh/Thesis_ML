@@ -1,5 +1,10 @@
 # pyproject.toml — package metadata and build configuration for Thesis_ML.
 # Uses a "src layout": the importable package lives under src/thesis_ml.
+#
+# Managed with uv: `uv sync` creates a local .venv and a uv.lock. This repo has
+# no SC2 dependencies, so it targets Python 3.12 (newer than the SC2 repos,
+# which are pinned to 3.11). Capped below 3.13 because PyTorch wheels lag the
+# newest interpreter; raise the cap once torch ships stable 3.13 wheels.
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -10,16 +15,32 @@ name = "thesis_ml"
 version = "0.0.1"
 description = "Thesis-level ML/AI architecture and framing"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Mataeo John Anderson" }]
 
-# Add runtime dependencies here as the architecture takes shape, e.g.:
-#   "numpy", "pandas", "scikit-learn", "torch"
-dependencies = []
+# Baseline ML + deep-learning stack. Extend as the thesis grows with `uv add <pkg>`.
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "scikit-learn>=1.3",
+    "matplotlib>=3.8",
+    "torch>=2.2",       # deep learning; CPU wheels by default on Windows (see note below)
+    "jupyterlab>=4.0",  # notebooks/ directory
+]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# NOTE on PyTorch + CUDA: by default uv installs the CPU build of torch on
+# Windows from PyPI. To use a CUDA build, point uv at the appropriate PyTorch
+# index, e.g. add:
+#   [tool.uv.sources]
+#   torch = { index = "pytorch-cu124" }
+#   [[tool.uv.index]]
+#   name = "pytorch-cu124"
+#   url = "https://download.pytorch.org/whl/cu124"
+#   explicit = true
