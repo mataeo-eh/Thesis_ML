@@ -1,0 +1,31 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Experiment / model artifacts ----
+experiments/runs/
+*.ckpt
+*.pt
+*.pth
+*.h5
+*.onnx
+
+# ---- OS / editor ----
+.DS_Store
+.idea/
+.vscode/

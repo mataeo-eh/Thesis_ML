@@ -1,0 +1,11 @@
+# Ignore all data files (datasets can be large / non-distributable),
+# but keep the directory structure and its README under version control.
+*
+!.gitignore
+!README.md
+!raw/
+!processed/
+raw/*
+processed/*
+!raw/.gitkeep
+!processed/.gitkeep

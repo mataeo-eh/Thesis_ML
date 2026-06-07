@@ -1,0 +1,25 @@
+# pyproject.toml — package metadata and build configuration for Thesis_ML.
+# Uses a "src layout": the importable package lives under src/thesis_ml.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thesis_ml"
+version = "0.0.1"
+description = "Thesis-level ML/AI architecture and framing"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Mataeo John Anderson" }]
+
+# Add runtime dependencies here as the architecture takes shape, e.g.:
+#   "numpy", "pandas", "scikit-learn", "torch"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
