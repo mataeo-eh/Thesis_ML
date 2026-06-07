@@ -35,12 +35,15 @@ dev = ["pytest", "ruff"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# NOTE on PyTorch + CUDA: by default uv installs the CPU build of torch on
-# Windows from PyPI. To use a CUDA build, point uv at the appropriate PyTorch
-# index, e.g. add:
-#   [tool.uv.sources]
-#   torch = { index = "pytorch-cu124" }
-#   [[tool.uv.index]]
-#   name = "pytorch-cu124"
-#   url = "https://download.pytorch.org/whl/cu124"
-#   explicit = true
+# PyTorch CUDA build. By default PyPI ships the CPU-only torch on Windows; the
+# config below pulls the CUDA 12.6 build instead from PyTorch's own index.
+# CUDA 12.6 is compatible with this workstation's NVIDIA RTX 3070 (driver
+# supports CUDA up to 13.1) and is the channel that ships torch 2.12 wheels for
+# Windows + Python 3.12. To change CUDA versions, swap "cu126" in both places.
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true  # only used for packages explicitly routed here (torch)
