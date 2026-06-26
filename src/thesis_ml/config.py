@@ -39,6 +39,8 @@ class ModelConfig:
     layers: int
     heads: int
     ffn: int
+    qk_norm: bool
+    self_conditioning: bool
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,7 @@ class TrainConfig:
     checkpoint_dir: str
     ema_decay: float
     confidence_loss_weight: float
+    self_cond_prob: float
     precision: str
 
 

@@ -23,6 +23,8 @@ def test_valid_config_loads() -> None:
     assert config.model.layers == 16
     assert config.model.heads == 12
     assert config.model.ffn == 4096
+    assert config.model.qk_norm is True
+    assert config.model.self_conditioning is True
     assert config.diffusion.mask_schedule.name == "linear"
     assert config.diffusion.mask_schedule.t_distribution == "uniform"
     assert config.diffusion.mask_schedule.min == 0.0
@@ -66,6 +68,7 @@ def test_valid_config_loads() -> None:
     assert config.train.checkpoint_dir == "checkpoints"
     assert config.train.ema_decay == 0.9999
     assert config.train.confidence_loss_weight == 0.1
+    assert config.train.self_cond_prob == 0.5
     assert config.train.precision == "bf16"
     assert config.sampler.max_steps == 48
     assert config.sampler.temperature.start == 0.8

@@ -59,6 +59,43 @@ def test_training_scores_exactly_masked_canvas_positions(tmp_path: Path) -> None
     assert result.canvas_logits.shape[1] == batch.target_canvas.shape[1]
 
 
+def test_self_conditioning_training_uses_no_grad_estimate_then_grad_pass(tmp_path: Path) -> None:
+    config = replace(
+        _small_config(tmp_path),
+        train=replace(_small_config(tmp_path).train, self_cond_prob=1.0),
+    )
+    torch.manual_seed(61)
+    examples = make_synthetic_examples(config, count=2)
+    batch = next(iter(DataLoader(examples, batch_size=2, shuffle=False, collate_fn=collate_diffusion_examples)))
+    model = CountingDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=61)
+
+    result = loop.compute_batch_loss(batch, fixed_t=1.0)
+
+    assert result.self_conditioning_used is True
+    assert model.forward_records == [(False, False), (True, True)]
+    assert loop.global_step == 0
+    assert loop.optimizer.state_dict()["state"] == {}
+
+
+def test_self_conditioning_off_uses_single_legacy_training_forward(tmp_path: Path) -> None:
+    config = replace(
+        _small_config(tmp_path),
+        model=replace(_small_config(tmp_path).model, self_conditioning=False),
+        train=replace(_small_config(tmp_path).train, self_cond_prob=1.0),
+    )
+    torch.manual_seed(62)
+    examples = make_synthetic_examples(config, count=2)
+    batch = next(iter(DataLoader(examples, batch_size=2, shuffle=False, collate_fn=collate_diffusion_examples)))
+    model = CountingDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=62)
+
+    result = loop.compute_batch_loss(batch, fixed_t=1.0)
+
+    assert result.self_conditioning_used is False
+    assert model.forward_records == [(True, False)]
+
+
 def test_schedule_weighting_uses_inverse_t_not_flat() -> None:
     weights = inverse_t_weights(torch.tensor([0.25, 0.75]), canvas_len=3)
 
@@ -198,6 +235,16 @@ def _loop_and_batch(config: ProjectConfig, *, seed: int) -> tuple[TrainingLoop, 
     batch = next(iter(dataloader))
     model = SC2StrategyDiffusionModel(config, vocab_size=128)
     return TrainingLoop(model=model, config=config, seed=seed), batch
+
+
+class CountingDiffusionModel(SC2StrategyDiffusionModel):
+    def __init__(self, config: ProjectConfig, *, vocab_size: int) -> None:
+        super().__init__(config, vocab_size=vocab_size)
+        self.forward_records: list[tuple[bool, bool]] = []
+
+    def forward(self, *args, canvas_self_conditioning=None, **kwargs):
+        self.forward_records.append((torch.is_grad_enabled(), canvas_self_conditioning is not None))
+        return super().forward(*args, canvas_self_conditioning=canvas_self_conditioning, **kwargs)
 
 
 def _assert_optimizer_states_match(first: dict, second: dict) -> None:

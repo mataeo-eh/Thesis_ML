@@ -24,13 +24,20 @@ class SC2StrategyDiffusionModel(nn.Module):
     def __init__(self, config: ProjectConfig, *, vocab_size: int, dropout: float = 0.0) -> None:
         super().__init__()
         model_config = config.model
-        self.embedding = InputContextEmbedding(vocab_size, model_config.d_model)
+        self.self_conditioning = model_config.self_conditioning
+        # Enabling QK-norm or self-conditioning changes the architecture; pre-009 checkpoints need retraining.
+        self.embedding = InputContextEmbedding(
+            vocab_size,
+            model_config.d_model,
+            self_conditioning=model_config.self_conditioning,
+        )
         self.backbone = BidirectionalTransformer(
             d_model=model_config.d_model,
             layers=model_config.layers,
             heads=model_config.heads,
             ffn_dim=model_config.ffn,
             dropout=dropout,
+            qk_norm=model_config.qk_norm,
         )
         self.output_head = nn.Linear(model_config.d_model, vocab_size, bias=False)
         self._init_weights(model_config.layers)
@@ -43,11 +50,13 @@ class SC2StrategyDiffusionModel(nn.Module):
         input_attention_mask: torch.Tensor | None = None,
         canvas_attention_mask: torch.Tensor | None = None,
         input_records: Sequence[Sequence[TokenRecord]] | None = None,
+        canvas_self_conditioning: torch.Tensor | None = None,
     ) -> ModelOutput:
         embeddings = self.embedding(
             input_token_ids,
             canvas_token_ids,
             input_records=input_records,
+            canvas_self_conditioning=canvas_self_conditioning,
         )
         attention_mask = _combine_attention_masks(
             input_token_ids,
@@ -84,3 +93,9 @@ def _combine_attention_masks(
     if canvas_attention_mask is None:
         canvas_attention_mask = torch.ones_like(canvas_token_ids, dtype=torch.bool)
     return torch.cat([input_attention_mask.to(torch.bool), canvas_attention_mask.to(torch.bool)], dim=1)
+
+
+def canvas_self_conditioning_from_logits(canvas_logits: torch.Tensor) -> torch.Tensor:
+    """Convert prior clean-canvas logits to the shared self-conditioning tensor form."""
+
+    return torch.softmax(canvas_logits.float(), dim=-1).detach()

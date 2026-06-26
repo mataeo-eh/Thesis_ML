@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from thesis_ml.config import ProjectConfig, load_config
 from thesis_ml.data.dataset import (
@@ -11,15 +12,33 @@ from thesis_ml.data.dataset import (
     CLASS_PAD,
 )
 from thesis_ml.model.loss import CanvasCrossEntropyLoss
+from thesis_ml.model import backbone as backbone_module
+from thesis_ml.model.backbone import MultiHeadSelfAttention
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.serialize import TokenRecord
 
 
-def _small_config(*, d_model: int = 32, layers: int = 2, heads: int = 4, ffn: int = 64) -> ProjectConfig:
+def _small_config(
+    *,
+    d_model: int = 32,
+    layers: int = 2,
+    heads: int = 4,
+    ffn: int = 64,
+    qk_norm: bool = True,
+    self_conditioning: bool = True,
+) -> ProjectConfig:
     config = load_config("config/default.yaml")
     return replace(
         config,
-        model=replace(config.model, d_model=d_model, layers=layers, heads=heads, ffn=ffn),
+        model=replace(
+            config.model,
+            d_model=d_model,
+            layers=layers,
+            heads=heads,
+            ffn=ffn,
+            qk_norm=qk_norm,
+            self_conditioning=self_conditioning,
+        ),
     )
 
 
@@ -89,6 +108,81 @@ def test_contextual_encodings_are_input_only() -> None:
     base_full = model.embedding(input_ids, canvas_ids, input_records=base_records)
     changed_full = model.embedding(input_ids, canvas_ids, input_records=changed_records)
     assert torch.allclose(base_full[:, input_ids.shape[1] :], changed_full[:, input_ids.shape[1] :])
+
+
+def test_self_conditioning_adds_to_canvas_only_and_null_is_equivalent() -> None:
+    config = _small_config(layers=1, self_conditioning=True)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    input_ids = torch.tensor([[6, 7, 8]])
+    canvas_ids = torch.tensor([[9, 10, 11]])
+    records = _records(1, 3)
+    conditioning = torch.zeros(1, 3, 128)
+    conditioning[0, :, 12] = 1.0
+
+    base = model.embedding(input_ids, canvas_ids, input_records=records)
+    zero = model.embedding(
+        input_ids,
+        canvas_ids,
+        input_records=records,
+        canvas_self_conditioning=torch.zeros_like(conditioning),
+    )
+    conditioned = model.embedding(
+        input_ids,
+        canvas_ids,
+        input_records=records,
+        canvas_self_conditioning=conditioning,
+    )
+
+    input_len = input_ids.shape[1]
+    assert torch.allclose(base, zero)
+    assert torch.allclose(base[:, :input_len], conditioned[:, :input_len])
+    assert not torch.allclose(base[:, input_len:], conditioned[:, input_len:])
+
+
+def test_qk_norm_is_gated_and_applied_before_rope(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(19)
+    attention = MultiHeadSelfAttention(d_model=32, heads=4, qk_norm=True)
+    seen_rms: list[torch.Tensor] = []
+
+    def spy_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        seen_rms.append(x.pow(2).mean(dim=-1).sqrt().detach())
+        return x
+
+    monkeypatch.setattr(backbone_module, "apply_rope", spy_rope)
+    attention(torch.randn(2, 5, 32))
+
+    assert attention.q_norm is not None
+    assert attention.k_norm is not None
+    assert len(seen_rms) == 2
+    for rms in seen_rms:
+        assert torch.allclose(rms, torch.ones_like(rms), atol=1e-5)
+
+    legacy_attention = MultiHeadSelfAttention(d_model=32, heads=4, qk_norm=False)
+    assert legacy_attention.q_norm is None
+    assert legacy_attention.k_norm is None
+
+
+def test_qk_norm_disabled_matches_legacy_attention_path() -> None:
+    torch.manual_seed(23)
+    attention = MultiHeadSelfAttention(d_model=32, heads=4, qk_norm=False)
+    x = torch.randn(2, 5, 32)
+
+    actual = attention(x)
+
+    batch, seq_len, d_model = x.shape
+    qkv = attention.qkv(x).view(batch, seq_len, 3, attention.heads, attention.head_dim)
+    q, k, v = qkv.unbind(dim=2)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    cos, sin = attention.rope(seq_len, device=x.device, dtype=x.dtype)
+    q = backbone_module.apply_rope(q, cos, sin)
+    k = backbone_module.apply_rope(k, cos, sin)
+    expected = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+    expected = expected.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
+    expected = attention.out(expected)
+
+    assert torch.allclose(actual, expected)
 
 
 def test_loss_is_canvas_only() -> None:

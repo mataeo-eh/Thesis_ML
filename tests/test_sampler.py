@@ -44,6 +44,34 @@ def test_sampler_commits_monotonically_without_remasking() -> None:
     assert output.committed_mask.all()
 
 
+def test_sampler_reuses_self_conditioning_without_extra_model_calls() -> None:
+    config = _small_config(canvas_budget=3, max_steps=3, entropy_bound=0.0)
+    target = torch.tensor([100, 101, END_ID])
+    model = FixedCanvasModel(target, vocab_size=128, top_logit=1.0)
+
+    output = sample_canvas(model, _batch(config), config)
+
+    assert len(model.self_conditioning_inputs) == output.steps
+    assert model.self_conditioning_inputs[0] is None
+    for self_conditioning in model.self_conditioning_inputs[1:]:
+        assert self_conditioning is not None
+        assert self_conditioning.shape == (1, config.data.canvas_budget_tokens, model.vocab_size)
+
+
+def test_sampler_self_conditioning_off_preserves_legacy_call_contract() -> None:
+    config = replace(
+        _small_config(canvas_budget=3, max_steps=3, entropy_bound=0.0),
+        model=replace(_small_config(canvas_budget=3, max_steps=3, entropy_bound=0.0).model, self_conditioning=False),
+    )
+    target = torch.tensor([100, 101, END_ID])
+    model = FixedCanvasModel(target, vocab_size=128, top_logit=1.0)
+
+    output = sample_canvas(model, _batch(config), config)
+
+    assert len(model.self_conditioning_inputs) == output.steps
+    assert model.self_conditioning_inputs == ["missing", "missing", "missing"]
+
+
 def test_sampler_early_stops_and_respects_max_steps() -> None:
     config = _small_config(canvas_budget=5, max_steps=10, entropy_bound=100.0)
     target = torch.tensor([100, DELIMITER_ID, 101, END_ID, PAD_ID])
@@ -103,6 +131,7 @@ class FixedCanvasModel(nn.Module):
         self.register_buffer("target_canvas", target_canvas.clone())
         self.vocab_size = vocab_size
         self.top_logit = top_logit
+        self.self_conditioning_inputs = []
 
     def forward(
         self,
@@ -112,7 +141,12 @@ class FixedCanvasModel(nn.Module):
         input_attention_mask=None,
         canvas_attention_mask=None,
         input_records=None,
+        canvas_self_conditioning="missing",
     ):
+        if isinstance(canvas_self_conditioning, torch.Tensor):
+            self.self_conditioning_inputs.append(canvas_self_conditioning.detach().clone())
+        else:
+            self.self_conditioning_inputs.append(canvas_self_conditioning)
         batch, canvas_len = canvas_token_ids.shape
         input_len = input_token_ids.shape[1]
         logits = torch.zeros(batch, input_len + canvas_len, self.vocab_size, device=canvas_token_ids.device)

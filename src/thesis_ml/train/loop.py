@@ -16,6 +16,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from thesis_ml.config import ProjectConfig
 from thesis_ml.data.collate import DiffusionBatch
 from thesis_ml.model.loss import CanvasCrossEntropyLoss, LossOutput
+from thesis_ml.model.model import canvas_self_conditioning_from_logits
 from thesis_ml.train.corruption import CorruptionOutput, corrupt_batch
 
 
@@ -28,6 +29,7 @@ class BatchLoss:
     corruption: CorruptionOutput
     scored_mask: torch.Tensor
     canvas_logits: torch.Tensor
+    self_conditioning_used: bool
 
 
 @dataclass(frozen=True)
@@ -166,14 +168,31 @@ class TrainingLoop:
             enabled=self.config.train.precision == "bf16" and self.device.type in {"cpu", "cuda"},
         ):
             active_model = self.model if model is None else model
-            output = active_model(
-                input_token_ids=corruption.input_token_ids,
-                canvas_token_ids=corruption.noised_canvas,
-                input_attention_mask=batch.input_attention_mask,
-                canvas_attention_mask=batch.canvas_loss_mask,
-                input_records=batch.input_records,
-            )
             input_len = batch.input_token_ids.shape[1]
+            canvas_self_conditioning = None
+            self_conditioning_used = model is None and self._use_self_conditioning()
+            if self_conditioning_used:
+                with torch.no_grad():
+                    estimate = active_model(
+                        input_token_ids=corruption.input_token_ids,
+                        canvas_token_ids=corruption.noised_canvas,
+                        input_attention_mask=batch.input_attention_mask,
+                        canvas_attention_mask=batch.canvas_loss_mask,
+                        input_records=batch.input_records,
+                    )
+                    canvas_self_conditioning = canvas_self_conditioning_from_logits(
+                        estimate.logits[:, input_len:, :]
+                    )
+            forward_kwargs = {
+                "input_token_ids": corruption.input_token_ids,
+                "canvas_token_ids": corruption.noised_canvas,
+                "input_attention_mask": batch.input_attention_mask,
+                "canvas_attention_mask": batch.canvas_loss_mask,
+                "input_records": batch.input_records,
+            }
+            if self.config.model.self_conditioning:
+                forward_kwargs["canvas_self_conditioning"] = canvas_self_conditioning
+            output = active_model(**forward_kwargs)
             canvas_logits = output.logits[:, input_len:, :]
             loss_output = self.loss_fn(
                 canvas_logits.float(),
@@ -194,6 +213,7 @@ class TrainingLoop:
             corruption=corruption,
             scored_mask=scored_mask,
             canvas_logits=canvas_logits,
+            self_conditioning_used=self_conditioning_used,
         )
 
     @property
@@ -265,6 +285,17 @@ class TrainingLoop:
         if microbatch_tokens <= 0:
             return configured
         return max(configured, math.ceil(target_tokens / microbatch_tokens))
+
+    def _use_self_conditioning(self) -> bool:
+        if not self.config.model.self_conditioning:
+            return False
+        probability = self.config.train.self_cond_prob
+        if probability <= 0.0:
+            return False
+        if probability >= 1.0:
+            return True
+        generator_device = self.device if self.device.type in {"cpu", "cuda"} else torch.device("cpu")
+        return bool(torch.rand((), device=generator_device, generator=self.generator).item() < probability)
 
     def _update_ema(self) -> None:
         decay = self.config.train.ema_decay

@@ -187,6 +187,7 @@ class FixedCanvasModel(nn.Module):
         input_attention_mask=None,
         canvas_attention_mask=None,
         input_records=None,
+        canvas_self_conditioning=None,
     ):
         batch, canvas_len = canvas_token_ids.shape
         input_len = input_token_ids.shape[1]

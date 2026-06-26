@@ -52,8 +52,10 @@ class FourierFeatures(nn.Module):
 class InputContextEmbedding(nn.Module):
     """Shared token embedding with additive contextual fields for input tokens only."""
 
-    def __init__(self, vocab_size: int, d_model: int) -> None:
+    def __init__(self, vocab_size: int, d_model: int, *, self_conditioning: bool = True) -> None:
         super().__init__()
+        self.vocab_size = vocab_size
+        self.self_conditioning = self_conditioning
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.map_fourier = FourierFeatures(input_dim=2)
         self.clock_fourier = FourierFeatures(input_dim=1)
@@ -61,6 +63,7 @@ class InputContextEmbedding(nn.Module):
         self.clock_projection = nn.Linear(self.clock_fourier.output_dim, d_model, bias=False)
         self.stat_projection = nn.Linear(len(STAT_KEYS), d_model, bias=False)
         self.team_embedding = nn.Embedding(3, d_model, padding_idx=0)
+        self.self_cond_projection = nn.Linear(vocab_size, d_model, bias=False) if self_conditioning else None
 
     def forward(
         self,
@@ -68,9 +71,10 @@ class InputContextEmbedding(nn.Module):
         canvas_token_ids: torch.Tensor,
         *,
         input_records: Sequence[Sequence[TokenRecord]] | None = None,
+        canvas_self_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor:
         input_embeddings = self.embed_input(input_token_ids, input_records=input_records)
-        canvas_embeddings = self.embed_canvas(canvas_token_ids)
+        canvas_embeddings = self.embed_canvas(canvas_token_ids, canvas_self_conditioning=canvas_self_conditioning)
         return torch.cat([input_embeddings, canvas_embeddings], dim=1)
 
     def embed_input(
@@ -98,8 +102,23 @@ class InputContextEmbedding(nn.Module):
             + self.team_embedding(team_ids)
         )
 
-    def embed_canvas(self, canvas_token_ids: torch.Tensor) -> torch.Tensor:
-        return self.token_embedding(canvas_token_ids)
+    def embed_canvas(
+        self,
+        canvas_token_ids: torch.Tensor,
+        *,
+        canvas_self_conditioning: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        embeddings = self.token_embedding(canvas_token_ids)
+        if not self.self_conditioning or canvas_self_conditioning is None:
+            return embeddings
+        expected_shape = (*canvas_token_ids.shape, self.vocab_size)
+        if tuple(canvas_self_conditioning.shape) != expected_shape:
+            raise ValueError(
+                "canvas_self_conditioning must have shape "
+                f"{expected_shape}, got {tuple(canvas_self_conditioning.shape)}"
+            )
+        projection = self.self_cond_projection(canvas_self_conditioning.to(dtype=embeddings.dtype))
+        return embeddings + projection
 
 
 def _records_to_tensors(

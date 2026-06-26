@@ -47,16 +47,19 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 class MultiHeadSelfAttention(nn.Module):
     """Vanilla MHA, not GQA."""
 
-    def __init__(self, d_model: int, heads: int, dropout: float = 0.0) -> None:
+    def __init__(self, d_model: int, heads: int, dropout: float = 0.0, *, qk_norm: bool = True) -> None:
         super().__init__()
         if d_model % heads != 0:
             raise ValueError("d_model must be divisible by heads")
         self.heads = heads
         self.head_dim = d_model // heads
+        self.qk_norm = qk_norm
         self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
         self.dropout = dropout
         self.rope = RotaryEmbedding(self.head_dim)
+        self.q_norm = RMSNorm(self.head_dim) if qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim) if qk_norm else None
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         batch, seq_len, d_model = x.shape
@@ -65,6 +68,10 @@ class MultiHeadSelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        if self.qk_norm:
+            # QK-norm can flatten attention; keep copy-class loss visible when toggling it.
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         cos, sin = self.rope(seq_len, device=x.device, dtype=x.dtype)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
@@ -97,10 +104,10 @@ class SwiGLU(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, heads: int, ffn_dim: int, dropout: float = 0.0) -> None:
+    def __init__(self, d_model: int, heads: int, ffn_dim: int, dropout: float = 0.0, *, qk_norm: bool = True) -> None:
         super().__init__()
         self.attn_norm = RMSNorm(d_model)
-        self.attn = MultiHeadSelfAttention(d_model, heads, dropout=dropout)
+        self.attn = MultiHeadSelfAttention(d_model, heads, dropout=dropout, qk_norm=qk_norm)
         self.ffn_norm = RMSNorm(d_model)
         self.ffn = SwiGLU(d_model, ffn_dim)
 
@@ -111,10 +118,19 @@ class TransformerBlock(nn.Module):
 
 
 class BidirectionalTransformer(nn.Module):
-    def __init__(self, d_model: int, layers: int, heads: int, ffn_dim: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        layers: int,
+        heads: int,
+        ffn_dim: int,
+        dropout: float = 0.0,
+        *,
+        qk_norm: bool = True,
+    ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            [TransformerBlock(d_model, heads, ffn_dim, dropout=dropout) for _ in range(layers)]
+            [TransformerBlock(d_model, heads, ffn_dim, dropout=dropout, qk_norm=qk_norm) for _ in range(layers)]
         )
         self.final_norm = RMSNorm(d_model)
 

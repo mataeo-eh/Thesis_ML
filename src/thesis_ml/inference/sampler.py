@@ -11,6 +11,7 @@ from torch import nn
 
 from thesis_ml.config import ProjectConfig
 from thesis_ml.data.collate import DiffusionBatch
+from thesis_ml.model.model import canvas_self_conditioning_from_logits
 from thesis_ml.vocab.special_tokens import MASK_ID
 
 
@@ -58,19 +59,26 @@ def sample_canvas(
         device=active_device,
     )
     committed = torch.zeros_like(canvas, dtype=torch.bool)
+    canvas_self_conditioning: torch.Tensor | None = None
     trace: list[SamplerStep] = []
 
     for step_index in range(config.sampler.max_steps):
         temperature = sampler_temperature(config, step_index)
-        output = model(
-            input_token_ids=input_token_ids,
-            canvas_token_ids=canvas,
-            input_attention_mask=input_attention_mask,
-            canvas_attention_mask=torch.ones_like(canvas, dtype=torch.bool),
-            input_records=batch.input_records,
-        )
-        canvas_logits = output.logits[:, input_token_ids.shape[1] :, :] / temperature
+        forward_kwargs = {
+            "input_token_ids": input_token_ids,
+            "canvas_token_ids": canvas,
+            "input_attention_mask": input_attention_mask,
+            "canvas_attention_mask": torch.ones_like(canvas, dtype=torch.bool),
+            "input_records": batch.input_records,
+        }
+        if config.model.self_conditioning:
+            forward_kwargs["canvas_self_conditioning"] = canvas_self_conditioning
+        output = model(**forward_kwargs)
+        raw_canvas_logits = output.logits[:, input_token_ids.shape[1] :, :]
+        canvas_logits = raw_canvas_logits / temperature
         probs = torch.softmax(canvas_logits, dim=-1)
+        if config.model.self_conditioning:
+            canvas_self_conditioning = canvas_self_conditioning_from_logits(raw_canvas_logits)
         confidence, predicted = probs.max(dim=-1)
         entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
 
