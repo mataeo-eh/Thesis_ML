@@ -1,0 +1,122 @@
+from pathlib import Path
+import sys
+
+import pytest
+import yaml
+
+from thesis_ml.pipeline.acquire_data import CredentialError, run_acquisition
+from thesis_ml.pipeline.storage import StorageResolver, parse_s3_uri
+from thesis_ml.pipeline.train_pipeline import run_training_pipeline
+
+
+def test_master_pipeline_smoke_run_writes_checkpoint_and_resumes(tmp_path: Path) -> None:
+    config_path = _pipeline_config(tmp_path)
+
+    first = run_training_pipeline(config_path)
+    second = run_training_pipeline(config_path)
+
+    checkpoint = tmp_path / "checkpoints" / "last.pt"
+    assert checkpoint.exists()
+    assert first.resumed is False
+    assert second.resumed is True
+    assert second.steps == first.steps
+
+
+def test_storage_resolver_routes_local_and_s3(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    local.mkdir()
+    fake_s3 = FakeS3Client()
+    resolver = StorageResolver(s3_client=fake_s3)
+
+    assert resolver.exists(str(local)) is True
+    assert parse_s3_uri("s3://bucket/path/file.pt").bucket == "bucket"
+    assert resolver.exists("s3://bucket/path/file.pt") is True
+    assert fake_s3.head_calls == [("bucket", "path/file.pt")]
+
+    source = tmp_path / "source.txt"
+    source.write_text("ok", encoding="utf-8")
+    resolver.put_file(source, "s3://bucket/out/source.txt")
+    assert fake_s3.upload_calls == [(str(source), "bucket", "out/source.txt")]
+
+
+def test_pipeline_code_has_no_machine_specific_absolute_paths() -> None:
+    pipeline_dir = Path(__file__).resolve().parents[1] / "src" / "thesis_ml" / "pipeline"
+    text = "\n".join(path.read_text(encoding="utf-8") for path in pipeline_dir.glob("*.py"))
+    forbidden = ("C:\\", "C:/Users", "/Users/", "/home/matae")
+    assert not any(pattern in text for pattern in forbidden)
+
+
+def test_acquisition_entrypoint_runs_standalone_dry_run(tmp_path: Path) -> None:
+    config_path = _pipeline_config(tmp_path, source="local")
+
+    result = run_acquisition(config_path, dry_run=True)
+
+    assert result.dry_run is True
+    assert result.commands
+    assert result.commands[-1][0:2] == ["python", "quickstart.py"]
+
+
+def test_kaggle_credentials_are_required_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = _pipeline_config(tmp_path, source="kaggle")
+    monkeypatch.delenv("KAGGLE_USERNAME", raising=False)
+    monkeypatch.delenv("KAGGLE_KEY", raising=False)
+
+    with pytest.raises(CredentialError, match="KAGGLE_USERNAME"):
+        run_acquisition(config_path, dry_run=True)
+
+    monkeypatch.setenv("KAGGLE_USERNAME", "user")
+    monkeypatch.setenv("KAGGLE_KEY", "secret")
+    result = run_acquisition(config_path, dry_run=True)
+    assert result.commands[0][:4] == ["kaggle", "datasets", "download", "-d"]
+    assert "secret" not in " ".join(result.commands[0])
+
+
+def test_run_documentation_matches_entrypoints() -> None:
+    root = Path(__file__).resolve().parents[1]
+    run_md = (root / "RUN.md").read_text(encoding="utf-8")
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert "uv sync" in run_md
+    assert "uv run thesis-ml-train" in run_md
+    assert "uv run thesis-ml-acquire" in run_md
+    assert 'thesis-ml-train = "thesis_ml.pipeline.train_pipeline:main"' in pyproject
+    assert 'thesis-ml-acquire = "thesis_ml.pipeline.acquire_data:main"' in pyproject
+
+
+class FakeS3Client:
+    def __init__(self) -> None:
+        self.head_calls: list[tuple[str, str]] = []
+        self.upload_calls: list[tuple[str, str, str]] = []
+
+    def head_object(self, *, Bucket: str, Key: str):
+        self.head_calls.append((Bucket, Key))
+        return {}
+
+    def upload_file(self, Filename: str, Bucket: str, Key: str) -> None:
+        self.upload_calls.append((Filename, Bucket, Key))
+
+    def list_objects_v2(self, *, Bucket: str, Prefix: str):
+        return {"Contents": [{"Key": Prefix + "last.pt"}]}
+
+    def download_file(self, Bucket: str, Key: str, Filename: str) -> None:
+        Path(Filename).write_text("downloaded", encoding="utf-8")
+
+
+def _pipeline_config(tmp_path: Path, *, source: str = "local") -> Path:
+    default_config = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
+    raw = yaml.safe_load(default_config.read_text(encoding="utf-8"))
+    raw["storage"]["data_uri"] = str(tmp_path / "data")
+    raw["storage"]["raw_uri"] = str(tmp_path / "raw")
+    raw["storage"]["checkpoint_uri"] = str(tmp_path / "checkpoints")
+    raw["storage"]["log_uri"] = str(tmp_path / "logs")
+    raw["storage"]["local_cache_dir"] = str(tmp_path / "cache")
+    raw["data_source"]["source"] = source
+    raw["data_source"]["extractor_path"] = "."
+    raw["pipeline"]["smoke"] = True
+    raw["pipeline"]["smoke_steps"] = 1
+    raw["pipeline"]["seed"] = 7
+    raw["pipeline"]["batch_size"] = 2
+    raw["train"]["checkpoint_interval"] = 100
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    return config_path

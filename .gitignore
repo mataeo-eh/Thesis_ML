@@ -29,3 +29,5 @@ experiments/runs/
 .DS_Store
 .idea/
 .vscode/
+
+data/*
