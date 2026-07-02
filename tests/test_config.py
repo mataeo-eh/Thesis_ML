@@ -12,19 +12,27 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
 def test_valid_config_loads() -> None:
     config = load_config(DEFAULT_CONFIG)
 
-    assert config.data.sampling_interval_s == 5
-    assert config.data.input_window_timesteps == 60
-    assert config.data.canvas_budget_tokens == 2048
+    assert config.data.sampling_interval_s == 1
+    assert config.data.input_budget_tokens == 4096
+    assert config.data.canvas_budget_tokens == 4096
+    assert config.data.canvas_recon_fraction == 0.5
     assert config.data.within_type_tiebreak == "unit_id"
     assert config.fog.rate_distribution.name == "uniform"
     assert config.fog.rate_distribution.min == 0.0
     assert config.fog.rate_distribution.max == 0.8
-    assert config.model.d_model == 1536
-    assert config.model.layers == 16
-    assert config.model.heads == 12
-    assert config.model.ffn == 4096
+    assert config.model.d_model == 256
+    assert config.model.layers == 10
+    assert config.model.heads == 4
+    assert config.model.ffn == 1024
     assert config.model.qk_norm is True
-    assert config.model.self_conditioning is True
+    assert config.model.self_conditioning is False
+    assert config.model.gradient_checkpointing is False
+    assert config.model.rope_theta == 500000.0
+    assert config.model.rope_scaling.rope_type == "llama3"
+    assert config.model.rope_scaling.factor == 8.0
+    assert config.model.rope_scaling.low_freq_factor == 1.0
+    assert config.model.rope_scaling.high_freq_factor == 4.0
+    assert config.model.rope_scaling.original_max_position_embeddings == 8192
     assert config.diffusion.mask_schedule.name == "linear"
     assert config.diffusion.mask_schedule.t_distribution == "uniform"
     assert config.diffusion.mask_schedule.min == 0.0
@@ -46,8 +54,7 @@ def test_valid_config_loads() -> None:
     assert config.pipeline.smoke is False
     assert config.pipeline.smoke_steps == 2
     assert config.pipeline.seed == 123
-    assert config.pipeline.batch_size == 2
-    assert config.pipeline.examples_per_replay == 1
+    assert config.pipeline.batch_size == 8
     assert config.pipeline.replay_glob == "*.parquet"
     assert config.pipeline.token_dictionary_uri == "data/Token_Dictionary.json"
     assert config.pipeline.perspectives == "p1,p2"
@@ -63,13 +70,18 @@ def test_valid_config_loads() -> None:
     assert config.train.accumulation_steps == 1
     assert config.train.target_effective_batch_tokens == 524288
     assert config.train.max_steps == 100000
+    assert config.train.epochs == 6
+    assert config.train.early_stopping_patience_epochs == 0
+    assert config.train.early_stopping_min_relative_improvement == 0.001
     assert config.train.val_interval == 1000
     assert config.train.checkpoint_interval == 1000
     assert config.train.checkpoint_dir == "checkpoints"
     assert config.train.ema_decay == 0.9999
     assert config.train.confidence_loss_weight == 0.1
-    assert config.train.self_cond_prob == 0.5
+    assert config.train.self_cond_prob == 0.0
     assert config.train.precision == "bf16"
+    assert config.train.require_cuda is False
+    assert config.train.max_cuda_reserved_gb == 0.0
     assert config.sampler.max_steps == 48
     assert config.sampler.temperature.start == 0.8
     assert config.sampler.temperature.end == 0.4
@@ -86,6 +98,33 @@ def test_valid_config_loads() -> None:
     assert config.loss.class_loss_weights.delimiter == 1.0
     assert config.loss.class_loss_weights.end == 1.0
     assert config.loss.class_loss_weights.pad == 1.0
+
+
+def test_local_profiles_extend_default_and_disable_self_conditioning() -> None:
+    root = DEFAULT_CONFIG.parents[1]
+    for name in ("local_overfit.yaml", "local_full.yaml"):
+        config = load_config(root / "configs" / name)
+        assert config.data.sampling_interval_s == 1
+        assert config.data.input_budget_tokens == 4096
+        assert config.data.canvas_budget_tokens == 4096
+        assert config.data.canvas_recon_fraction == 0.5
+        assert config.model.self_conditioning is False
+        assert config.train.self_cond_prob == 0.0
+        assert config.train.require_cuda is True
+
+    overfit = load_config(root / "configs" / "local_overfit.yaml")
+    full = load_config(root / "configs" / "local_full.yaml")
+    assert overfit.pipeline.replay_subset_size == 25
+    assert overfit.pipeline.validation_replay_count == 3
+    assert overfit.pipeline.batch_size == 10
+    assert overfit.pipeline.num_workers == 4
+    assert overfit.pipeline.prefetch_factor == 4
+    assert overfit.train.epochs == 200
+    assert overfit.train.early_stopping_patience_epochs == 15
+    assert overfit.loss.class_loss_weights.pad == 0.2
+    assert overfit.train.max_cuda_reserved_gb == 7.5
+    assert overfit.model.gradient_checkpointing is True
+    assert full.train.epochs == 8
 
 
 def test_unknown_key_is_rejected(tmp_path: Path) -> None:

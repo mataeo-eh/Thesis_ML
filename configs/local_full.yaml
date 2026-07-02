@@ -1,0 +1,44 @@
+extends: ../config/default.yaml
+
+storage:
+  data_uri: ../data/quickstart/parquet
+  checkpoint_uri: checkpoints/local-full
+  log_uri: tests/output/smallTrainingTest
+  local_cache_dir: .pipeline_cache/local-full
+
+data:
+  sampling_interval_s: 1
+  input_budget_tokens: 4096
+  canvas_budget_tokens: 4096
+  canvas_recon_fraction: 0.5
+  tokenized_replay_dir: data/processed/local/tokenized_replays
+  window_manifest_path: data/processed/local/window_manifest.jsonl
+
+pipeline:
+  seed: 2718
+  split_seed: 2718
+  batch_size: 8
+  replay_glob: "*.parquet"
+  num_workers: 3
+  replay_subset_size: 0
+  validation_replay_count: 0
+
+model:
+  d_model: 256
+  layers: 10
+  heads: 4
+  ffn: 1024
+  self_conditioning: false
+
+train:
+  epochs: 8
+  max_steps: 0
+  early_stopping_patience_epochs: 0
+  early_stopping_min_relative_improvement: 0.001
+  accumulation_steps: 1
+  target_effective_batch_tokens: 0
+  checkpoint_interval: 250
+  val_interval: 0
+  self_cond_prob: 0.0
+  precision: bf16
+  require_cuda: true

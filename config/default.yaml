@@ -1,8 +1,11 @@
 data:
-  sampling_interval_s: 5
-  input_window_timesteps: 60
-  canvas_budget_tokens: 2048
+  sampling_interval_s: 1
+  input_budget_tokens: 4096
+  canvas_budget_tokens: 4096
+  canvas_recon_fraction: 0.5
   within_type_tiebreak: unit_id
+  tokenized_replay_dir: data/processed/tokenized_replays
+  window_manifest_path: data/processed/window_manifest.jsonl
 
 fog:
   rate_distribution:
@@ -11,12 +14,20 @@ fog:
     max: 0.8
 
 model:
-  d_model: 1536
-  layers: 16
-  heads: 12
-  ffn: 4096
+  d_model: 256
+  layers: 10
+  heads: 4
+  ffn: 1024
   qk_norm: true
-  self_conditioning: true
+  self_conditioning: false
+  gradient_checkpointing: false
+  rope_theta: 500000.0
+  rope_scaling:
+    rope_type: llama3
+    factor: 8.0
+    low_freq_factor: 1.0
+    high_freq_factor: 4.0
+    original_max_position_embeddings: 8192
 
 diffusion:
   mask_schedule:
@@ -47,11 +58,20 @@ pipeline:
   smoke: false
   smoke_steps: 2
   seed: 123
-  batch_size: 2
-  examples_per_replay: 1
+  batch_size: 8
   replay_glob: "*.parquet"
   token_dictionary_uri: data/Token_Dictionary.json
   perspectives: p1,p2
+  num_workers: 4
+  prefetch_factor: 2
+  cache_ram_fraction: 0.5
+  split_seed: 1234
+  test_fraction: 0.15
+  dev_fraction: 0.10
+  replay_subset_size: 0
+  validation_replay_count: 0
+  preprocess_if_missing: true
+  rebuild_manifest: false
 
 train:
   lr: 0.0003
@@ -66,13 +86,19 @@ train:
   accumulation_steps: 1
   target_effective_batch_tokens: 524288
   max_steps: 100000
+  epochs: 6
+  early_stopping_patience_epochs: 0
+  early_stopping_min_relative_improvement: 0.001
   val_interval: 1000
   checkpoint_interval: 1000
   checkpoint_dir: checkpoints
+  keep_step_checkpoints: false
   ema_decay: 0.9999
   confidence_loss_weight: 0.1
-  self_cond_prob: 0.5
+  self_cond_prob: 0.0
   precision: bf16
+  require_cuda: false
+  max_cuda_reserved_gb: 0.0
 
 sampler:
   max_steps: 48

@@ -23,14 +23,26 @@ class UniformDistributionConfig:
 @dataclass(frozen=True)
 class DataConfig:
     sampling_interval_s: int
-    input_window_timesteps: int
+    input_budget_tokens: int
     canvas_budget_tokens: int
+    canvas_recon_fraction: float
     within_type_tiebreak: str
+    tokenized_replay_dir: str
+    window_manifest_path: str
 
 
 @dataclass(frozen=True)
 class FogConfig:
     rate_distribution: UniformDistributionConfig
+
+
+@dataclass(frozen=True)
+class RopeScalingConfig:
+    rope_type: str
+    factor: float
+    low_freq_factor: float
+    high_freq_factor: float
+    original_max_position_embeddings: int
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,9 @@ class ModelConfig:
     ffn: int
     qk_norm: bool
     self_conditioning: bool
+    gradient_checkpointing: bool
+    rope_theta: float
+    rope_scaling: RopeScalingConfig
 
 
 @dataclass(frozen=True)
@@ -84,10 +99,29 @@ class PipelineConfig:
     smoke_steps: int
     seed: int
     batch_size: int
-    examples_per_replay: int
     replay_glob: str
     token_dictionary_uri: str
     perspectives: str
+    # DataLoader throughput knobs for the real (non-smoke) training pipeline.
+    # num_workers spawns that many background loader processes; prefetch_factor
+    # is how many batches each worker pre-loads ahead of the GPU. Both keep the
+    # GPU from starving while CPU-bound serialization/parsing happens off-thread.
+    num_workers: int
+    prefetch_factor: int
+    # Fraction of total host RAM the per-process replay-frame cache may use,
+    # shared (divided) across DataLoader workers so the aggregate stays bounded.
+    # Prevents loading a hundreds-of-GB dataset fully into memory.
+    cache_ram_fraction: float
+    # Reproducible train/dev/test split over REPLAYS (not windows, to avoid
+    # leakage). split_seed is independent of the training seed so re-seeding a
+    # run does not reshuffle which replays are held out.
+    split_seed: int
+    test_fraction: float
+    dev_fraction: float
+    replay_subset_size: int
+    validation_replay_count: int
+    preprocess_if_missing: bool
+    rebuild_manifest: bool
 
 
 @dataclass(frozen=True)
@@ -104,13 +138,22 @@ class TrainConfig:
     accumulation_steps: int
     target_effective_batch_tokens: int
     max_steps: int
+    epochs: int
+    early_stopping_patience_epochs: int
+    early_stopping_min_relative_improvement: float
     val_interval: int
     checkpoint_interval: int
     checkpoint_dir: str
+    # When False (default), each periodic checkpoint overwrites a single
+    # `last.pt` so disk/S3 usage stays flat over a multi-day run. When True,
+    # every interval also keeps a timestamped `step-N.pt` snapshot.
+    keep_step_checkpoints: bool
     ema_decay: float
     confidence_loss_weight: float
     self_cond_prob: float
     precision: str
+    require_cuda: bool
+    max_cuda_reserved_gb: float
 
 
 @dataclass(frozen=True)
@@ -176,7 +219,28 @@ def load_config(path: str | Path) -> ProjectConfig:
     if not isinstance(raw, dict):
         raise ConfigError("config must be a mapping")
 
+    extends = raw.pop("extends", None)
+    if extends is not None:
+        if not isinstance(extends, str):
+            raise ConfigError("config.extends must be str")
+        base_path = (config_path.parent / extends).resolve()
+        with base_path.open("r", encoding="utf-8") as handle:
+            base_raw = yaml.safe_load(handle)
+        if not isinstance(base_raw, dict):
+            raise ConfigError("extended config must be a mapping")
+        raw = _deep_merge(base_raw, raw)
+
     return _build_dataclass(ProjectConfig, raw, "config")
+
+
+def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _build_dataclass(cls: type[T], raw: Any, path: str) -> T:

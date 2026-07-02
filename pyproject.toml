@@ -17,6 +17,7 @@ dependencies = [
     "boto3>=1.34",
     "kaggle>=1.6",
     "pandas>=2.1",
+    "psutil>=5.9",
     "pyarrow>=12.0",
     "PyYAML>=6.0",
     "torch>=2.2",
@@ -26,6 +27,11 @@ dependencies = [
 thesis-ml-acquire = "thesis_ml.pipeline.acquire_data:main"
 thesis-ml-train = "thesis_ml.pipeline.train_pipeline:main"
 
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4",
@@ -33,3 +39,6 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }

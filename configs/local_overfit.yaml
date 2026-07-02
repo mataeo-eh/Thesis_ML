@@ -1,0 +1,51 @@
+extends: ../config/default.yaml
+
+storage:
+  data_uri: ../data/quickstart/parquet
+  checkpoint_uri: checkpoints/local-overfit
+  log_uri: tests/output/overfit
+  local_cache_dir: .pipeline_cache/local-overfit
+
+data:
+  sampling_interval_s: 1
+  input_budget_tokens: 4096
+  canvas_budget_tokens: 4096
+  canvas_recon_fraction: 0.5
+  tokenized_replay_dir: data/processed/local/tokenized_replays
+  window_manifest_path: data/processed/local/window_manifest.jsonl
+
+pipeline:
+  seed: 1729
+  split_seed: 1729
+  batch_size: 10
+  replay_glob: "*.parquet"
+  num_workers: 4
+  prefetch_factor: 4
+  replay_subset_size: 25
+  validation_replay_count: 3
+
+model:
+  d_model: 256
+  layers: 10
+  heads: 4
+  ffn: 1024
+  self_conditioning: false
+  gradient_checkpointing: true
+
+train:
+  epochs: 200
+  max_steps: 0
+  early_stopping_patience_epochs: 15
+  early_stopping_min_relative_improvement: 0.001
+  accumulation_steps: 1
+  target_effective_batch_tokens: 0
+  checkpoint_interval: 100
+  val_interval: 0
+  self_cond_prob: 0.0
+  precision: bf16
+  require_cuda: true
+  max_cuda_reserved_gb: 7.5
+
+loss:
+  class_loss_weights:
+    pad: 0.2
