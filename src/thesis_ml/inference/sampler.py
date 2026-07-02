@@ -69,7 +69,7 @@ def sample_canvas(
             "canvas_token_ids": canvas,
             "input_attention_mask": input_attention_mask,
             "canvas_attention_mask": torch.ones_like(canvas, dtype=torch.bool),
-            "input_records": batch.input_records,
+            "input_features": batch.input_features,
         }
         if config.model.self_conditioning:
             forward_kwargs["canvas_self_conditioning"] = canvas_self_conditioning

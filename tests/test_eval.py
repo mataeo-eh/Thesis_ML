@@ -7,13 +7,13 @@ import torch
 from torch import nn
 
 from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.dataset import CLASS_DELIMITER, CLASS_ENEMY_FUTURE
+from thesis_ml.data.dataset import CLASS_DELIMITER, CLASS_ENEMY_FUTURE, CLASS_PAD
 from thesis_ml.eval.buildorder import BuildOrderEvent, extract_build_order, extract_build_order_from_frame
 from thesis_ml.eval.harness import evaluate_examples
 from thesis_ml.eval.metrics import compare_build_orders
 from thesis_ml.train.train import make_synthetic_examples
 from thesis_ml.vocab.content_vocab import build_content_vocabulary
-from thesis_ml.vocab.special_tokens import DELIMITER_ID
+from thesis_ml.vocab.special_tokens import DELIMITER_ID, PAD_ID
 
 
 def test_harness_computes_accuracy_f1_on_heldout_examples() -> None:
@@ -129,18 +129,18 @@ def test_metric_correctness_with_tolerance_and_miss() -> None:
     assert metrics.f1 == pytest.approx(4 / 7)
 
 
-def test_truncated_final_timestep_drop_is_symmetric() -> None:
-    config = _small_config(canvas_budget=3)
+def test_boundary_truncated_timesteps_are_not_dropped() -> None:
+    config = _small_config(canvas_budget=4)
     base = make_synthetic_examples(config, count=1)[0]
     truncated = replace(
         base,
-        target_canvas=torch.tensor([100, DELIMITER_ID, 101], dtype=torch.long),
-        class_labels=torch.tensor([CLASS_ENEMY_FUTURE, CLASS_DELIMITER, CLASS_ENEMY_FUTURE], dtype=torch.long),
+        target_canvas=torch.tensor([100, DELIMITER_ID, PAD_ID, PAD_ID], dtype=torch.long),
+        class_labels=torch.tensor([CLASS_ENEMY_FUTURE, CLASS_DELIMITER, CLASS_PAD, CLASS_PAD], dtype=torch.long),
         terminated=False,
         truncated=True,
         canvas_metadata=[],
     )
-    model = FixedCanvasModel(torch.tensor([100, DELIMITER_ID, 102]), vocab_size=128)
+    model = FixedCanvasModel(torch.tensor([100, DELIMITER_ID, PAD_ID, PAD_ID]), vocab_size=128)
 
     report = evaluate_examples(
         model=model,
@@ -149,7 +149,7 @@ def test_truncated_final_timestep_drop_is_symmetric() -> None:
         config=config,
     )
 
-    assert report.examples[0].dropped_final_timestep is True
+    assert report.examples[0].dropped_final_timestep is False
     assert report.examples[0].ground_truth_events == (BuildOrderEvent("synthetic_0", 0),)
     assert report.examples[0].predicted_events == (BuildOrderEvent("synthetic_0", 0),)
     assert report.metrics.accuracy == pytest.approx(1.0)
@@ -187,6 +187,7 @@ class FixedCanvasModel(nn.Module):
         input_attention_mask=None,
         canvas_attention_mask=None,
         input_records=None,
+        input_features=None,
         canvas_self_conditioning=None,
     ):
         batch, canvas_len = canvas_token_ids.shape
@@ -201,7 +202,7 @@ def _small_config(*, canvas_budget: int) -> ProjectConfig:
     config = load_config("config/default.yaml")
     return replace(
         config,
-        data=replace(config.data, input_window_timesteps=4, canvas_budget_tokens=canvas_budget),
+        data=replace(config.data, input_budget_tokens=64, canvas_budget_tokens=canvas_budget),
         model=replace(config.model, d_model=32, layers=1, heads=4, ffn=64),
         sampler=replace(config.sampler, max_steps=4, entropy_bound=100.0),
         eval=replace(config.eval, heldout_split="test", timing_tolerance_buckets=1, fog_rate=0.0),

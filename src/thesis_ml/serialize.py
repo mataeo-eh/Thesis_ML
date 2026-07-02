@@ -76,8 +76,9 @@ def serialize_snapshot(
     vocabulary: ContentVocabulary,
     *,
     perspective_player: str | None = None,
+    entity_groups: tuple[EntityColumnGroup, ...] | None = None,
 ) -> list[TokenRecord]:
-    groups = parse_entity_columns(snapshot.index)
+    groups = entity_groups if entity_groups is not None else parse_entity_columns(snapshot.index)
     records: list[TokenRecord] = []
     for group in groups:
         raw_attributes = _non_null_attributes(snapshot, group)
@@ -132,9 +133,48 @@ def snapshot_content_counts(snapshot: pd.Series) -> dict[str, int]:
         if _non_null_attributes(snapshot, group):
             counts[group.entity_type] = counts.get(group.entity_type, 0) + 1
     for owner in ("p1", "p2"):
-        for upgrade in _parse_upgrades(snapshot.get(f"{owner}_upgrades")):
+        for upgrade in parse_upgrades(snapshot.get(f"{owner}_upgrades")):
             counts[upgrade] = counts.get(upgrade, 0) + 1
     return counts
+
+
+def parse_upgrades(value: Any) -> tuple[str, ...]:
+    """Normalize one parquet upgrade cell into content-token names.
+
+    Extractor generations have stored these cumulative values as Python-literal
+    strings, Arrow/Pandas list-like values, and (in older data) mappings.  Keep
+    the normalization in one public helper so analysis scripts and model
+    serialization count the same upgrade tokens.
+    """
+
+    if value is None:
+        return ()
+
+    parsed = value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        try:
+            parsed = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            parsed = [text]
+    elif isinstance(value, (list, tuple, set)):
+        parsed = value
+    elif hasattr(value, "tolist"):
+        parsed = value.tolist()
+    elif pd.isna(value):
+        return ()
+
+    if not isinstance(parsed, (dict, list, tuple, set)) and pd.isna(parsed):
+        return ()
+    if isinstance(parsed, dict):
+        items = (name for name, enabled in parsed.items() if enabled)
+    elif isinstance(parsed, (list, tuple, set)):
+        items = parsed
+    else:
+        items = (parsed,)
+    return tuple(normalize_content_name(str(item)) for item in items if str(item).strip())
 
 
 def records_to_plain(records: Iterable[TokenRecord]) -> list[dict[str, Any]]:
@@ -187,7 +227,7 @@ def _upgrade_records(
 ) -> list[TokenRecord]:
     records: list[TokenRecord] = []
     for owner in ("p1", "p2"):
-        for upgrade in _parse_upgrades(snapshot.get(f"{owner}_upgrades")):
+        for upgrade in parse_upgrades(snapshot.get(f"{owner}_upgrades")):
             records.append(
                 TokenRecord(
                     token_id=vocabulary.token_id_for(upgrade),
@@ -202,23 +242,6 @@ def _upgrade_records(
                 )
             )
     return records
-
-
-def _parse_upgrades(value: Any) -> tuple[str, ...]:
-    if value is None or pd.isna(value):
-        return ()
-    parsed = value
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return ()
-        try:
-            parsed = ast.literal_eval(text)
-        except (SyntaxError, ValueError):
-            parsed = [text]
-    if isinstance(parsed, (list, tuple, set)):
-        return tuple(normalize_content_name(str(item)) for item in parsed if str(item).strip())
-    return (normalize_content_name(str(parsed)),)
 
 
 def _delimiter_record(snapshot: pd.Series) -> TokenRecord:

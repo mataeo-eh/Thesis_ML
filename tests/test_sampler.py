@@ -92,10 +92,15 @@ def test_decoder_roundtrips_known_canvas_and_flags_invalid() -> None:
     assert decoded.truncated is False
     assert decoded.partial_final_timestep is False
 
-    truncated = decode_canvas([100, DELIMITER_ID, 101], vocab)
+    truncated = decode_canvas([100, DELIMITER_ID, PAD_ID, PAD_ID], vocab)
     assert truncated.validation.valid
     assert truncated.truncated is True
-    assert truncated.partial_final_timestep is True
+    assert truncated.partial_final_timestep is False
+    assert truncated.timesteps == [{"marine": 1}]
+
+    partial = decode_canvas([100, DELIMITER_ID, 101], vocab)
+    assert partial.validation.valid is False
+    assert "boundary" in (partial.validation.diagnosis or "")
 
     invalid = validate_canvas([100, PAD_ID, END_ID])
     assert invalid.valid is False
@@ -141,6 +146,7 @@ class FixedCanvasModel(nn.Module):
         input_attention_mask=None,
         canvas_attention_mask=None,
         input_records=None,
+        input_features=None,
         canvas_self_conditioning="missing",
     ):
         if isinstance(canvas_self_conditioning, torch.Tensor):
@@ -164,8 +170,8 @@ def _small_config(
     config = load_config("config/default.yaml")
     return replace(
         config,
-        data=replace(config.data, input_window_timesteps=4, canvas_budget_tokens=canvas_budget),
-        model=replace(config.model, d_model=32, layers=1, heads=4, ffn=64),
+        data=replace(config.data, input_budget_tokens=64, canvas_budget_tokens=canvas_budget),
+        model=replace(config.model, d_model=32, layers=1, heads=4, ffn=64, self_conditioning=True),
         sampler=replace(
             config.sampler,
             max_steps=max_steps,

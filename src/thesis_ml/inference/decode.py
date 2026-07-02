@@ -50,20 +50,29 @@ def validate_canvas(token_ids: Sequence[int]) -> CanvasValidation:
     except ValueError:
         end_index = None
 
-    if first_pad is not None and end_index is None:
-        return CanvasValidation(False, "[PAD] appears before any [END]", None, False, False)
+    if WIN_ID in token_ids or LOSS_ID in token_ids:
+        return CanvasValidation(False, "outcome token is not valid in pretraining canvas", None, False, False)
+
     if first_pad is not None and end_index is not None and first_pad < end_index:
         return CanvasValidation(False, "[PAD] appears before [END]", end_index, False, False)
+    if first_pad is not None:
+        for index, token_id in enumerate(token_ids[first_pad:], start=first_pad):
+            if token_id != PAD_ID:
+                return CanvasValidation(False, f"non-[PAD] token after padding at position {index}", end_index, False, False)
     if end_index is not None:
+        if first_pad is not None and first_pad != end_index + 1:
+            return CanvasValidation(False, "[END] must be followed immediately by [PAD]", end_index, False, False)
         for index, token_id in enumerate(token_ids[end_index + 1 :], start=end_index + 1):
             if token_id != PAD_ID:
                 return CanvasValidation(False, f"non-[PAD] token after [END] at position {index}", end_index, False, False)
+        if end_index == 0 or token_ids[end_index - 1] != DELIMITER_ID:
+            return CanvasValidation(False, "[END] must follow a complete timestep", end_index, False, False)
         return CanvasValidation(True, None, end_index, False, False)
 
-    if WIN_ID in token_ids or LOSS_ID in token_ids:
-        return CanvasValidation(False, "outcome token is not valid in pretraining canvas", None, False, False)
-    partial = token_ids[-1] != DELIMITER_ID
-    return CanvasValidation(True, None, None, True, partial)
+    active_end = first_pad if first_pad is not None else len(token_ids)
+    if active_end == 0 or token_ids[active_end - 1] != DELIMITER_ID:
+        return CanvasValidation(False, "truncated canvas must end on a timestep boundary", None, True, False)
+    return CanvasValidation(True, None, None, True, False)
 
 
 def decode_canvas(
@@ -75,7 +84,13 @@ def decode_canvas(
         return DecodedCanvas(validation, [], validation.truncated, validation.partial_final_timestep)
 
     names = _id_to_name(vocabulary)
-    active = token_ids if validation.end_index is None else token_ids[: validation.end_index]
+    if validation.end_index is not None:
+        active = token_ids[: validation.end_index]
+    else:
+        try:
+            active = token_ids[: token_ids.index(PAD_ID)]
+        except ValueError:
+            active = token_ids
     timesteps: list[dict[str, int]] = []
     current: dict[str, int] = {}
     for index, token_id in enumerate(active):
@@ -95,8 +110,6 @@ def decode_canvas(
             return DecodedCanvas(invalid, [], invalid.truncated, invalid.partial_final_timestep)
         current[name] = current.get(name, 0) + 1
 
-    if validation.truncated and current:
-        timesteps.append(current)
     return DecodedCanvas(validation, timesteps, validation.truncated, validation.partial_final_timestep)
 
 

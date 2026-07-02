@@ -6,6 +6,7 @@ import pandas as pd
 from thesis_ml.config import load_config
 from thesis_ml.serialize import (
     deserialize_counts,
+    parse_upgrades,
     records_to_plain,
     serialize_snapshot,
     snapshot_content_counts,
@@ -99,3 +100,10 @@ def test_vocabulary_contains_only_allowed_token_identities() -> None:
     )
     for name in names:
         assert all(fragment not in name for fragment in banned_fragments), name
+
+
+def test_upgrade_parser_accepts_current_and_legacy_storage_shapes() -> None:
+    assert parse_upgrades(["Stimpack", "CombatShield"]) == ("stimpack", "combatshield")
+    assert parse_upgrades("['Stimpack']") == ("stimpack",)
+    assert parse_upgrades({"Stimpack": True, "CombatShield": False}) == ("stimpack",)
+    assert parse_upgrades(float("nan")) == ()

@@ -89,10 +89,8 @@ def evaluate_example(
     predicted = decode_canvas(sampled.canvas[0].tolist(), vocabulary)
 
     predicted_timesteps = _timed(predicted.timesteps, example, config)
-    drop_final = bool(example.truncated or predicted.truncated or predicted.partial_final_timestep)
-
-    predicted_events = extract_build_order(predicted_timesteps, drop_final_timestep=drop_final) if predicted.validation.valid else ()
-    truth_events = _ground_truth_events(example, vocabulary, config, drop_final=drop_final)
+    predicted_events = extract_build_order(predicted_timesteps, drop_final_timestep=False) if predicted.validation.valid else ()
+    truth_events = _ground_truth_events(example, vocabulary, config)
     metrics = compare_build_orders(
         predicted_events,
         truth_events,
@@ -103,7 +101,7 @@ def evaluate_example(
         ground_truth_events=truth_events,
         metrics=metrics,
         prediction_valid=predicted.validation.valid,
-        dropped_final_timestep=drop_final,
+        dropped_final_timestep=False,
     )
 
 
@@ -133,8 +131,6 @@ def _ground_truth_events(
     example: DatasetExample,
     vocabulary: ContentVocabulary,
     config: ProjectConfig,
-    *,
-    drop_final: bool,
 ) -> tuple[BuildOrderEvent, ...]:
     if example.replay_path is not None:
         return extract_build_order_from_parquet(
@@ -143,8 +139,8 @@ def _ground_truth_events(
             vocabulary,
             perspective_player=example.perspective_player,
             start=example.window_start,
-            drop_final_timestep=drop_final,
+            drop_final_timestep=False,
         )
     ground_truth = decode_canvas(example.target_canvas.tolist(), vocabulary)
     truth_timesteps = _timed(ground_truth.timesteps, example, config)
-    return extract_build_order(truth_timesteps, drop_final_timestep=drop_final)
+    return extract_build_order(truth_timesteps, drop_final_timestep=False)
