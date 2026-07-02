@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 import math
 import re
 from typing import Any, Sequence
@@ -34,6 +35,63 @@ STAT_KEYS = (
 )
 
 
+@dataclass(frozen=True)
+class InputFeatures:
+    """Pre-parsed, batched contextual fields for the input region.
+
+    These are the model-approved numeric values (map position, unit stats, team)
+    extracted once per batch in the DataLoader workers (see
+    ``thesis_ml.data.collate``), instead of re-parsing TokenRecord objects in a
+    Python loop on every forward pass. Shapes are ``[batch, seq_len, ...]``:
+      - map_values:   [B, L, 2]   exact (X, Y) map coordinate
+      - stat_values:  [B, L, S]   per-unit stats in STAT_KEYS order
+      - team_ids:     [B, L]      0 = pad, 1 = self, 2 = enemy
+
+    Absolute game time is intentionally absent. ``TokenRecord`` may retain a
+    timestamp for dataset ordering or output-side evaluation, but this type is
+    the boundary that prevents that metadata from entering the model.
+    """
+
+    map_values: torch.Tensor
+    stat_values: torch.Tensor
+    team_ids: torch.Tensor
+
+
+def build_input_features(
+    records: Sequence[Sequence[TokenRecord]],
+    seq_len: int,
+    *,
+    left_pad: bool = False,
+) -> InputFeatures:
+    """Parse a batch of input-token record rows into batched feature tensors.
+
+    Runs in the DataLoader worker (via collate) so this CPU-bound parsing is
+    parallelized and happens once per batch per epoch rather than every step.
+    Builds CPU float32 tensors; the model moves/casts them at use time.
+
+    Parameters:
+        records: one list of TokenRecord per batch row (the input region).
+        seq_len: padded sequence length the batch was collated to.
+    Returns:
+        InputFeatures with [batch, seq_len, ...] tensors.
+    Calls: _records_to_tensors, the sole allowlist from records to model inputs.
+    """
+
+    batch = len(records)
+    map_values, stat_values, team_ids = _records_to_tensors(
+        records,
+        torch.Size((batch, seq_len)),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        left_pad=left_pad,
+    )
+    return InputFeatures(
+        map_values=map_values,
+        stat_values=stat_values,
+        team_ids=team_ids,
+    )
+
+
 class FourierFeatures(nn.Module):
     """Extrapolation-friendly continuous features."""
 
@@ -58,9 +116,7 @@ class InputContextEmbedding(nn.Module):
         self.self_conditioning = self_conditioning
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.map_fourier = FourierFeatures(input_dim=2)
-        self.clock_fourier = FourierFeatures(input_dim=1)
         self.map_projection = nn.Linear(self.map_fourier.output_dim, d_model, bias=False)
-        self.clock_projection = nn.Linear(self.clock_fourier.output_dim, d_model, bias=False)
         self.stat_projection = nn.Linear(len(STAT_KEYS), d_model, bias=False)
         self.team_embedding = nn.Embedding(3, d_model, padding_idx=0)
         self.self_cond_projection = nn.Linear(vocab_size, d_model, bias=False) if self_conditioning else None
@@ -70,10 +126,13 @@ class InputContextEmbedding(nn.Module):
         input_token_ids: torch.Tensor,
         canvas_token_ids: torch.Tensor,
         *,
-        input_records: Sequence[Sequence[TokenRecord]] | None = None,
+        input_features: InputFeatures | None = None,
         canvas_self_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        input_embeddings = self.embed_input(input_token_ids, input_records=input_records)
+        input_embeddings = self.embed_input(
+            input_token_ids,
+            input_features=input_features,
+        )
         canvas_embeddings = self.embed_canvas(canvas_token_ids, canvas_self_conditioning=canvas_self_conditioning)
         return torch.cat([input_embeddings, canvas_embeddings], dim=1)
 
@@ -81,23 +140,21 @@ class InputContextEmbedding(nn.Module):
         self,
         input_token_ids: torch.Tensor,
         *,
-        input_records: Sequence[Sequence[TokenRecord]] | None = None,
+        input_features: InputFeatures | None = None,
     ) -> torch.Tensor:
         embeddings = self.token_embedding(input_token_ids)
-        if input_records is None:
+
+        if input_features is None:
             return embeddings
 
-        device = input_token_ids.device
-        map_values, clock_values, stat_values, team_ids = _records_to_tensors(
-            input_records,
-            input_token_ids.shape,
-            device=device,
-            dtype=embeddings.dtype,
-        )
+        device = embeddings.device
+        map_values = input_features.map_values.to(device=device, dtype=embeddings.dtype)
+        stat_values = input_features.stat_values.to(device=device, dtype=embeddings.dtype)
+        team_ids = input_features.team_ids.to(device=device, dtype=torch.long)
+
         return (
             embeddings
             + self.map_projection(self.map_fourier(map_values))
-            + self.clock_projection(self.clock_fourier(clock_values))
             + self.stat_projection(stat_values)
             + self.team_embedding(team_ids)
         )
@@ -127,21 +184,21 @@ def _records_to_tensors(
     *,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    left_pad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, seq_len = shape
     map_values = torch.zeros(batch, seq_len, 2, device=device, dtype=dtype)
-    clock_values = torch.zeros(batch, seq_len, 1, device=device, dtype=dtype)
     stat_values = torch.zeros(batch, seq_len, len(STAT_KEYS), device=device, dtype=dtype)
     team_ids = torch.zeros(batch, seq_len, device=device, dtype=torch.long)
 
     for batch_index, row_records in enumerate(records):
+        offset = max(0, seq_len - len(row_records)) if left_pad else 0
         for token_index, record in enumerate(row_records[:seq_len]):
+            token_index += offset
             if record.allegiance == "self":
                 team_ids[batch_index, token_index] = 1
             elif record.allegiance == "enemy":
                 team_ids[batch_index, token_index] = 2
-            if record.timestamp_seconds is not None:
-                clock_values[batch_index, token_index, 0] = float(record.timestamp_seconds)
             position = _parse_position(record.raw_position)
             if position is not None:
                 map_values[batch_index, token_index] = torch.tensor(position[:2], device=device, dtype=dtype)
@@ -149,7 +206,7 @@ def _records_to_tensors(
             for stat_index, key in enumerate(STAT_KEYS):
                 stat_values[batch_index, token_index, stat_index] = _numeric_feature(raw.get(key))
 
-    return map_values, clock_values, stat_values, team_ids
+    return map_values, stat_values, team_ids
 
 
 def _parse_position(value: Any) -> tuple[float, float, float] | None:

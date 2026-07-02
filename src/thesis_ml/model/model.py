@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
-
 import torch
 from torch import nn
 
 from thesis_ml.config import ProjectConfig
 from thesis_ml.model.backbone import BidirectionalTransformer, RMSNorm
-from thesis_ml.model.embedding import InputContextEmbedding
-from thesis_ml.serialize import TokenRecord
+from thesis_ml.model.embedding import InputContextEmbedding, InputFeatures
 
 
 @dataclass(frozen=True)
@@ -24,6 +21,11 @@ class SC2StrategyDiffusionModel(nn.Module):
     def __init__(self, config: ProjectConfig, *, vocab_size: int, dropout: float = 0.0) -> None:
         super().__init__()
         model_config = config.model
+        if model_config.rope_scaling.rope_type != "llama3":
+            raise ValueError(
+                "model.rope_scaling.rope_type must be 'llama3', "
+                f"got {model_config.rope_scaling.rope_type!r}"
+            )
         self.self_conditioning = model_config.self_conditioning
         # Enabling QK-norm or self-conditioning changes the architecture; pre-009 checkpoints need retraining.
         self.embedding = InputContextEmbedding(
@@ -38,6 +40,12 @@ class SC2StrategyDiffusionModel(nn.Module):
             ffn_dim=model_config.ffn,
             dropout=dropout,
             qk_norm=model_config.qk_norm,
+            rope_theta=model_config.rope_theta,
+            rope_scaling_factor=model_config.rope_scaling.factor,
+            rope_low_freq_factor=model_config.rope_scaling.low_freq_factor,
+            rope_high_freq_factor=model_config.rope_scaling.high_freq_factor,
+            rope_original_context=model_config.rope_scaling.original_max_position_embeddings,
+            gradient_checkpointing=model_config.gradient_checkpointing,
         )
         self.output_head = nn.Linear(model_config.d_model, vocab_size, bias=False)
         self._init_weights(model_config.layers)
@@ -49,13 +57,13 @@ class SC2StrategyDiffusionModel(nn.Module):
         canvas_token_ids: torch.Tensor,
         input_attention_mask: torch.Tensor | None = None,
         canvas_attention_mask: torch.Tensor | None = None,
-        input_records: Sequence[Sequence[TokenRecord]] | None = None,
+        input_features: InputFeatures | None = None,
         canvas_self_conditioning: torch.Tensor | None = None,
     ) -> ModelOutput:
         embeddings = self.embedding(
             input_token_ids,
             canvas_token_ids,
-            input_records=input_records,
+            input_features=input_features,
             canvas_self_conditioning=canvas_self_conditioning,
         )
         attention_mask = _combine_attention_masks(

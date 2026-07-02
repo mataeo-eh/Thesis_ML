@@ -13,7 +13,8 @@ from thesis_ml.data.dataset import (
 )
 from thesis_ml.model.loss import CanvasCrossEntropyLoss
 from thesis_ml.model import backbone as backbone_module
-from thesis_ml.model.backbone import MultiHeadSelfAttention
+from thesis_ml.model.backbone import MultiHeadSelfAttention, RotaryEmbedding
+from thesis_ml.model.embedding import InputFeatures, build_input_features
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.serialize import TokenRecord
 
@@ -70,6 +71,10 @@ def _records(batch: int, seq_len: int, *, x_offset: float = 0.0) -> list[list[To
     return rows
 
 
+def _features(records: list[list[TokenRecord]], seq_len: int) -> InputFeatures:
+    return build_input_features(records, seq_len)
+
+
 def test_forward_shapes() -> None:
     config = _small_config()
     model = SC2StrategyDiffusionModel(config, vocab_size=128)
@@ -82,7 +87,7 @@ def test_forward_shapes() -> None:
         input_token_ids=input_ids,
         canvas_token_ids=canvas_ids,
         input_attention_mask=input_mask,
-        input_records=_records(batch, input_ids.shape[1]),
+        input_features=_features(_records(batch, input_ids.shape[1]), input_ids.shape[1]),
     )
 
     assert output.logits.shape == (batch, input_ids.shape[1] + canvas_ids.shape[1], 128)
@@ -101,13 +106,37 @@ def test_contextual_encodings_are_input_only() -> None:
     pure_canvas = model.embedding.token_embedding(canvas_ids)
     assert torch.allclose(canvas_embeddings, pure_canvas)
 
-    base_input = model.embedding.embed_input(input_ids, input_records=base_records)
-    changed_input = model.embedding.embed_input(input_ids, input_records=changed_records)
+    base_features = _features(base_records, input_ids.shape[1])
+    changed_features = _features(changed_records, input_ids.shape[1])
+    base_input = model.embedding.embed_input(input_ids, input_features=base_features)
+    changed_input = model.embedding.embed_input(input_ids, input_features=changed_features)
     assert not torch.allclose(base_input[:, 0], changed_input[:, 0])
 
-    base_full = model.embedding(input_ids, canvas_ids, input_records=base_records)
-    changed_full = model.embedding(input_ids, canvas_ids, input_records=changed_records)
+    base_full = model.embedding(input_ids, canvas_ids, input_features=base_features)
+    changed_full = model.embedding(input_ids, canvas_ids, input_features=changed_features)
     assert torch.allclose(base_full[:, input_ids.shape[1] :], changed_full[:, input_ids.shape[1] :])
+
+
+def test_absolute_game_time_cannot_enter_model_features() -> None:
+    config = _small_config(layers=1)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    input_ids = torch.tensor([[6, 7, 8]])
+    base_records = _records(1, 3)
+    changed_records = [[replace(record, timestamp_seconds=record.timestamp_seconds + 10_000) for record in base_records[0]]]
+
+    base_features = _features(base_records, input_ids.shape[1])
+    changed_features = _features(changed_records, input_ids.shape[1])
+
+    assert not hasattr(base_features, "clock_values")
+    assert not hasattr(model.embedding, "clock_projection")
+    assert not hasattr(model.embedding, "clock_fourier")
+    assert torch.equal(base_features.map_values, changed_features.map_values)
+    assert torch.equal(base_features.stat_values, changed_features.stat_values)
+    assert torch.equal(base_features.team_ids, changed_features.team_ids)
+    assert torch.equal(
+        model.embedding.embed_input(input_ids, input_features=base_features),
+        model.embedding.embed_input(input_ids, input_features=changed_features),
+    )
 
 
 def test_self_conditioning_adds_to_canvas_only_and_null_is_equivalent() -> None:
@@ -116,20 +145,21 @@ def test_self_conditioning_adds_to_canvas_only_and_null_is_equivalent() -> None:
     input_ids = torch.tensor([[6, 7, 8]])
     canvas_ids = torch.tensor([[9, 10, 11]])
     records = _records(1, 3)
+    features = _features(records, input_ids.shape[1])
     conditioning = torch.zeros(1, 3, 128)
     conditioning[0, :, 12] = 1.0
 
-    base = model.embedding(input_ids, canvas_ids, input_records=records)
+    base = model.embedding(input_ids, canvas_ids, input_features=features)
     zero = model.embedding(
         input_ids,
         canvas_ids,
-        input_records=records,
+        input_features=features,
         canvas_self_conditioning=torch.zeros_like(conditioning),
     )
     conditioned = model.embedding(
         input_ids,
         canvas_ids,
-        input_records=records,
+        input_features=features,
         canvas_self_conditioning=conditioning,
     )
 
@@ -185,6 +215,84 @@ def test_qk_norm_disabled_matches_legacy_attention_path() -> None:
     assert torch.allclose(actual, expected)
 
 
+def test_padding_mask_is_boolean_key_mask_broadcast_over_heads_and_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attention = MultiHeadSelfAttention(d_model=32, heads=4)
+    seen_mask: list[torch.Tensor] = []
+    original = F.scaled_dot_product_attention
+
+    def capture_mask(query, key, value, *, attn_mask=None, **kwargs):
+        seen_mask.append(attn_mask)
+        return original(query, key, value, attn_mask=attn_mask, **kwargs)
+
+    monkeypatch.setattr(backbone_module.F, "scaled_dot_product_attention", capture_mask)
+    padding_mask = torch.tensor([[True, True, False], [True, True, True]])
+
+    attention(torch.randn(2, 3, 32), attention_mask=padding_mask)
+
+    assert len(seen_mask) == 1
+    assert seen_mask[0].dtype == torch.bool
+    assert seen_mask[0].shape == (2, 1, 1, 3)
+    assert torch.equal(seen_mask[0][:, 0, 0, :], padding_mask)
+
+
+def test_gradient_checkpointing_is_config_gated(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _small_config(layers=1)
+    config = replace(
+        config,
+        model=replace(config.model, gradient_checkpointing=True, self_conditioning=False),
+    )
+    calls = 0
+    original = backbone_module.checkpoint
+
+    def count_checkpoint(function, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(function, *args, **kwargs)
+
+    monkeypatch.setattr(backbone_module, "checkpoint", count_checkpoint)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    input_ids = torch.tensor([[6, 7, 8]])
+    canvas_ids = torch.tensor([[9, 10, 11]])
+
+    output = model(
+        input_token_ids=input_ids,
+        canvas_token_ids=canvas_ids,
+        input_features=_features(_records(1, 3), 3),
+    )
+    output.logits.sum().backward()
+
+    assert calls == 1
+
+
+def test_llama3_rope_scaling_matches_reference_frequency_bands() -> None:
+    head_dim = 128
+    theta = 500_000.0
+    factor = 8.0
+    original_context = 8192
+    rope = RotaryEmbedding(
+        head_dim,
+        base=theta,
+        scaling_factor=factor,
+        low_freq_factor=1.0,
+        high_freq_factor=4.0,
+        original_context=original_context,
+    )
+    unscaled = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+    wavelengths = 2 * torch.pi / unscaled
+
+    high_frequency = wavelengths < original_context / 4.0
+    low_frequency = wavelengths > original_context
+    medium_frequency = ~(high_frequency | low_frequency)
+
+    assert torch.equal(rope.inv_freq[high_frequency], unscaled[high_frequency])
+    assert torch.allclose(rope.inv_freq[low_frequency], unscaled[low_frequency] / factor)
+    assert medium_frequency.any()
+    assert torch.all(rope.inv_freq[medium_frequency] < unscaled[medium_frequency])
+    assert torch.all(rope.inv_freq[medium_frequency] > unscaled[medium_frequency] / factor)
+
+
 def test_loss_is_canvas_only() -> None:
     config = _small_config()
     loss_fn = CanvasCrossEntropyLoss(config)
@@ -224,13 +332,14 @@ def test_attention_is_bidirectional() -> None:
     canvas_ids = torch.tensor([[10, 11, 12, 13]])
 
     with torch.no_grad():
-        base = model(input_token_ids=input_ids, canvas_token_ids=canvas_ids, input_records=_records(1, 4)).logits
+        features = _features(_records(1, 4), input_ids.shape[1])
+        base = model(input_token_ids=input_ids, canvas_token_ids=canvas_ids, input_features=features).logits
         changed_canvas = canvas_ids.clone()
         changed_canvas[0, -1] = 40
         changed = model(
             input_token_ids=input_ids,
             canvas_token_ids=changed_canvas,
-            input_records=_records(1, 4),
+            input_features=features,
         ).logits
 
     first_canvas_index = input_ids.shape[1]
@@ -246,22 +355,22 @@ def test_rope_length_extrapolation_smoke() -> None:
     output = model(
         input_token_ids=input_ids,
         canvas_token_ids=canvas_ids,
-        input_records=_records(1, input_ids.shape[1]),
+        input_features=_features(_records(1, input_ids.shape[1]), input_ids.shape[1]),
     )
 
     assert output.logits.shape == (1, input_ids.shape[1] + canvas_ids.shape[1], 128)
 
 
-def test_default_provisional_shape_instantiates_on_meta_device() -> None:
+def test_default_local_shape_instantiates_on_meta_device() -> None:
     config = load_config("config/default.yaml")
     with torch.device("meta"):
         model = SC2StrategyDiffusionModel(config, vocab_size=400)
 
     first_layer = model.backbone.layers[0]
-    assert model.embedding.token_embedding.embedding_dim == 1536
-    assert len(model.backbone.layers) == 16
-    assert first_layer.attn.heads == 12
-    assert first_layer.attn.head_dim == 128
+    assert model.embedding.token_embedding.embedding_dim == 256
+    assert len(model.backbone.layers) == 10
+    assert first_layer.attn.heads == 4
+    assert first_layer.attn.head_dim == 64
 
 
 def test_model_uses_explicit_depth_scaled_initialization() -> None:
