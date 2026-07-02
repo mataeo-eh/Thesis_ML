@@ -6,7 +6,8 @@ import yaml
 
 from thesis_ml.pipeline.acquire_data import CredentialError, run_acquisition
 from thesis_ml.pipeline.storage import StorageResolver, parse_s3_uri
-from thesis_ml.pipeline.train_pipeline import run_training_pipeline
+from thesis_ml.config import load_config
+from thesis_ml.pipeline.train_pipeline import _select_replays, run_training_pipeline
 
 
 def test_master_pipeline_smoke_run_writes_checkpoint_and_resumes(tmp_path: Path) -> None:
@@ -20,6 +21,79 @@ def test_master_pipeline_smoke_run_writes_checkpoint_and_resumes(tmp_path: Path)
     assert first.resumed is False
     assert second.resumed is True
     assert second.steps == first.steps
+
+
+def test_overfit_selection_is_seeded_exact_and_disjoint() -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "configs" / "local_overfit.yaml")
+    train_candidates = [f"train_{index}.parquet" for index in range(100)]
+    dev_candidates = [f"dev_{index}.parquet" for index in range(20)]
+
+    first = _select_replays(train_candidates, dev_candidates, config)
+    second = _select_replays(train_candidates, dev_candidates, config)
+
+    assert first == second
+    assert len(first[0]) == 25
+    assert len(first[1]) == 3
+    assert set(first[0]).isdisjoint(first[1])
+
+
+def test_real_manifest_pipeline_uses_workers_and_resumes(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    raw = yaml.safe_load((root / "config" / "default.yaml").read_text(encoding="utf-8"))
+    raw["storage"].update(
+        {
+            "data_uri": str(root / "tests" / "fixtures"),
+            "checkpoint_uri": str(tmp_path / "real-checkpoints"),
+            "log_uri": str(tmp_path / "real-logs"),
+            "local_cache_dir": str(tmp_path / "real-cache"),
+        }
+    )
+    raw["data"].update(
+        {
+            "input_budget_tokens": 512,
+            "canvas_budget_tokens": 256,
+            "tokenized_replay_dir": str(tmp_path / "tokenized"),
+            "window_manifest_path": str(tmp_path / "manifest.jsonl"),
+        }
+    )
+    raw["pipeline"].update(
+        {
+            "smoke": False,
+            "batch_size": 2,
+            "replay_glob": "match_4745722_game_state.parquet",
+            "token_dictionary_uri": str(root / "data" / "Token_Dictionary.json"),
+            "num_workers": 2,
+            "prefetch_factor": 1,
+            "test_fraction": 0.0,
+            "dev_fraction": 0.0,
+        }
+    )
+    raw["data_source"]["workers"] = 1
+    raw["model"].update({"d_model": 32, "layers": 1, "heads": 4, "ffn": 64})
+    raw["train"].update(
+        {
+            "max_steps": 1,
+            "epochs": 1,
+            "precision": "fp32",
+            "warmup": 1,
+            "target_effective_batch_tokens": 0,
+            "val_interval": 0,
+            "checkpoint_interval": 1,
+        }
+    )
+    config_path = tmp_path / "real.yaml"
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    first = run_training_pipeline(config_path)
+    second = run_training_pipeline(config_path)
+
+    assert first.resumed is False
+    assert second.resumed is True
+    assert second.steps == 1
+    assert (tmp_path / "manifest.jsonl").exists()
+    assert (tmp_path / "real-checkpoints" / "last.pt").exists()
+    assert (tmp_path / "real-logs" / "epoch_metrics.csv").exists()
+    assert (tmp_path / "real-logs" / "replay_selection.json").exists()
 
 
 def test_storage_resolver_routes_local_and_s3(tmp_path: Path) -> None:

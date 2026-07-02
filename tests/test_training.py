@@ -1,4 +1,5 @@
 from dataclasses import replace
+import csv
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,7 @@ def test_training_scores_exactly_masked_canvas_positions(tmp_path: Path) -> None
 def test_self_conditioning_training_uses_no_grad_estimate_then_grad_pass(tmp_path: Path) -> None:
     config = replace(
         _small_config(tmp_path),
+        model=replace(_small_config(tmp_path).model, self_conditioning=True),
         train=replace(_small_config(tmp_path).train, self_cond_prob=1.0),
     )
     torch.manual_seed(61)
@@ -116,6 +118,8 @@ def test_checkpoint_roundtrip_restores_model_optimizer_and_step(tmp_path: Path) 
     restored.load_checkpoint(checkpoint)
 
     assert restored.global_step == loop.global_step
+    assert restored.total_tokens_ingested == loop.total_tokens_ingested
+    assert restored.unique_token_ids_seen == loop.unique_token_ids_seen
     for saved, loaded in zip(loop.model.parameters(), restored.model.parameters(), strict=True):
         assert torch.allclose(saved, loaded)
     for saved, loaded in zip(loop.ema_model.parameters(), restored.ema_model.parameters(), strict=True):
@@ -200,11 +204,87 @@ def test_seeded_smoke_runs_are_deterministic(tmp_path: Path) -> None:
     assert [log.per_class for log in first] == [log.per_class for log in second]
 
 
+def test_epoch_metrics_csv_contains_train_dev_classes_and_throughput(tmp_path: Path) -> None:
+    config = _small_config(tmp_path)
+    examples = make_synthetic_examples(config, count=4)
+    train_loader = DataLoader(examples[:2], batch_size=2, collate_fn=collate_diffusion_examples)
+    dev_loader = DataLoader(examples[2:], batch_size=2, collate_fn=collate_diffusion_examples)
+    csv_path = tmp_path / "epoch_metrics.csv"
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=71, epoch_metrics_path=csv_path)
+
+    loop.fit(train_loader, val_dataloader=dev_loader, max_steps=2, epochs=2, fixed_t=1.0)
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [int(row["epoch"]) for row in rows] == [1, 2]
+    assert all(float(row["train_loss"]) > 0 for row in rows)
+    assert all(float(row["dev_loss"]) > 0 for row in rows)
+    assert all(float(row["tokens_per_second"]) > 0 for row in rows)
+    assert all(float(row["wall_clock_elapsed_seconds"]) > 0 for row in rows)
+    assert all(float(row["average_input_timesteps"]) == pytest.approx(8.0) for row in rows)
+    assert all(float(row["average_enemy_future_timesteps"]) == pytest.approx(1.0) for row in rows)
+    assert [int(row["total_tokens_ingested"]) for row in rows] == [40, 80]
+    assert [int(row["total_unique_tokens_seen"]) for row in rows] == [9, 9]
+    assert "train_enemy_observed_loss" in rows[0]
+    assert "dev_pad_loss" in rows[0]
+
+
+def test_training_prints_live_epoch_and_batch_progress(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config = _small_config(tmp_path)
+    examples = make_synthetic_examples(config, count=4)
+    train_loader = DataLoader(examples, batch_size=2, shuffle=False, collate_fn=collate_diffusion_examples)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=72)
+
+    loop.fit(train_loader, max_steps=4, epochs=2, fixed_t=1.0)
+
+    output = capsys.readouterr().out
+    assert "phase=train epoch=1/2 batch=1/2" in output
+    assert "phase=train epoch=1/2 batch=2/2" in output
+    assert "phase=train epoch=2/2 batch=1/2" in output
+    assert "phase=train epoch=2/2 batch=2/2" in output
+    assert "step=1 step_wall_seconds=" in output
+    assert "tokens_per_second=" in output
+    assert "cuda_max_memory_allocated_gb=0.000" in output
+    assert "cuda_memory_reserved_gb=0.000" in output
+
+
+def test_cuda_reserved_memory_limit_fails_hard(tmp_path: Path) -> None:
+    config = replace(
+        _small_config(tmp_path),
+        train=replace(_small_config(tmp_path).train, max_cuda_reserved_gb=7.0),
+    )
+    loop = TrainingLoop(model=SC2StrategyDiffusionModel(config, vocab_size=128), config=config, seed=74)
+    loop.device = torch.device("cuda")
+
+    with pytest.raises(RuntimeError, match="reserved-memory safety limit exceeded"):
+        loop._enforce_cuda_memory_limit(7 * 1024**3)
+
+
+def test_relative_early_stopping_requires_consecutive_subthreshold_epochs(tmp_path: Path) -> None:
+    config = replace(
+        _small_config(tmp_path),
+        train=replace(
+            _small_config(tmp_path).train,
+            early_stopping_patience_epochs=2,
+            early_stopping_min_relative_improvement=0.001,
+        ),
+    )
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=73)
+
+    assert loop._should_stop_early(10.0) is False
+    assert loop._should_stop_early(9.995) is False
+    assert loop._should_stop_early(9.994) is True
+    assert loop.epochs_without_improvement == 2
+
+
 def _small_config(tmp_path: Path | None = None) -> ProjectConfig:
     config = load_config("config/default.yaml")
     return replace(
         config,
-        data=replace(config.data, input_window_timesteps=4, canvas_budget_tokens=12),
+        data=replace(config.data, input_budget_tokens=64, canvas_budget_tokens=12),
         model=replace(config.model, d_model=32, layers=2, heads=4, ffn=64),
         train=replace(
             config.train,

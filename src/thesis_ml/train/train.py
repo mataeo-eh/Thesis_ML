@@ -120,7 +120,7 @@ def _smoke_config(*, max_steps: int, checkpoint_dir: str | Path | None) -> Proje
     checkpoint = str(checkpoint_dir) if checkpoint_dir is not None else str(PROJECT_ROOT / "checkpoints" / "smoke")
     return replace(
         config,
-        data=replace(config.data, input_window_timesteps=4, canvas_budget_tokens=12),
+        data=replace(config.data, input_budget_tokens=64, canvas_budget_tokens=12),
         model=replace(config.model, d_model=32, layers=2, heads=4, ffn=64),
         train=replace(
             config.train,
