@@ -19,7 +19,7 @@ Data extraction is complete and lives in a separate repository (`SC2-gamestate-e
 ## 2. Model family — SETTLED
 
 - Masked (absorbing-state) discrete diffusion, MDLM/LLaDA family. Methodology citations: SEDD, MDLM, LLaDA.
-- Backbone: a dense bidirectional transformer in the **LLaDA / LLaMA lineage** — RMSNorm (pre-norm), SwiGLU FFN, RoPE for sequence position, **vanilla multi-head attention (MHA), NOT grouped-query attention**, with **QK-norm** (per-head RMSNorm on queries/keys before RoPE, for attention stability; config-gated, default on). Single stack. Rationale for MHA over GQA: GQA exists to shrink the KV cache during autoregressive decoding; full-canvas diffusion does not decode autoregressively, so (following LLaDA) MHA is used and FFN width is the parameter-budget knob. QK-norm note: it can flatten attention and slightly weaken precise retrieval, which matters for the input→canvas copy pathway — watch the copy-class loss when toggling. Attention uses FlashAttention kernels via PyTorch SDPA (no causal mask — full bidirectional with a padding mask only).
+- Backbone: a dense bidirectional transformer in the **LLaDA / LLaMA lineage** — RMSNorm (pre-norm), SwiGLU FFN, **Llama 3.1-style frequency-scaled RoPE** for sequence position, **vanilla multi-head attention (MHA), NOT grouped-query attention**, with **QK-norm** (per-head RMSNorm on queries/keys before RoPE, for attention stability; config-gated, default on). Single stack. The RoPE base and Llama 3 scaling factors are config fields so pretraining can use shorter sequences while inference can evaluate much longer sequences without learned position tables or an architecture change. This is the Llama 3 scaled-RoPE variant, not the separately defined YaRN algorithm. Rationale for MHA over GQA: GQA exists to shrink the KV cache during autoregressive decoding; full-canvas diffusion does not decode autoregressively, so (following LLaDA) MHA is used and FFN width is the parameter-budget knob. QK-norm note: it can flatten attention and slightly weaken precise retrieval, which matters for the input→canvas copy pathway — watch the copy-class loss when toggling. Attention uses FlashAttention kernels via PyTorch SDPA (no causal mask — full bidirectional with a padding mask only).
 - Reference architecture: LLaDA (dense, from-scratch masked diffusion LM) is the closest published anchor and is downscaled to fit this project. DiffusionGemma is NOT a structural template — it is MoE, block/semi-autoregressive, and encoder-decoder, all of which this project cuts; it serves only as a family existence proof and a source of sampler defaults (§9).
 - Each training example is one flat sequence: `[input region][canvas region]`. Full bidirectional attention over the entire sequence. The input region is clamped — never noised, never receives loss. The canvas region is noised; loss is computed on canvas positions only.
 - Conditioning is clamping. There is no encoder-decoder split, no cross-attention conditioning, no separate prompt encoder.
@@ -68,29 +68,36 @@ There is no copy mechanism of any kind. Input-to-output copying is a learned beh
 ## 6. Input representation — SETTLED
 
 Two distinct kinds of "position" exist in this system and must never be conflated:
-- **Sequence position** — a token's index in the flat sequence. Encoded with **RoPE (rotary position embedding), or a RoPE-equivalent relative scheme**, applied to queries/keys in attention. Chosen specifically so that entity-counts-per-timestep and timestep-counts not seen during training do not break the model at inference. This is the only sequence-position mechanism; no learned absolute position table.
+- **Sequence position** — a token's index in the flat sequence. Encoded only with **Llama 3.1-style frequency-scaled RoPE**, applied to queries/keys in attention. Chosen specifically so that entity-counts-per-timestep and timestep-counts not seen during training do not break the model at inference. This is the only numerical sequence-position encoding the model receives: no learned absolute position table, absolute game clock, frame number, `game_loop`, or timestamp-derived feature.
 - **Map position** — where a unit sits on the game map: the exact (X,Y) coordinate from the extractor parquet. A *feature* of the entity, encoded as an additive **input-only** contextual encoding (below), never part of any token identity. Unrelated to RoPE.
 
 Input embedding pipeline — lives in the MODEL, not the tokenizer (these are learned parameters trained by backprop), applied to input tokens:
 1. Token embedding lookup (learned).
-2. Additive contextual encodings, **input-only**: exact (X,Y) map position, unit stats, absolute game clock. Canvas tokens never receive these. Continuous encodings (clock, map position) should be chosen to extrapolate to unseen values (e.g. Fourier/sinusoidal features) rather than learned lookups over fixed bins.
+2. Additive contextual encodings, **input-only**: exact (X,Y) map position and unit stats. Canvas tokens never receive these. Map position uses extrapolation-friendly Fourier/sinusoidal features rather than a learned lookup over fixed bins. Absolute game time, frame number, `game_loop`, and timestamp-derived values are prohibited from this feature path.
 3. Team flag: a learned embedding component distinguishing self tokens from enemy tokens.
 4. RoPE applied in attention for sequence position (see above).
 5. Timestep boundaries: `[DELIMITER]` tokens, present in both input and canvas.
 
-The tokenizer (§4–5) emits one sequence of token records, each carrying its token ID plus the raw input-only field VALUES (map position, stats, clock, allegiance) from the extractor parquet. Turning those values into vectors is the model's job, per the pipeline above. The tokenizer never computes embeddings or positional encodings.
+The tokenizer (§4–5) emits one sequence of token records carrying token identity and source metadata. A model-facing allowlisted feature structure carries only map position, unit stats, and allegiance into the embedding stack. Absolute clock metadata may remain available outside the model for dataset ordering and post-sampling evaluation, but must never be copied into model inputs, embeddings, attention inputs, or targets. The tokenizer never computes embeddings or positional encodings.
 
-Windows may begin mid-game, so absolute game clock must be present on the input for the model to know game phase.
+Windows may begin mid-game; the model must infer game phase from observed game state and sequence structure rather than an absolute clock.
+
+Training windows are greedy contiguous runs of whole timesteps from one replay.
+A timestep is added only while the zero-fog serialized input remains within its
+budget and the full in-window enemy reconstruction remains within
+`canvas_recon_fraction × canvas_budget_tokens`.
+Successive default windows tile each replay without overlap. One window is one
+batch sequence; sequence packing and cross-document masks are not used.
 
 v1 uses delimiters only for timestep structure; a separate timestep-membership encoding is OPEN (§12) — do not implement one.
 
 ## 7. Output canvas semantics — SETTLED
 
 - Flat token canvas with one fixed overall budget (config). Model-placed `[DELIMITER]`s partition it into contiguous timesteps. No per-timestep slot budgets.
-- Each timestep's tokens are followed by one `[DELIMITER]`. After the final timestep of a replay: `[END]`, then `[PAD]` to the end of the budget.
+- Each timestep's tokens are followed by one `[DELIMITER]`. After the final timestep of a replay: `[END]`, then semantic `[PAD]` targets. Collation may add further batch-shape `[PAD]` values, which are excluded from attention and loss.
 - Absolute timing of canvas timesteps is recovered externally by arithmetic: clock of last input frame + fixed sampling interval × timestep index. The model never emits time.
-- **Target truncation rule — mid-timestep fill:** the target canvas is filled exactly to budget. When the remaining game exceeds the budget, truncate mid-timestep so the canvas is exactly full; no `[END]` appears. `[PAD]` appears **only** after `[END]` (game ended within budget). Consequence: a truncated target's final timestep may be partial; evaluation drops the final timestep of generated canvases on truncated-horizon examples.
-- Grammar invariant (enforced in tests): a valid canvas is `(timestep-tokens [DELIMITER])*` followed by either exact-fill termination (truncated horizon) or `[END] [PAD]*` to budget.
+- **Target truncation rule — whole timesteps only:** reconstruction contains exactly the window timesteps and future continuation admits a timestep only when all enemy tokens plus its `[DELIMITER]` fit. No partial timestep is ever emitted. If the game ends within budget, append `[END]` then `[PAD]` to budget. Otherwise stop at the last complete boundary and append `[PAD]` directly to budget.
+- Grammar invariant (enforced in tests): a valid canvas is `(timestep-tokens [DELIMITER])+` followed by either `[END] [PAD]*` or `[PAD]*`.
 
 ## 8. Outcome fine-tuning — SETTLED mechanism, out of v1 scope
 
@@ -109,7 +116,7 @@ v1 uses delimiters only for timestep structure; a separate timestep-membership e
 
 - Headline metrics: accuracy and F1 of predicted build orders against a deterministic build-order extraction tool run on ground-truth replays.
 - Token cross-entropy is for training curves and model selection only. It is never a reported result.
-- Evaluation drops the final (possibly partial) timestep on truncated-horizon examples (§7).
+- Evaluation keeps every decoded timestep; valid canvases cannot contain a partial final timestep (§7).
 - Baselines (later phase, not v1): naive Bayes and SVM on naive features. Literature reference point: Synnaeve & Bessière, ~63–68% accuracy at 5 minutes.
 
 ## 11. PROVISIONAL config parameters
@@ -118,20 +125,23 @@ All of the following are config fields in one YAML file, validated by a dataclas
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `sampling_interval_s` | 5 | Must match extractor output |
-| `input_window_timesteps` | 60 | Tune so input token length lands near ~2048; finalize after fixture inspection. Input length is variable (entities per timestep vary); a hard input-token cap may be added later if memory requires. |
-| `canvas_budget_tokens` | 2048 | Output canvas length. Holds full enemy past reconstruction + future, so it must be generous; expand further if first runs show heavy truncation and capacity allows. |
+| `sampling_interval_s` | 1 | Must equal the native cadence of the tokens consumed by the model; the current dataset is one-second cadence. |
+| `input_budget_tokens` | 4096 | Hard per-window input bound. Windows grow only at whole-timestep boundaries. |
+| `canvas_budget_tokens` | 4096 | Output canvas length for reconstruction plus future continuation. |
+| `canvas_recon_fraction` | 0.5 | Maximum canvas fraction consumed by in-window enemy reconstruction; reserves the remainder for future prediction. |
 | `fog_rate_distribution` | uniform(0.0, 0.8) | Sampled per example |
 | `within_type_tiebreak` | unit ID | §5 |
 | `class_loss_weights` | all 1.0 | Keyed by §3 token classes |
-| `model.*` (d_model / layers / heads / ffn) | 1536 / 16 / 12 / 4096 | LLaDA-shape, ~450M (head_dim 128; RMSNorm, SwiGLU, RoPE, MHA). Aspect ratio 96 — squarely in the LLaDA/LLaMA 80–130 band. **Size is a deliberate open call, see note.** |
+| local `model.*` (d_model / layers / heads / ffn) | 256 / 10 / 4 / 1024 | ~10.7M proof-of-life shape with head dimension 64. Cloud scale remains config-only. |
 | `mask_schedule` | linear, t ~ U(0,1) | MDLM/LLaDA default; loss reweighted by 1/t over masked positions |
 | `train.*` (lr / betas / weight_decay / warmup / lr_floor / grad_clip / accum / precision) | 3e-4 / (0.9,0.95) / 0.1 / 2000 / 0.1×peak / 1.0 / as-needed / bf16 | Cosine decay to lr_floor; accumulation derived from a target effective batch size (§005) |
 | `train.ema_decay / confidence_loss_weight / val_interval` | 0.9999 / 0.1 / periodic | EMA on by default; confidence loss off-able via 0.0 (§3, §005) |
+| `train.epochs / early_stopping_*` | profile-owned / disabled by default | Epoch CSV metrics are always available; local overfit uses 0.1% relative improvement with five-epoch patience and a 200-epoch cap. |
 | `model.qk_norm / model.self_conditioning / train.self_cond_prob` | true / true / 0.5 | QK-norm and self-conditioning (§2, §3, §009); both gated, OFF reproduces pre-009 behavior |
+| `model.rope_theta / model.rope_scaling.*` | 500000 / llama3, factor 8, low/high 1/4, original context 8192 | Llama 3.1 frequency-scaled RoPE; all constants are config-owned and sequence length is not hard-capped in the rotary implementation |
 | `sampler.max_steps / temperature / entropy_bound` | 48 / 0.8→0.4 / 0.1 | §9 |
 
-**Model-sizing note (provisional, owner's call before first real training run).** All `model.*` values are config; size can change in one edit. Sizing is governed by two facts: (1) the vocabulary is tiny (~300–400 tokens), so almost all parameters are backbone, not embeddings; (2) masked diffusion is token-hungry — LLaDA used ~287 tokens-seen per parameter (vs ~20 for autoregressive Chinchilla), because a token is only supervised when masked. Unique corpus is ~5–20B tokens; epochs/repetition (which diffusion tolerates well) raise tokens-seen toward the 100B–1T range. A ~400–500M model is the comfortable match for ~100B tokens-seen; a 1–2B model wants ~370B+ tokens-seen, where training time becomes the binding constraint. At d_model=1024, reaching ≥400M requires a deeper-narrower aspect ratio than LLaDA's ~80–130 (d÷layers); to hold a standard aspect at larger sizes, widen d_model (1280–2048) rather than stacking depth. Recommended path: start ~400–500M, measure underfit via per-class loss curves, scale up by widening only if clearly capacity-bound and compute allows.
+**Model-sizing note.** All `model.*` values are config; size changes require no code changes. The local ~10M shape validates the pipeline and is not a capability target. The intended cloud-scale endpoint remains approximately 450M parameters and is restored by configuration alone.
 
 ## 12. OPEN questions — do not resolve, do not implement
 
@@ -160,7 +170,7 @@ Each item below was explicitly evaluated and cut. Do not introduce them in any f
 - Learned or compound tokenizers: BPE, merges, hierarchical clustering
 - Strategy-label supervision anywhere in training
 - Per-timestep output slot budgets
-- Coordinates, frame numbers, or absolute times in the output vocabulary
+- Coordinates in the output vocabulary; frame numbers, `game_loop`, absolute times, or timestamp-derived values anywhere in model inputs, embeddings, or the output vocabulary
 - Placeholder tokens for fogged entities (fog is omission)
 - Death-signal tokens
 - Permutation-invariant losses, Hungarian matching, set losses

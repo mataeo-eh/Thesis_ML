@@ -210,7 +210,7 @@ Snapshots are represented by rows.
 - Primary row order field: `game_loop`.
 - Secondary time field: `timestamp_seconds`.
 - The fixtures appear sorted by `game_loop`.
-- `timestamp_seconds` is absolute elapsed game time and should be carried as a raw clock value on input token records. It must not enter the vocabulary.
+- `timestamp_seconds` is absolute elapsed game time. It may remain source metadata for ordering and post-sampling evaluation, but must not enter model-facing features, embeddings, attention inputs, targets, or the vocabulary.
 
 ## Player Ownership And Training Perspective
 
@@ -298,7 +298,7 @@ These parquet values must not enter the vocabulary:
 | Unit instance for deterministic ordering | Three-digit `instance_id` embedded in column name; owner-approved as the within-type tiebreak |
 | Map position | `pos_(X,Y,Z)` attribute value, exact tuple string |
 | Unit stats | Remaining entity attributes such as `health`, `energy`, `build_progress`, flags, upgrades, cargo, buffs |
-| Absolute game clock | `timestamp_seconds` row field |
+| Absolute game clock (non-model metadata only) | `timestamp_seconds` row field; excluded by the model-facing feature allowlist |
 | Snapshot/timestep | One parquet row, ordered by `game_loop` |
 | Self/enemy allegiance | Derived later from `p1`/`p2` owner prefix plus selected training perspective |
 | Vocabulary exclusions | Coordinates, timestamps, frame numbers, aggregate counts, resources, ownership, bot names, stats |

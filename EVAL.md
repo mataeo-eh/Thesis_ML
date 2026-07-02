@@ -28,7 +28,7 @@ Events are sorted by `(bucket, entity_type)` for deterministic comparison.
 
 ## Truncated Horizons
 
-When an example has a truncated horizon, the final timestep is dropped from both prediction and ground truth before extraction. This follows `SPEC.md` §7: the final timestep may be partial when the canvas fills exactly without `[END]`.
+Truncated canvases end at a complete timestep boundary and pad the remaining horizon directly without `[END]`. Evaluation keeps every decoded timestep because partial final timesteps are invalid.
 
 ## Metrics
 

@@ -20,14 +20,14 @@ Non-negotiable (§2, §6, §14). Violating any is a failed task:
 - NO copy mechanism (pointer net, copy gate, copy loss). Copying is learned via the loss.
 - NO set aggregators / pooling-over-entities. Every entity is its own token; embeddings are per-token.
 - **Two position concepts, never conflated (§6):** *sequence position* is RoPE (rotary), applied to queries/keys in attention — the only sequence-position mechanism, no learned absolute position table. *Map position* is an entity FEATURE, encoded as an additive contextual encoding. They are different axes.
-- **Embedding pipeline (§6), input-region tokens only:** token embedding (learned) + additive contextual encodings (map position, unit stats, absolute clock) + team-flag embedding (self vs enemy). Continuous encodings (clock, map position) use extrapolation-friendly features (Fourier/sinusoidal), NOT learned lookups over fixed bins. CANVAS tokens receive the token embedding ONLY — never the contextual encodings or team flag.
+- **Embedding pipeline (§6), input-region tokens only:** token embedding (learned) + additive contextual encodings (map position, unit stats) + team-flag embedding (self vs enemy). Map position uses extrapolation-friendly Fourier/sinusoidal features, NOT learned lookups over fixed bins. Absolute game time, frame number, `game_loop`, and timestamp-derived features are forbidden. CANVAS tokens receive the token embedding ONLY — never the contextual encodings or team flag.
 - Loss is position-wise cross-entropy on CANVAS positions only; input positions never receive loss. Per-token-class loss logging is mandatory (§3).
 </constraints_from_spec>
 
 <requirements>
 1. **Embedding module.**
    - Shared token embedding table over the full vocabulary (special + content tokens from 002).
-   - Additive input-only contextual encodings: map position (2D, Fourier/sinusoidal → projected to d_model), unit stats (projected to d_model), absolute game clock (continuous, Fourier/sinusoidal → projected). These are summed into the token embedding for INPUT tokens only.
+   - Additive input-only contextual encodings: map position (2D, Fourier/sinusoidal → projected to d_model) and unit stats (projected to d_model). These are summed into the token embedding for INPUT tokens only. Use an allowlisted feature structure with no absolute-clock field.
    - Team-flag embedding (self vs enemy), added to INPUT tokens only (the canvas is enemy-only, so it needs no team flag).
    - Canvas tokens: token embedding only. Assert this is structurally true — there should be no code path that adds contextual encodings to canvas positions.
    - Raw field values come from the batched records (002/003). The module turns values into vectors; it is the value→vector step SPEC §6 assigns to the model.
@@ -80,7 +80,7 @@ Run these and report each PASS/FAIL with command and result:
 
 1. **Forward shapes:** A forward pass on a small synthetic batch (use config defaults at reduced scale) produces logits of shape `[batch, seq_len, vocab_size]`. PASS only if shapes are correct and the pass runs without error.
 
-2. **Contextual encodings are input-only:** Assert that canvas-position embeddings equal the pure token embedding (no contextual/team-flag component), and that perturbing an input token's raw fields (map position / stats / clock) changes that input position's embedding but changes NO canvas-position embedding before attention. PASS only if the input-only property holds structurally.
+2. **Contextual encodings are input-only and exclude clock:** Assert that canvas-position embeddings equal the pure token embedding (no contextual/team-flag component), that perturbing map position or stats changes the relevant input embedding, and that perturbing only absolute time changes no model-facing feature or embedding. PASS only if both properties hold structurally.
 
 3. **Loss is canvas-only:** Construct a batch where input-region target ids differ from predictions; assert input positions contribute ZERO to the loss and only canvas positions do. PASS only if input positions are provably excluded.
 
