@@ -31,3 +31,4 @@ experiments/runs/
 .vscode/
 
 data/*
+tests/output/
