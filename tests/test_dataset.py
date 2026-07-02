@@ -14,8 +14,8 @@ from thesis_ml.data.dataset import (
     SC2DiffusionDataset,
     build_input_records,
     build_target_canvas,
-    drop_final_partial_timestep,
 )
+from thesis_ml.data.windowing import load_window_manifest, preprocess_replays
 from thesis_ml.serialize import serialize_snapshot
 from thesis_ml.vocab.content_vocab import load_content_vocabulary
 from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID
@@ -33,7 +33,7 @@ def _config(*, window: int = 8, budget: int = 256) -> ProjectConfig:
         config,
         data=replace(
             config.data,
-            input_window_timesteps=window,
+            input_budget_tokens=max(64, window * 256),
             canvas_budget_tokens=budget,
         ),
     )
@@ -118,7 +118,7 @@ def test_canvas_grammar_exact_budget_for_terminated_and_truncated_examples() -> 
     assert truncated.terminated is False
     assert len(truncated.token_ids) == 17
     assert END_ID not in truncated.token_ids
-    assert PAD_ID not in truncated.token_ids
+    assert PAD_ID in truncated.token_ids
     _assert_canvas_grammar(truncated.token_ids)
 
 
@@ -174,7 +174,7 @@ def test_class_label_coverage_and_partially_fogged_group_counts() -> None:
     assert len(fogged_positions) == omitted
 
 
-def test_truncated_flag_and_eval_drop() -> None:
+def test_truncated_target_ends_at_boundary_and_pads_without_end() -> None:
     target = build_target_canvas(
         _frame().head(20),
         _config(window=8, budget=17),
@@ -184,22 +184,30 @@ def test_truncated_flag_and_eval_drop() -> None:
         fogged_counts={},
     )
     assert target.truncated is True
-    dropped = drop_final_partial_timestep(target.token_ids, truncated=target.truncated)
-    assert len(dropped) <= len(target.token_ids)
-    if dropped:
-        assert dropped[-1] == DELIMITER_ID
+    assert END_ID not in target.token_ids
+    first_pad = target.token_ids.index(PAD_ID)
+    assert target.token_ids[first_pad - 1] == DELIMITER_ID
+    assert all(token == PAD_ID for token in target.token_ids[first_pad:])
 
 
-def test_dataset_and_collate_determinism_under_seed() -> None:
-    config = _config(window=8, budget=256)
+def test_dataset_and_collate_determinism_under_seed(tmp_path: Path) -> None:
+    base = _config(window=8, budget=256)
+    config = replace(
+        base,
+        data=replace(
+            base.data,
+            tokenized_replay_dir=str(tmp_path / "artifacts"),
+            window_manifest_path=str(tmp_path / "manifest.jsonl"),
+        ),
+    )
     vocab = _vocab()
+    preprocess_replays([FIXTURE], config, vocab, perspectives=("p1",))
+    windows = load_window_manifest(config.data.window_manifest_path, config=config)
     kwargs = dict(
-        replay_paths=[FIXTURE],
+        windows=windows,
         config=config,
         vocabulary=vocab,
         seed=123,
-        examples_per_replay=1,
-        perspectives=("p1",),
         fog_rate_override=0.5,
     )
     first = SC2DiffusionDataset(**kwargs)[0]
@@ -211,18 +219,23 @@ def test_dataset_and_collate_determinism_under_seed() -> None:
 
     batch = collate_diffusion_examples([first, second])
     assert batch.input_token_ids.shape[0] == 2
-    assert batch.target_canvas.shape == (2, config.data.canvas_budget_tokens)
+    assert batch.target_canvas.shape[1] <= config.data.canvas_budget_tokens
     assert torch.equal(batch.input_lengths, torch.tensor([len(first.input_token_ids), len(second.input_token_ids)]))
-    assert batch.canvas_loss_mask.all()
+    assert torch.equal(batch.canvas_loss_mask, batch.canvas_attention_mask)
+
+    training_batch = collate_diffusion_examples([first, second], retain_metadata=False)
+    assert training_batch.input_records == []
+    assert training_batch.canvas_metadata == []
+    assert training_batch.input_features.map_values.shape[:2] == batch.input_token_ids.shape
 
 
 def _assert_canvas_grammar(token_ids: list[int]) -> None:
     if PAD_ID in token_ids:
         first_pad = token_ids.index(PAD_ID)
         assert first_pad > 0
-        assert token_ids[first_pad - 1] in {END_ID, PAD_ID}
-        assert END_ID in token_ids[: first_pad + 1]
+        assert token_ids[first_pad - 1] in {END_ID, DELIMITER_ID}
         assert all(token == PAD_ID for token in token_ids[first_pad:])
     if END_ID in token_ids:
         end_index = token_ids.index(END_ID)
+        assert end_index > 0 and token_ids[end_index - 1] == DELIMITER_ID
         assert all(token == PAD_ID for token in token_ids[end_index + 1 :])

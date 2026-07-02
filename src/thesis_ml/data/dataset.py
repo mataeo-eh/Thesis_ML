@@ -9,9 +9,17 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 
 from thesis_ml.config import ProjectConfig
+from thesis_ml.data.windowing import (
+    ENTITY_CODE,
+    P1_CODE,
+    P2_CODE,
+    TokenizedReplay,
+    WindowManifestEntry,
+)
+from thesis_ml.model.embedding import STAT_KEYS
 from thesis_ml.serialize import TokenRecord, serialize_snapshot
 from thesis_ml.vocab.content_vocab import ContentVocabulary
 from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID
@@ -63,74 +71,60 @@ class DatasetExample:
     window_start: int
     perspective_player: str
     replay_path: Path | None = None
+    clean_input_token_ids: torch.Tensor | None = None
+    window_end: int | None = None
+    replay_id: str | None = None
 
 
 class SC2DiffusionDataset(Dataset[DatasetExample]):
-    """PyTorch dataset for clamped-input and clean-canvas examples.
-
-    Window starts are sampled once during construction using the optional seed.
-    Fog is sampled per item with a seed derived from the dataset seed and item index,
-    making tests reproducible while leaving the unseeded training path random.
-    Short games use all available rows from the sampled start.
-    """
+    """Lazy manifest-backed clamped-input and clean-canvas examples."""
 
     def __init__(
         self,
-        replay_paths: Sequence[str | Path],
+        windows: Sequence[WindowManifestEntry],
         config: ProjectConfig,
         vocabulary: ContentVocabulary,
         *,
         seed: int | None = None,
-        examples_per_replay: int = 1,
-        perspectives: Sequence[str] = ("p1", "p2"),
         fog_rate_override: float | None = None,
     ) -> None:
-        self.replay_paths = tuple(Path(path) for path in replay_paths)
+        self.windows = tuple(windows)
         self.config = config
         self.vocabulary = vocabulary
         self.seed = seed
         self.fog_rate_override = fog_rate_override
-        self._frames: dict[Path, pd.DataFrame] = {}
-
-        rng = np.random.default_rng(seed)
-        windows: list[ReplayWindow] = []
-        for replay_path in self.replay_paths:
-            row_count = len(pd.read_parquet(replay_path, columns=["game_loop"]))
-            max_start = max(0, row_count - 1)
-            for perspective in perspectives:
-                for _ in range(examples_per_replay):
-                    start = int(rng.integers(0, max_start + 1)) if max_start else 0
-                    windows.append(ReplayWindow(replay_path, start, perspective))
-        self.windows = tuple(windows)
+        self._artifact_path: str | None = None
+        self._artifact: TokenizedReplay | None = None
+        self._serve_counts: dict[int, int] = {}
+        self._epoch = 0
 
     def __len__(self) -> int:
         return len(self.windows)
 
     def __getitem__(self, index: int) -> DatasetExample:
+        if index < 0:
+            index += len(self.windows)
         window = self.windows[index]
-        frame = self._frame(window.replay_path)
-        end = min(len(frame), window.start + self.config.data.input_window_timesteps)
-        input_frame = frame.iloc[window.start:end]
+        replay = self._replay(window.artifact_path)
         enemy_player = _enemy_player(window.perspective_player)
         rng = self._rng_for_index(index)
         fog_rate = self._sample_fog_rate(rng)
 
-        input_records, fogged_counts, observed_counts = build_input_records(
-            input_frame,
-            self.config,
+        input_records, clean_records, fogged_counts, observed_counts = _build_artifact_input(
+            replay,
+            window,
             self.vocabulary,
-            window.perspective_player,
             fog_rate=fog_rate,
             rng=rng,
         )
 
-        target = build_target_canvas(
-            frame.iloc[window.start:],
-            self.config,
+        target = _build_artifact_target(
+            replay,
+            window,
             self.vocabulary,
             enemy_player,
-            input_timestep_count=len(input_frame),
             fogged_counts=fogged_counts,
+            budget=self.config.data.canvas_budget_tokens,
         )
 
         return DatasetExample(
@@ -143,20 +137,32 @@ class SC2DiffusionDataset(Dataset[DatasetExample]):
             canvas_metadata=target.metadata,
             fogged_counts=fogged_counts,
             observed_counts=observed_counts,
-            window_start=window.start,
+            window_start=window.start_timestep,
             perspective_player=window.perspective_player,
-            replay_path=window.replay_path,
+            replay_path=Path(window.replay_path),
+            clean_input_token_ids=torch.tensor([record.token_id for record in clean_records], dtype=torch.long),
+            window_end=window.end_timestep,
+            replay_id=window.replay_id,
         )
 
-    def _frame(self, path: Path) -> pd.DataFrame:
-        if path not in self._frames:
-            self._frames[path] = pd.read_parquet(path).sort_values("game_loop").reset_index(drop=True)
-        return self._frames[path]
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def _replay(self, artifact_path: str) -> TokenizedReplay:
+        if self._artifact is None or self._artifact_path != artifact_path:
+            self._artifact = TokenizedReplay(artifact_path)
+            self._artifact_path = artifact_path
+        return self._artifact
 
     def _rng_for_index(self, index: int) -> np.random.Generator:
-        if self.seed is None:
-            return np.random.default_rng()
-        return np.random.default_rng(self.seed + index)
+        serving = self._serve_counts.get(index, 0)
+        self._serve_counts[index] = serving + 1
+        worker = get_worker_info()
+        worker_seed = int(worker.seed) if worker is not None else 0
+        base = int(self.seed) if self.seed is not None else int(np.random.SeedSequence().entropy)
+        return np.random.default_rng(
+            np.random.SeedSequence([base, self._epoch, index, serving, worker_seed & 0xFFFFFFFF])
+        )
 
     def _sample_fog_rate(self, rng: np.random.Generator) -> float:
         if self.fog_rate_override is not None:
@@ -165,6 +171,167 @@ class SC2DiffusionDataset(Dataset[DatasetExample]):
         if distribution.name != "uniform":
             raise ValueError(f"unsupported fog distribution: {distribution.name}")
         return float(rng.uniform(distribution.min, distribution.max))
+
+
+def _build_artifact_input(
+    replay: TokenizedReplay,
+    window: WindowManifestEntry,
+    vocabulary: ContentVocabulary,
+    *,
+    fog_rate: float,
+    rng: np.random.Generator,
+) -> tuple[list[TokenRecord], list[TokenRecord], dict[tuple[int, str], int], dict[tuple[int, str], int]]:
+    self_code = P1_CODE if window.perspective_player == "p1" else P2_CODE
+    enemy_code = P2_CODE if self_code == P1_CODE else P1_CODE
+    self_block: list[TokenRecord] = []
+    clean_enemy_block: list[TokenRecord] = []
+    fogged_enemy_block: list[TokenRecord] = []
+    fogged_counts: dict[tuple[int, str], int] = {}
+    observed_counts: dict[tuple[int, str], int] = {}
+    for relative_timestep, timestep in enumerate(range(window.start_timestep, window.end_timestep)):
+        records = _artifact_timestep_records(replay, timestep, vocabulary, window.perspective_player)
+        delimiter = _artifact_delimiter(replay, timestep)
+        self_records = [record for code, record in records if code == self_code]
+        enemy_records = [record for code, record in records if code == enemy_code]
+        self_block.extend(self_records)
+        self_block.append(delimiter)
+        clean_enemy_block.extend(enemy_records)
+        clean_enemy_block.append(delimiter)
+        for record in enemy_records:
+            key = (relative_timestep, record.token_name)
+            if record.token_kind == "entity" and rng.random() < fog_rate:
+                _increment(fogged_counts, key)
+                continue
+            _increment(observed_counts, key)
+            fogged_enemy_block.append(record)
+        fogged_enemy_block.append(delimiter)
+    return (
+        self_block + fogged_enemy_block,
+        self_block + clean_enemy_block,
+        fogged_counts,
+        observed_counts,
+    )
+
+
+def _build_artifact_target(
+    replay: TokenizedReplay,
+    window: WindowManifestEntry,
+    vocabulary: ContentVocabulary,
+    enemy_player: str,
+    *,
+    fogged_counts: dict[tuple[int, str], int],
+    budget: int,
+) -> CanvasBuild:
+    enemy_code = P1_CODE if enemy_player == "p1" else P2_CODE
+    remaining_fogged = dict(fogged_counts)
+    token_ids: list[int] = []
+    class_labels: list[int] = []
+    metadata: list[dict[str, Any]] = []
+    truncated = False
+    reached_game_end = False
+    for timestep in range(window.start_timestep, replay.timestep_count):
+        relative_timestep = timestep - window.start_timestep
+        records = [
+            record
+            for code, record in _artifact_timestep_records(
+                replay, timestep, vocabulary, window.perspective_player
+            )
+            if code == enemy_code
+        ]
+        records.append(_artifact_delimiter(replay, timestep))
+        is_final_game_timestep = timestep == replay.timestep_count - 1
+        required = len(records) + (1 if is_final_game_timestep else 0)
+        if len(token_ids) + required > budget:
+            if relative_timestep < window.timestep_count:
+                raise RuntimeError(
+                    f"manifest reconstruction does not fit canvas: replay={window.replay_id} "
+                    f"start={window.start_timestep} end={window.end_timestep}"
+                )
+            truncated = True
+            break
+        for record in records:
+            token_ids.append(record.token_id)
+            class_labels.append(
+                _canvas_label(record, relative_timestep, window.timestep_count, remaining_fogged)
+            )
+            metadata.append(_canvas_metadata(record, relative_timestep))
+        if is_final_game_timestep:
+            reached_game_end = True
+            break
+
+    terminated = reached_game_end
+    if terminated:
+        token_ids.append(END_ID)
+        class_labels.append(CLASS_END)
+        metadata.append({"token_kind": "end", "timestep_index": None, "token_name": "[END]"})
+    else:
+        truncated = True
+    while len(token_ids) < budget:
+        token_ids.append(PAD_ID)
+        class_labels.append(CLASS_PAD)
+        metadata.append({"token_kind": "pad", "timestep_index": None, "token_name": "[PAD]"})
+    return CanvasBuild(token_ids, class_labels, metadata, terminated, truncated)
+
+
+def _artifact_timestep_records(
+    replay: TokenizedReplay,
+    timestep: int,
+    vocabulary: ContentVocabulary,
+    perspective_player: str,
+) -> list[tuple[int, TokenRecord]]:
+    result: list[tuple[int, TokenRecord]] = []
+    token_slice = replay.token_slice(timestep)
+    for position in range(token_slice.start, token_slice.stop):
+        owner_code = int(replay.owners[position])
+        owner = "p1" if owner_code == P1_CODE else "p2"
+        token_id = int(replay.token_ids[position])
+        token_name = vocabulary.token_name_for(token_id)
+        values = replay.features[position]
+        raw_attributes = {
+            key: float(values[2 + stat_index])
+            for stat_index, key in enumerate(STAT_KEYS)
+            if float(values[2 + stat_index]) != 0.0
+        }
+        record = TokenRecord(
+            token_id=token_id,
+            token_name=token_name,
+            token_kind="entity" if int(replay.kinds[position]) == ENTITY_CODE else "upgrade",
+            owner=owner,
+            allegiance="self" if owner == perspective_player else "enemy",
+            game_loop=int(replay.game_loops[timestep]),
+            timestamp_seconds=_optional_artifact_timestamp(replay.timestamps[timestep]),
+            entity_type=token_name,
+            raw_position=(float(values[0]), float(values[1]), 0.0),
+            raw_attributes=raw_attributes,
+        )
+        result.append((owner_code, record))
+    return result
+
+
+def _artifact_delimiter(replay: TokenizedReplay, timestep: int) -> TokenRecord:
+    return TokenRecord(
+        token_id=DELIMITER_ID,
+        token_name="[DELIMITER]",
+        token_kind="delimiter",
+        owner=None,
+        allegiance=None,
+        game_loop=int(replay.game_loops[timestep]),
+        timestamp_seconds=_optional_artifact_timestamp(replay.timestamps[timestep]),
+    )
+
+
+def _optional_artifact_timestamp(value: float) -> float | None:
+    return None if np.isnan(value) else float(value)
+
+
+def _read_replay_frame(path: Path) -> pd.DataFrame:
+    """Read one replay parquet into a game-loop-ordered DataFrame.
+
+    Module-level (not a closure) so it is picklable to DataLoader workers and
+    can be passed as the BoundedFrameCache loader callback.
+    """
+
+    return pd.read_parquet(path).sort_values("game_loop").reset_index(drop=True)
 
 
 def build_input_records(
@@ -222,34 +389,34 @@ def build_target_canvas(
     metadata: list[dict[str, Any]] = []
     truncated = False
     terminated = False
+    rows = list(target_frame.iterrows())
 
-    for timestep_index, (_, row) in enumerate(target_frame.iterrows()):
+    for timestep_index, (_, row) in enumerate(rows):
         records = serialize_snapshot(row, config, vocabulary, perspective_player=_enemy_player(enemy_player))
         enemy_records = _records_for_owner(records, enemy_player)
         timestep_records = enemy_records + [_delimiter(records)]
-
+        is_final_game_timestep = timestep_index == len(rows) - 1
+        required = len(timestep_records) + (1 if is_final_game_timestep else 0)
+        if len(token_ids) + required > budget:
+            truncated = True
+            break
         for record in timestep_records:
-            if len(token_ids) >= budget:
-                truncated = True
-                break
             label = _canvas_label(record, timestep_index, input_timestep_count, remaining_fogged_counts)
             token_ids.append(record.token_id)
             class_labels.append(label)
             metadata.append(_canvas_metadata(record, timestep_index))
-        if len(token_ids) >= budget:
-            truncated = True
+        if is_final_game_timestep:
+            terminated = True
             break
 
-    if not truncated:
-        if len(token_ids) < budget:
-            token_ids.append(END_ID)
-            class_labels.append(CLASS_END)
-            metadata.append({"token_kind": "end", "timestep_index": None, "token_name": "[END]"})
-            terminated = True
-        while len(token_ids) < budget:
-            token_ids.append(PAD_ID)
-            class_labels.append(CLASS_PAD)
-            metadata.append({"token_kind": "pad", "timestep_index": None, "token_name": "[PAD]"})
+    if terminated:
+        token_ids.append(END_ID)
+        class_labels.append(CLASS_END)
+        metadata.append({"token_kind": "end", "timestep_index": None, "token_name": "[END]"})
+    while len(token_ids) < budget:
+        token_ids.append(PAD_ID)
+        class_labels.append(CLASS_PAD)
+        metadata.append({"token_kind": "pad", "timestep_index": None, "token_name": "[PAD]"})
 
     return CanvasBuild(
         token_ids=token_ids,
@@ -258,20 +425,6 @@ def build_target_canvas(
         terminated=terminated,
         truncated=truncated,
     )
-
-
-def drop_final_partial_timestep(token_ids: Sequence[int], *, truncated: bool) -> list[int]:
-    """Return tokens suitable for eval by dropping a truncated final partial timestep."""
-
-    if not truncated:
-        return list(token_ids)
-    last_delimiter = -1
-    for index, token_id in enumerate(token_ids):
-        if token_id == DELIMITER_ID:
-            last_delimiter = index
-    return list(token_ids[: last_delimiter + 1])
-
-
 def _canvas_label(
     record: TokenRecord,
     timestep_index: int,
@@ -298,6 +451,7 @@ def _canvas_metadata(record: TokenRecord, timestep_index: int) -> dict[str, Any]
         "timestep_index": timestep_index,
         "owner": record.owner,
         "instance_id": record.instance_id,
+        "game_loop": record.game_loop,
     }
 
 
