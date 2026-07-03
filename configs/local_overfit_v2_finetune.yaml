@@ -1,0 +1,49 @@
+# Debut-mode fine-tune profile (Worker 5).
+#
+# This config extends the pre-training overfit profile (local_overfit_v2.yaml)
+# so it inherits the SAME replay selection seeds (pipeline.seed=1729,
+# pipeline.split_seed=1729, replay_subset_size=25, validation_replay_count=3)
+# and the SAME data.* window budgets (sampling_interval_s, input_budget_tokens,
+# canvas_budget_tokens, canvas_recon_fraction) -- none of those are overridden
+# here, which is what lets `finetune_pipeline.py` reuse the pre-training
+# window manifest instead of rebuilding it.
+#
+# Only the settings needed to turn the pre-trained checkpoint into a debut
+# fine-tune are overridden below:
+#   - a much smaller learning rate (fine-tuning, not training from scratch)
+#   - a fresh 100-epoch fine-tune budget
+#   - the warm-start source checkpoint (weights only, see TrainingLoop.load_model_weights)
+#   - debut_mode / outcome_last so the dataset builds the 7-class debut target
+#     and the sampler denoises the [WIN]/[LOSS] outcome token LAST
+#   - a SEPARATE checkpoint directory so fine-tune checkpoints never overwrite
+#     the pre-trained checkpoints at checkpoints/local-overfitV2
+extends: local_overfit_v2.yaml
+
+train:
+  lr: 1.0e-6
+  epochs: 100
+  init_from_checkpoint: checkpoints/local-overfitV2/last.pt
+
+data:
+  debut_mode: true
+
+sampler:
+  outcome_last: true
+
+eval:
+  # The 25 memorized + 3 dev replays expand into well over a thousand overlapping
+  # windows. Scoring every one would sample the diffusion model thousands of
+  # times and hold every example in host RAM. Cap each report section to an
+  # evenly-strided sample that still spans early->late input reach (so the
+  # 1/3/5/7/10-minute win/loss buckets stay populated). Raise this for a more
+  # thorough final evaluation; it only affects the eval pass, not training.
+  debut_max_examples: 40
+
+storage:
+  # SEPARATE checkpoint directory: fine-tuning must never clobber the
+  # pre-trained weights sitting at checkpoints/local-overfitV2.
+  checkpoint_uri: checkpoints/local-overfitV2-finetune
+  # log_uri is intentionally NOT overridden: it stays tests/output/overfitV2
+  # (the same directory pre-training writes to). The finetune_pipeline module
+  # is responsible for prefixing every file it writes there with "finetune_"
+  # so pre-training's step_metrics.jsonl / epoch_metrics.csv are untouched.

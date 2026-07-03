@@ -102,7 +102,7 @@ def test_valid_config_loads() -> None:
 
 def test_local_profiles_extend_default_and_disable_self_conditioning() -> None:
     root = DEFAULT_CONFIG.parents[1]
-    for name in ("local_overfit.yaml", "local_full.yaml"):
+    for name in ("local_overfit.yaml", "local_overfit_v2.yaml", "local_full.yaml"):
         config = load_config(root / "configs" / name)
         assert config.data.sampling_interval_s == 1
         assert config.data.input_budget_tokens == 4096
@@ -113,6 +113,7 @@ def test_local_profiles_extend_default_and_disable_self_conditioning() -> None:
         assert config.train.require_cuda is True
 
     overfit = load_config(root / "configs" / "local_overfit.yaml")
+    overfit_v2 = load_config(root / "configs" / "local_overfit_v2.yaml")
     full = load_config(root / "configs" / "local_full.yaml")
     assert overfit.pipeline.replay_subset_size == 25
     assert overfit.pipeline.validation_replay_count == 3
@@ -120,10 +121,16 @@ def test_local_profiles_extend_default_and_disable_self_conditioning() -> None:
     assert overfit.pipeline.num_workers == 4
     assert overfit.pipeline.prefetch_factor == 4
     assert overfit.train.epochs == 200
-    assert overfit.train.early_stopping_patience_epochs == 15
-    assert overfit.loss.class_loss_weights.pad == 0.2
+    assert overfit.train.early_stopping_patience_epochs == 5
+    assert overfit.loss.class_loss_weights.pad == 1.0
     assert overfit.train.max_cuda_reserved_gb == 7.5
     assert overfit.model.gradient_checkpointing is True
+    assert overfit_v2.train.epochs == 200
+    assert overfit_v2.train.early_stopping_patience_epochs == 0
+    assert overfit_v2.loss.class_loss_weights.pad == 0.2
+    assert overfit_v2.storage.checkpoint_uri == "checkpoints/local-overfitV2"
+    assert overfit_v2.storage.log_uri == "tests/output/overfitV2"
+    assert overfit_v2.storage.local_cache_dir == ".pipeline_cache/local-overfitV2"
     assert full.train.epochs == 8
 
 
@@ -135,6 +142,21 @@ def test_unknown_key_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="unexpected"):
         load_config(config_path)
+
+
+def test_nested_extends_and_cycles_are_handled(tmp_path: Path) -> None:
+    base = tmp_path / "base.yaml"
+    middle = tmp_path / "middle.yaml"
+    child = tmp_path / "child.yaml"
+    base.write_text(DEFAULT_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
+    middle.write_text("extends: base.yaml\ntrain:\n  epochs: 20\n", encoding="utf-8")
+    child.write_text("extends: middle.yaml\ntrain:\n  epochs: 30\n", encoding="utf-8")
+
+    assert load_config(child).train.epochs == 30
+
+    base.write_text("extends: child.yaml\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="extends cycle"):
+        load_config(child)
 
 
 def test_wrong_typed_value_is_rejected(tmp_path: Path) -> None:

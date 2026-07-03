@@ -6,6 +6,9 @@ data:
   within_type_tiebreak: unit_id
   tokenized_replay_dir: data/processed/tokenized_replays
   window_manifest_path: data/processed/window_manifest.jsonl
+  # Debut build-order + win/loss fine-tuning target mode. Off by default so the
+  # pretraining target path is unchanged. Set True only for fine-tuning runs.
+  debut_mode: false
 
 fog:
   rate_distribution:
@@ -99,6 +102,10 @@ train:
   precision: bf16
   require_cuda: false
   max_cuda_reserved_gb: 0.0
+  # Weights-only fine-tune warm-start source. Empty string = disabled (the
+  # pre-training pipeline never sets this, so it always trains from scratch
+  # / full-resumes as before). See TrainingLoop.load_model_weights.
+  init_from_checkpoint: ""
 
 sampler:
   max_steps: 48
@@ -108,11 +115,15 @@ sampler:
   entropy_bound: 0.1
   confidence_threshold: 0.0
   min_commit_per_step: 1
+  outcome_last: false
 
 eval:
   heldout_split: validation
   timing_tolerance_buckets: 1
   fog_rate: 0.0
+  debut_minute_buckets: "1,3,5,7,10"
+  debut_fog_bucket_edges: "0.3,0.7"
+  debut_max_examples: 0
 
 loss:
   use_fused_cross_entropy: false
@@ -123,3 +134,4 @@ loss:
     delimiter: 1.0
     end: 1.0
     pad: 1.0
+    win_loss: 1.0

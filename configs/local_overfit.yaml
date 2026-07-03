@@ -35,7 +35,7 @@ model:
 train:
   epochs: 200
   max_steps: 0
-  early_stopping_patience_epochs: 15
+  early_stopping_patience_epochs: 5
   early_stopping_min_relative_improvement: 0.001
   accumulation_steps: 1
   target_effective_batch_tokens: 0
@@ -45,7 +45,3 @@ train:
   precision: bf16
   require_cuda: true
   max_cuda_reserved_gb: 7.5
-
-loss:
-  class_loss_weights:
-    pad: 0.2

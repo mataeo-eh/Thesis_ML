@@ -218,7 +218,7 @@ def test_dynamic_padding_masks_loss_and_preserves_real_position_outputs(tmp_path
 
 
 def test_local_cadence_matches_timing_recovery() -> None:
-    for profile in ("local_overfit.yaml", "local_full.yaml"):
+    for profile in ("local_overfit.yaml", "local_overfit_v2.yaml", "local_full.yaml"):
         config = load_config(ROOT / "configs" / profile)
         assert config.data.sampling_interval_s == 1
         timed = attach_absolute_times(

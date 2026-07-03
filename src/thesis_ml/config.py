@@ -29,6 +29,12 @@ class DataConfig:
     within_type_tiebreak: str
     tokenized_replay_dir: str
     window_manifest_path: str
+    # When True, the artifact target builder produces a "debut build-order +
+    # win/loss outcome" canvas (fine-tuning mode) instead of the default
+    # full-reconstruction target. When False (default), the pretraining target
+    # path is used and behaves exactly as before. This flag ONLY switches the
+    # target builder; it does not change the input manifest or any budget.
+    debut_mode: bool
 
 
 @dataclass(frozen=True)
@@ -154,6 +160,13 @@ class TrainConfig:
     precision: str
     require_cuda: bool
     max_cuda_reserved_gb: float
+    # Weights-only warm-start source for fine-tuning (Worker 5). When this is
+    # a non-empty path, the fine-tune pipeline loads ONLY the model weights
+    # from this checkpoint (see `TrainingLoop.load_model_weights`) before
+    # training begins, rather than doing a full optimizer/step/epoch resume.
+    # Empty string "" (the default) disables warm-start entirely, which
+    # keeps the pre-training path (`train_pipeline.py`) fully unaffected.
+    init_from_checkpoint: str
 
 
 @dataclass(frozen=True)
@@ -169,6 +182,11 @@ class SamplerConfig:
     entropy_bound: float
     confidence_threshold: float
     min_commit_per_step: int
+    # Fine-tune sampler constraint (Worker 2). When True, the leading canvas
+    # position (index 0, the [WIN]/[LOSS] outcome token) is denoised LAST: it may
+    # only be committed after every other canvas position has been committed.
+    # Default False reproduces the pre-training sampler exactly.
+    outcome_last: bool
 
 
 @dataclass(frozen=True)
@@ -176,6 +194,24 @@ class EvalConfig:
     heldout_split: str
     timing_tolerance_buckets: int
     fog_rate: float
+    # Fine-tune debut evaluation buckets (Worker 4). Config validation only
+    # supports scalar field types (int/float/str/bool), so these list-shaped
+    # bucket definitions are stored as comma-separated strings and parsed by the
+    # eval code. `debut_minute_buckets` = cumulative win/loss accuracy checkpoints
+    # in minutes; `debut_fog_bucket_edges` = the two fog-rate boundaries that
+    # split examples into <low / mid / >high fogged buckets.
+    debut_minute_buckets: str
+    debut_fog_bucket_edges: str
+    # Fine-tune debut evaluation SIZE CAP (Worker 4 / Worker 5). A windowed
+    # dataset expands each replay into MANY overlapping windows (e.g. 25 replays
+    # -> ~1360 windows). The debut evaluator samples the diffusion model once per
+    # example, so scoring every window would sample thousands of times and hold
+    # every materialized example in host RAM. This caps how many examples each
+    # report section ("memorized"/"test") scores. The pipeline picks them by
+    # EVEN STRIDING across the dataset so the sample still spans early->late
+    # input reach (needed for the 1/3/5/7/10-minute win/loss buckets). 0 = score
+    # every window (only sensible for very small datasets).
+    debut_max_examples: int
 
 
 @dataclass(frozen=True)
@@ -186,6 +222,10 @@ class ClassLossWeightsConfig:
     delimiter: float
     end: float
     pad: float
+    # Fine-tune win/loss outcome class weight (Worker 3). Class id 6
+    # (CLASS_WINLOSS). Only used when the debut taxonomy is active; harmless in
+    # pre-training (that path never emits class-id-6 labels).
+    win_loss: float
 
 
 @dataclass(frozen=True)
@@ -212,7 +252,18 @@ class ProjectConfig:
 def load_config(path: str | Path) -> ProjectConfig:
     """Load and validate a YAML config file."""
 
-    config_path = Path(path)
+    raw = _load_config_mapping(Path(path).resolve(), stack=())
+    return _build_dataclass(ProjectConfig, raw, "config")
+
+
+def _load_config_mapping(
+    config_path: Path,
+    *,
+    stack: tuple[Path, ...],
+) -> dict[str, Any]:
+    if config_path in stack:
+        cycle = " -> ".join(str(path) for path in (*stack, config_path))
+        raise ConfigError(f"config.extends cycle: {cycle}")
     with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle)
 
@@ -224,13 +275,10 @@ def load_config(path: str | Path) -> ProjectConfig:
         if not isinstance(extends, str):
             raise ConfigError("config.extends must be str")
         base_path = (config_path.parent / extends).resolve()
-        with base_path.open("r", encoding="utf-8") as handle:
-            base_raw = yaml.safe_load(handle)
-        if not isinstance(base_raw, dict):
-            raise ConfigError("extended config must be a mapping")
+        base_raw = _load_config_mapping(base_path, stack=(*stack, config_path))
         raw = _deep_merge(base_raw, raw)
 
-    return _build_dataclass(ProjectConfig, raw, "config")
+    return raw
 
 
 def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:

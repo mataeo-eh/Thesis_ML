@@ -8,6 +8,7 @@ from thesis_ml.config import ProjectConfig, load_config
 from thesis_ml.data.dataset import (
     CLASS_DELIMITER,
     CLASS_ENEMY_FOGGED,
+    CLASS_ENEMY_FUTURE,
     CLASS_ENEMY_OBSERVED,
     CLASS_PAD,
 )
@@ -321,6 +322,30 @@ def test_per_class_logging_populated_and_consistent() -> None:
     assert set(result.per_class) == {"enemy-observed", "enemy-fogged", "[DELIMITER]", "[PAD]"}
     expected = torch.stack(list(result.per_class.values())).mean()
     assert torch.allclose(result.loss, expected)
+
+
+def test_future_loss_is_bucketed_by_prediction_distance() -> None:
+    loss_fn = CanvasCrossEntropyLoss(_small_config())
+    logits = torch.zeros(1, 6, 8)
+    target = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    labels = torch.full((1, 6), CLASS_ENEMY_FUTURE, dtype=torch.long)
+    distances = torch.tensor([[1, 3, 8, 20, 40, -1]])
+
+    result = loss_fn(logits, target, labels, prediction_distances=distances)
+
+    assert set(result.future_distance) == {"1", "2_5", "6_10", "11_30", "31_plus"}
+    assert result.future_distance_counts == {
+        "1": 1,
+        "2_5": 1,
+        "6_10": 1,
+        "11_30": 1,
+        "31_plus": 1,
+    }
+    expected = torch.log(torch.tensor(8.0)).item()
+    assert all(
+        value.item() == pytest.approx(expected)
+        for value in result.future_distance.values()
+    )
 
 
 def test_attention_is_bidirectional() -> None:

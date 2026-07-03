@@ -8,11 +8,23 @@ from torch.utils.data import DataLoader
 
 from thesis_ml.config import ProjectConfig, load_config
 from thesis_ml.data.collate import collate_diffusion_examples
+from thesis_ml.data.dataset import (
+    CLASS_DELIMITER,
+    CLASS_END,
+    CLASS_ENEMY_FOGGED,
+    CLASS_ENEMY_FUTURE,
+    CLASS_ENEMY_OBSERVED,
+    CLASS_PAD,
+    CLASS_WINLOSS,
+    DEBUT_CLASS_ID_TO_NAME,
+    DatasetExample,
+)
 from thesis_ml.model.loss import CLASS_ID_TO_NAME
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.train.corruption import corrupt_batch, inverse_t_weights
 from thesis_ml.train.loop import TrainingLoop, auxiliary_confidence_loss
-from thesis_ml.train.train import make_synthetic_examples, run_smoke_train
+from thesis_ml.train.train import _synthetic_input_records, make_synthetic_examples, run_smoke_train
+from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID, WIN_ID
 
 
 def test_smoke_train_loss_decreases_and_first_step_per_class_logs(tmp_path: Path) -> None:
@@ -224,10 +236,197 @@ def test_epoch_metrics_csv_contains_train_dev_classes_and_throughput(tmp_path: P
     assert all(float(row["wall_clock_elapsed_seconds"]) > 0 for row in rows)
     assert all(float(row["average_input_timesteps"]) == pytest.approx(8.0) for row in rows)
     assert all(float(row["average_enemy_future_timesteps"]) == pytest.approx(1.0) for row in rows)
+    assert all(float(row["input_timestep_p50"]) == pytest.approx(8.0) for row in rows)
+    assert all(float(row["input_timestep_p90"]) == pytest.approx(8.0) for row in rows)
+    assert all(float(row["input_timestep_p95"]) == pytest.approx(8.0) for row in rows)
+    assert all(float(row["enemy_future_timestep_p50"]) == pytest.approx(1.0) for row in rows)
+    assert all(float(row["enemy_future_timestep_p90"]) == pytest.approx(1.0) for row in rows)
+    assert all(float(row["enemy_future_timestep_p95"]) == pytest.approx(1.0) for row in rows)
+    assert all(float(row["train_enemy_future_loss_distance_1"]) > 0 for row in rows)
+    assert all(float(row["dev_enemy_future_loss_distance_1"]) > 0 for row in rows)
+    assert all(row["train_enemy_future_loss_distance_2_5"] == "" for row in rows)
     assert [int(row["total_tokens_ingested"]) for row in rows] == [40, 80]
     assert [int(row["total_unique_tokens_seen"]) for row in rows] == [9, 9]
     assert "train_enemy_observed_loss" in rows[0]
     assert "dev_pad_loss" in rows[0]
+
+
+def test_epoch_metrics_migrates_an_existing_narrower_schema(tmp_path: Path) -> None:
+    config = _small_config(tmp_path)
+    examples = make_synthetic_examples(config, count=2)
+    train_loader = DataLoader(examples, batch_size=2, collate_fn=collate_diffusion_examples)
+    csv_path = tmp_path / "epoch_metrics.csv"
+    csv_path.write_text("epoch,train_loss\n0,9.0\n", encoding="utf-8")
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=75, epoch_metrics_path=csv_path)
+
+    loop.fit(train_loader, max_steps=1, epochs=1, fixed_t=1.0)
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 2
+    assert rows[0]["epoch"] == "0"
+    assert rows[0]["average_input_timesteps"] == ""
+    assert rows[1]["average_input_timesteps"] == "8.0"
+
+
+def test_pretraining_epoch_metrics_has_exactly_six_original_class_columns(tmp_path: Path) -> None:
+    """Debut-mode support must NOT change pretraining's epoch-CSV shape.
+
+    This locks in the "byte-for-byte unchanged when debut mode is off"
+    requirement: with debut_mode False (the default), the CSV must contain
+    exactly the original 6 pretraining class names (enemy_observed,
+    enemy_fogged, enemy_future, delimiter, end, pad) and nothing from the
+    7-class debut taxonomy (in particular, no win_loss column).
+    """
+
+    config = _small_config(tmp_path)
+    assert config.data.debut_mode is False
+    examples = make_synthetic_examples(config, count=2)
+    train_loader = DataLoader(examples, batch_size=2, collate_fn=collate_diffusion_examples)
+    csv_path = tmp_path / "epoch_metrics.csv"
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=81, epoch_metrics_path=csv_path)
+
+    loop.fit(train_loader, max_steps=1, epochs=1, fixed_t=1.0)
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = set(reader.fieldnames or [])
+        rows = list(reader)
+    expected_class_columns = {
+        f"{split}_{name}_loss"
+        for split in ("train", "dev")
+        for name in ("enemy_observed", "enemy_fogged", "enemy_future", "delimiter", "end", "pad")
+    }
+    present_class_columns = {name for name in fieldnames if name.endswith("_loss") and name not in {"train_loss", "dev_loss"}}
+    # Only the 6 original pretraining class-loss columns should exist; the
+    # debut-only "win_loss" column must be absent, and no future-distance
+    # bucket columns should be mistaken for class columns (they use a
+    # different "_loss_distance_" naming scheme so they don't collide).
+    present_class_columns = {
+        name for name in present_class_columns if "loss_distance" not in name
+    }
+    assert present_class_columns == expected_class_columns
+    assert "train_win_loss_loss" not in fieldnames
+    assert all(float(rows[0][column]) >= 0 for column in expected_class_columns if rows[0][column] != "")
+
+
+def test_debut_mode_epoch_metrics_has_all_seven_classes_populated_from_epoch_one(tmp_path: Path) -> None:
+    """Debut mode must log all 7 debut classes, populated from the FIRST epoch.
+
+    Every synthetic debut canvas built by ``_make_debut_synthetic_examples``
+    below contains one token of each of the 7 debut classes (visible-debut,
+    fogged-debut, future-debut, delimiter, win-loss, end, pad), so every
+    train_/dev_ column for those classes should be a real (non-empty) numeric
+    value starting at epoch 1 -- there is no "ramp-up" period where a debut
+    class is simply absent from the data.
+    """
+
+    config = replace(_small_config(tmp_path), data=replace(_small_config(tmp_path).data, debut_mode=True))
+    examples = _make_debut_synthetic_examples(config, count=4)
+    train_loader = DataLoader(examples[:2], batch_size=2, collate_fn=collate_diffusion_examples)
+    dev_loader = DataLoader(examples[2:], batch_size=2, collate_fn=collate_diffusion_examples)
+    csv_path = tmp_path / "epoch_metrics.csv"
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=82, epoch_metrics_path=csv_path)
+
+    loop.fit(train_loader, val_dataloader=dev_loader, max_steps=1, epochs=1, fixed_t=1.0)
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    first_row = rows[0]
+    assert first_row["epoch"] == "1"
+    # DEBUT_CLASS_ID_TO_NAME.values() = visible-debut, fogged-debut,
+    # future-debut, delimiter, win-loss, end, pad -- sanitized the same way
+    # train/loop.py's `_metric_class_name` sanitizes names for CSV headers.
+    expected_debut_columns = [
+        "visible_debut",
+        "fogged_debut",
+        "future_debut",
+        "delimiter",
+        "win_loss",
+        "end",
+        "pad",
+    ]
+    for name in expected_debut_columns:
+        for split in ("train", "dev"):
+            column = f"{split}_{name}_loss"
+            assert column in first_row, f"missing column {column}"
+            value = first_row[column]
+            assert value != "", f"{column} is empty on the first epoch"
+            assert float(value) >= 0.0
+
+
+def _make_debut_synthetic_examples(config: ProjectConfig, *, count: int) -> list[DatasetExample]:
+    """Build tiny synthetic debut-mode canvases containing all 7 debut classes.
+
+    Mirrors ``thesis_ml.train.train.make_synthetic_examples`` (the
+    pretraining fixture) but lays out a debut-style canvas: a single win/loss
+    outcome token at position 0 (``CLASS_WINLOSS``), followed by one token of
+    each of the other 6 debut classes. This lets the per-class-loss test
+    above assert every debut column is populated without needing a real
+    replay or the full ``_build_debut_target`` pipeline (which depends on
+    on-disk metadata unavailable in unit tests).
+    """
+
+    debut_canvas = torch.tensor(
+        [
+            WIN_ID,
+            100,
+            101,
+            DELIMITER_ID,
+            102,
+            103,
+            DELIMITER_ID,
+            104,
+            105,
+            DELIMITER_ID,
+            END_ID,
+            PAD_ID,
+        ],
+        dtype=torch.long,
+    )
+    debut_class_labels = torch.tensor(
+        [
+            CLASS_WINLOSS,
+            CLASS_ENEMY_OBSERVED,  # "visible-debut"
+            CLASS_ENEMY_OBSERVED,
+            CLASS_DELIMITER,  # "delimiter"
+            CLASS_ENEMY_FOGGED,  # "fogged-debut"
+            CLASS_ENEMY_FOGGED,
+            CLASS_DELIMITER,
+            CLASS_ENEMY_FUTURE,  # "future-debut"
+            CLASS_ENEMY_FUTURE,
+            CLASS_DELIMITER,
+            CLASS_END,  # "end"
+            CLASS_PAD,  # "pad"
+        ],
+        dtype=torch.long,
+    )
+    assert set(debut_class_labels.tolist()) == set(DEBUT_CLASS_ID_TO_NAME.keys())
+    examples = []
+    for example_index in range(count):
+        input_records = _synthetic_input_records(example_index)
+        examples.append(
+            DatasetExample(
+                input_records=input_records,
+                input_token_ids=torch.tensor([record.token_id for record in input_records], dtype=torch.long),
+                target_canvas=debut_canvas.clone(),
+                class_labels=debut_class_labels.clone(),
+                terminated=True,
+                truncated=False,
+                canvas_metadata=[
+                    {"token_id": int(token_id), "timestep_index": index // 3}
+                    for index, token_id in enumerate(debut_canvas.tolist())
+                ],
+                fogged_counts={},
+                observed_counts={},
+                window_start=example_index,
+                perspective_player="p1" if example_index % 2 == 0 else "p2",
+            )
+        )
+    return examples
 
 
 def test_training_prints_live_epoch_and_batch_progress(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

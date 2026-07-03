@@ -10,6 +10,7 @@ from thesis_ml.data.collate import collate_diffusion_examples
 from thesis_ml.data.dataset import (
     CLASS_DELIMITER,
     CLASS_ENEMY_FOGGED,
+    CLASS_ENEMY_FUTURE,
     CLASS_PAD,
     SC2DiffusionDataset,
     build_input_records,
@@ -222,11 +223,18 @@ def test_dataset_and_collate_determinism_under_seed(tmp_path: Path) -> None:
     assert batch.target_canvas.shape[1] <= config.data.canvas_budget_tokens
     assert torch.equal(batch.input_lengths, torch.tensor([len(first.input_token_ids), len(second.input_token_ids)]))
     assert torch.equal(batch.canvas_loss_mask, batch.canvas_attention_mask)
+    future_mask = batch.class_labels == CLASS_ENEMY_FUTURE
+    assert (batch.canvas_prediction_distances[future_mask] > 0).all()
+    assert (batch.canvas_prediction_distances[~future_mask] == -1).all()
 
     training_batch = collate_diffusion_examples([first, second], retain_metadata=False)
     assert training_batch.input_records == []
     assert training_batch.canvas_metadata == []
     assert training_batch.input_features.map_values.shape[:2] == batch.input_token_ids.shape
+    assert torch.equal(
+        training_batch.canvas_prediction_distances,
+        batch.canvas_prediction_distances,
+    )
 
 
 def _assert_canvas_grammar(token_ids: list[int]) -> None:

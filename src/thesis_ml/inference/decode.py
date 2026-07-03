@@ -75,6 +75,105 @@ def validate_canvas(token_ids: Sequence[int]) -> CanvasValidation:
     return CanvasValidation(True, None, None, True, False)
 
 
+def validate_debut_canvas(token_ids: Sequence[int]) -> CanvasValidation:
+    """Validate the RELAXED fine-tuning (debut-mode) canvas grammar.
+
+    This is a SEPARATE, additive validator for fine-tuning: it does NOT touch
+    ``validate_canvas`` (the pre-training grammar) and is never used by
+    ``decode_canvas``. The pre-training grammar explicitly REJECTS win/loss
+    outcome tokens; the fine-tuning grammar REQUIRES exactly one at position 0.
+
+    The debut grammar accepted here is:
+
+        [WIN | LOSS]                          # exactly one, at position 0
+        ( [DELIMITER] | timestep-tokens [DELIMITER] )+   # one group per timestep
+        ( [END] [PAD]* | [PAD]* )             # optional terminal [END], then pad
+
+    Notes on the relaxations relative to the pre-training grammar:
+      * A timestep may be EMPTY: two ``[DELIMITER]`` tokens back-to-back are
+        legal (an empty debut timestep emits a bare delimiter). The
+        pre-training grammar has no such notion because it reconstructs full
+        snapshots.
+      * Position 0 is the single outcome token, which the pre-training grammar
+        forbids anywhere.
+
+    Everything else mirrors the structural rules of ``validate_canvas``:
+      * No residual ``[MASK]`` may remain.
+      * ``[PAD]`` may only appear as a trailing run and may not precede ``[END]``.
+      * ``[END]`` must be immediately followed by ``[PAD]`` (or the sequence end)
+        and must sit on a completed timestep boundary (preceded by a
+        ``[DELIMITER]``).
+      * A truncated canvas (no ``[END]``) must still end on a timestep boundary.
+
+    Parameters:
+        token_ids: The full generated canvas token id sequence (position 0
+            included).
+
+    Returns:
+        A ``CanvasValidation``. ``valid`` is True only when the sequence matches
+        the debut grammar above; ``diagnosis`` explains the first violation.
+
+    Calls:
+        Nothing else; pure structural checks over the id sequence.
+    """
+
+    if not token_ids:
+        return CanvasValidation(False, "canvas is empty", None, False, False)
+    if MASK_ID in token_ids:
+        return CanvasValidation(False, "canvas still contains [MASK]", None, False, False)
+
+    # Rule 1: position 0 must be exactly one win/loss outcome token, and no other
+    # position may contain a win/loss token.
+    if token_ids[0] not in (WIN_ID, LOSS_ID):
+        return CanvasValidation(False, "debut canvas must start with a [WIN]/[LOSS] token", None, False, False)
+    rest = token_ids[1:]
+    if WIN_ID in rest or LOSS_ID in rest:
+        return CanvasValidation(False, "outcome token may appear only at position 0", None, False, False)
+
+    # Locate the first [PAD] and the (single expected) [END] over the whole
+    # sequence, mirroring validate_canvas's bookkeeping.
+    try:
+        first_pad = token_ids.index(PAD_ID)
+    except ValueError:
+        first_pad = None
+    try:
+        end_index = token_ids.index(END_ID)
+    except ValueError:
+        end_index = None
+
+    # [PAD] may never appear before [END].
+    if first_pad is not None and end_index is not None and first_pad < end_index:
+        return CanvasValidation(False, "[PAD] appears before [END]", end_index, False, False)
+    # Once padding starts it must run uninterrupted to the end.
+    if first_pad is not None:
+        for index, token_id in enumerate(token_ids[first_pad:], start=first_pad):
+            if token_id != PAD_ID:
+                return CanvasValidation(False, f"non-[PAD] token after padding at position {index}", end_index, False, False)
+
+    if end_index is not None:
+        # [END] must be immediately followed by [PAD] (if any padding exists).
+        if first_pad is not None and first_pad != end_index + 1:
+            return CanvasValidation(False, "[END] must be followed immediately by [PAD]", end_index, False, False)
+        for index, token_id in enumerate(token_ids[end_index + 1 :], start=end_index + 1):
+            if token_id != PAD_ID:
+                return CanvasValidation(False, f"non-[PAD] token after [END] at position {index}", end_index, False, False)
+        # [END] must land on a completed timestep: the token before it is a
+        # [DELIMITER], and it cannot be the outcome token at position 0.
+        if end_index == 0 or token_ids[end_index - 1] != DELIMITER_ID:
+            return CanvasValidation(False, "[END] must follow a complete timestep", end_index, False, False)
+        return CanvasValidation(True, None, end_index, False, False)
+
+    # No [END]: the canvas is truncated. The active region (everything before the
+    # trailing pad) must still end on a timestep boundary, i.e. a [DELIMITER].
+    active_end = first_pad if first_pad is not None else len(token_ids)
+    # active_end == 1 means only the outcome token precedes the padding (no
+    # timesteps at all); token_ids[active_end - 1] would be the outcome token,
+    # which is not a delimiter, so this is correctly rejected below.
+    if active_end <= 1 or token_ids[active_end - 1] != DELIMITER_ID:
+        return CanvasValidation(False, "truncated debut canvas must end on a timestep boundary", None, True, False)
+    return CanvasValidation(True, None, None, True, False)
+
+
 def decode_canvas(
     token_ids: Sequence[int],
     vocabulary: ContentVocabulary | Mapping[int, str],

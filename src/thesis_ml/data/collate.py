@@ -25,6 +25,7 @@ class DiffusionBatch:
     # CPU-only telemetry retained even when raw example metadata is dropped.
     input_timestep_counts: torch.Tensor
     enemy_future_timestep_counts: torch.Tensor
+    canvas_prediction_distances: torch.Tensor
     input_records: list[list[object]]
     canvas_metadata: list[list[dict[str, object]]]
     # Pre-parsed contextual encodings for the input region, built here so the
@@ -48,6 +49,7 @@ class DiffusionBatch:
             canvas_loss_mask=self.canvas_loss_mask.pin_memory(),
             terminated=self.terminated.pin_memory(),
             truncated=self.truncated.pin_memory(),
+            canvas_prediction_distances=self.canvas_prediction_distances.pin_memory(),
             input_features=InputFeatures(
                 map_values=features.map_values.pin_memory(),
                 stat_values=features.stat_values.pin_memory(),
@@ -78,11 +80,20 @@ def collate_diffusion_examples(
     target_canvas = torch.full((len(examples), max_canvas_len), PAD_ID, dtype=torch.long)
     class_labels = torch.full((len(examples), max_canvas_len), CLASS_PAD, dtype=torch.long)
     canvas_attention_mask = torch.zeros((len(examples), max_canvas_len), dtype=torch.bool)
+    canvas_prediction_distances = torch.full(
+        (len(examples), max_canvas_len),
+        -1,
+        dtype=torch.long,
+    )
     for row, example in enumerate(examples):
         length = example.target_canvas.numel()
         target_canvas[row, :length] = example.target_canvas
         class_labels[row, :length] = example.class_labels
         canvas_attention_mask[row, :length] = True
+        canvas_prediction_distances[row, :length] = torch.tensor(
+            _enemy_future_prediction_distances(example),
+            dtype=torch.long,
+        )
     canvas_loss_mask = canvas_attention_mask.clone()
 
     input_records = [example.input_records for example in examples]
@@ -106,6 +117,7 @@ def collate_diffusion_examples(
             [_enemy_future_timestep_count(example) for example in examples],
             dtype=torch.long,
         ),
+        canvas_prediction_distances=canvas_prediction_distances,
         input_records=input_records if retain_metadata else [],
         canvas_metadata=(
             [example.canvas_metadata for example in examples]
@@ -153,3 +165,51 @@ def _enemy_future_timestep_count(example: DatasetExample) -> int:
         and (index == 0 or labels[index - 1] != CLASS_ENEMY_FUTURE)
         for index, label in enumerate(labels)
     )
+
+
+def _enemy_future_prediction_distances(example: DatasetExample) -> list[int]:
+    labels = example.class_labels.tolist()
+    distances = [-1] * len(labels)
+    if len(example.canvas_metadata) == len(labels):
+        if example.window_end is not None:
+            input_count = _input_timestep_count(example)
+            for index, (label, metadata) in enumerate(
+                zip(labels, example.canvas_metadata, strict=True)
+            ):
+                timestep_index = metadata.get("timestep_index")
+                if label == CLASS_ENEMY_FUTURE and timestep_index is not None:
+                    distance = int(timestep_index) - input_count + 1
+                    if distance > 0:
+                        distances[index] = distance
+            return distances
+
+        future_timesteps = sorted(
+            {
+                int(metadata["timestep_index"])
+                for label, metadata in zip(labels, example.canvas_metadata, strict=True)
+                if label == CLASS_ENEMY_FUTURE and metadata.get("timestep_index") is not None
+            }
+        )
+        ordinal_by_timestep = {
+            timestep: ordinal
+            for ordinal, timestep in enumerate(future_timesteps, start=1)
+        }
+        for index, (label, metadata) in enumerate(
+            zip(labels, example.canvas_metadata, strict=True)
+        ):
+            timestep_index = metadata.get("timestep_index")
+            if label == CLASS_ENEMY_FUTURE and timestep_index is not None:
+                distances[index] = ordinal_by_timestep[int(timestep_index)]
+        return distances
+
+    distance = 0
+    in_future_timestep = False
+    for index, label in enumerate(labels):
+        if label == CLASS_ENEMY_FUTURE:
+            if not in_future_timestep:
+                distance += 1
+                in_future_timestep = True
+            distances[index] = distance
+        else:
+            in_future_timestep = False
+    return distances

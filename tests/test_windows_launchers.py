@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_windows_launchers_are_thin_config_driven_wrappers() -> None:
     expected = {
-        "overfit.bat": "configs\\local_overfit.yaml",
+        "overfit.bat": "configs\\local_overfit_v2.yaml",
         "smallTrainingTest.bat": "configs\\local_full.yaml",
     }
     for filename, config_path in expected.items():
@@ -15,6 +15,7 @@ def test_windows_launchers_are_thin_config_driven_wrappers() -> None:
         assert f"--config {config_path.lower()}" in text
         assert "%*" in text
         if filename == "overfit.bat":
+            assert 'set "output_dir=%~dp0output\\overfitv2"' in text
             assert "'.venv\\scripts\\python.exe' -m thesis_ml.pipeline.train_pipeline" in text
             assert "tee-object -filepath '%output_dir%\\console.log'" in text
             assert "exit $lastexitcode" in text

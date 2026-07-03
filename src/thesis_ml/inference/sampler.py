@@ -42,7 +42,19 @@ def sample_canvas(
     *,
     device: torch.device | str = "cpu",
 ) -> SamplerOutput:
-    """Denoise an all-[MASK] canvas by monotonic confidence-based commits."""
+    """Denoise an all-[MASK] canvas by monotonic confidence-based commits.
+
+    Each step runs the model over the current (partly masked) canvas, then commits
+    the most-confident still-masked positions. Committed positions are never
+    remasked, so the canvas fills in monotonically until every position is set.
+
+    Fine-tune constraint (`config.sampler.outcome_last`): when True, canvas
+    position 0 holds the win/loss outcome token and is forced to denoise LAST. It
+    is excluded from the commit candidates until every other position `[1:]` is
+    committed, then force-committed with the model's prediction (ignoring the
+    confidence/entropy gates so sampling cannot stall). When the flag is False the
+    behavior is byte-for-byte identical to the pre-training sampler.
+    """
 
     active_device = torch.device(device)
     model = model.to(active_device)
@@ -82,14 +94,49 @@ def sample_canvas(
         confidence, predicted = probs.max(dim=-1)
         entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
 
+        # Candidate set for this step: every position that is still masked.
+        # `selectable` is what we allow `_select_commits` to consider. When the
+        # fine-tune constraint `config.sampler.outcome_last` is OFF this is
+        # exactly `~committed`, so the pre-training sampling path is unchanged.
+        selectable = ~committed
+        if config.sampler.outcome_last:
+            # Outcome-last constraint (Worker 2): canvas position 0 holds the
+            # [WIN]/[LOSS] outcome token and must denoise LAST. Remove position 0
+            # from the candidate set for any row whose remaining positions `[1:]`
+            # are not yet fully committed. `rest_all_committed` is computed from
+            # `committed` BEFORE this step's commits, so on the step that finishes
+            # `[1:]`, position 0 is still not selectable here (it is force-committed
+            # below on that same step instead).
+            rest_all_committed = committed[:, 1:].all(dim=1)  # shape (batch,)
+            selectable = selectable.clone()
+            selectable[:, 0] = selectable[:, 0] & rest_all_committed
+
         commit_mask = _select_commits(
             entropy=entropy,
             confidence=confidence,
-            masked=~committed,
+            masked=selectable,
             entropy_bound=config.sampler.entropy_bound,
             confidence_threshold=config.sampler.confidence_threshold,
             min_commit_per_step=config.sampler.min_commit_per_step,
         )
+
+        if config.sampler.outcome_last:
+            # Guarantee the outcome token commits. Once a row's `[1:]` positions
+            # are ALL committed (looking at this step's commits via
+            # `committed | commit_mask`), force-commit position 0 using the
+            # model's own prediction, bypassing the confidence/entropy gates in
+            # `_select_commits` so sampling can never stall on the final token.
+            # Because `_select_commits` above never selects position 0 (it was
+            # cleared from `selectable`), this force path is the only way the
+            # outcome token is ever committed under the flag, so it is always the
+            # last position to transition from masked -> committed. This also
+            # covers the max_steps edge case: if `[1:]` finishes on the final
+            # allowed step, the outcome token still commits on that same step.
+            rest_done_after_step = (committed | commit_mask)[:, 1:].all(dim=1)
+            outcome_still_masked = ~(committed | commit_mask)[:, 0]
+            force_outcome = rest_done_after_step & outcome_still_masked  # (batch,)
+            commit_mask[:, 0] = commit_mask[:, 0] | force_outcome
+
         canvas = torch.where(commit_mask, predicted, canvas)
         committed = committed | commit_mask
         trace.append(

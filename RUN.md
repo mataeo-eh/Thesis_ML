@@ -40,11 +40,12 @@ Run the local proof-of-life profiles:
 
 ```bash
 uv run thesis-ml-train --config configs/local_overfit.yaml
+uv run thesis-ml-train --config configs/local_overfit_v2.yaml
 uv run thesis-ml-train --config configs/local_full.yaml
 ```
 
 On Windows, equivalent thin launchers write console output and run artifacts to
-`tests\output\overfit\` and `tests\output\smallTrainingTest\`:
+`tests\output\overfitV2\` and `tests\output\smallTrainingTest\`:
 
 ```bat
 tests\overfit.bat
@@ -136,9 +137,13 @@ train/dev/test split (config `pipeline.split_seed` / `test_fraction` /
 validation; the test split is held out for final evaluation.
 
 Local profiles also write `epoch_metrics.csv` with epoch train/dev loss,
-train/dev per-class losses, tokens/sec, and cumulative wall-clock elapsed time.
-The overfit profile records its seeded 25 train and three disjoint dev replay
-IDs in `replay_selection.json` beside that CSV.
+train/dev per-class losses, p50/p90/p95 input and future horizon lengths,
+train/dev future-token loss bucketed by prediction distance, cumulative token
+counts, tokens/sec, and cumulative wall-clock elapsed time. The overfit profiles
+record their seeded 25 train and three disjoint dev replay IDs in
+`replay_selection.json` beside that CSV. `tests\overfit.bat` launches the V2
+profile, which uses an isolated output/checkpoint namespace, downweights
+`[PAD]` to 0.2, and runs all 200 epochs unless manually stopped.
 
 ### Throughput knobs
 

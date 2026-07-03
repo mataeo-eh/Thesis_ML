@@ -1,0 +1,14 @@
+extends: local_overfit.yaml
+
+storage:
+  checkpoint_uri: checkpoints/local-overfitV2
+  log_uri: tests/output/overfitV2
+  local_cache_dir: .pipeline_cache/local-overfitV2
+
+train:
+  epochs: 200
+  early_stopping_patience_epochs: 0
+
+loss:
+  class_loss_weights:
+    pad: 0.2

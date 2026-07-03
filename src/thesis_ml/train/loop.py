@@ -19,7 +19,12 @@ from torch.optim.lr_scheduler import LambdaLR
 from thesis_ml.config import ProjectConfig
 from thesis_ml.data.collate import DiffusionBatch
 from thesis_ml.model.embedding import InputFeatures
-from thesis_ml.model.loss import CLASS_ID_TO_NAME, CanvasCrossEntropyLoss, LossOutput
+from thesis_ml.model.loss import (
+    FUTURE_DISTANCE_BUCKETS,
+    CanvasCrossEntropyLoss,
+    LossOutput,
+    active_class_id_to_name,
+)
 from thesis_ml.model.model import canvas_self_conditioning_from_logits
 from thesis_ml.train.corruption import CorruptionOutput, corrupt_batch
 
@@ -40,6 +45,7 @@ class BatchLoss:
 class ValidationLog:
     loss: float
     per_class: dict[str, float]
+    future_distance: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,7 @@ class TrainStepLog:
     denoising_loss: float
     confidence_loss: float
     per_class: dict[str, float]
+    future_distance: dict[str, float]
     lr: float
     t_mean: float
     masked_fraction: float
@@ -68,6 +75,10 @@ class EpochMetrics:
     dev_per_class: dict[str, float]
     average_input_timesteps: float
     average_enemy_future_timesteps: float
+    input_timestep_percentiles: dict[str, float]
+    enemy_future_timestep_percentiles: dict[str, float]
+    train_future_distance: dict[str, float]
+    dev_future_distance: dict[str, float]
     total_tokens_ingested: int
     total_unique_tokens_seen: int
     tokens_per_second: float
@@ -185,6 +196,10 @@ class TrainingLoop:
             epoch_examples = 0
             epoch_input_timesteps = 0
             epoch_enemy_future_timesteps = 0
+            epoch_input_timestep_counts: list[int] = []
+            epoch_enemy_future_timestep_counts: list[int] = []
+            epoch_future_distance_sums: dict[str, float] = {}
+            epoch_future_distance_counts: dict[str, int] = {}
             epoch_batch_index = 0
             data_iter = iter(dataloader)
 
@@ -225,8 +240,17 @@ class TrainingLoop:
                     epoch_enemy_future_timesteps += int(
                         batch.enemy_future_timestep_counts.sum().item()
                     )
+                    epoch_input_timestep_counts.extend(batch.input_timestep_counts.tolist())
+                    epoch_enemy_future_timestep_counts.extend(
+                        batch.enemy_future_timestep_counts.tolist()
+                    )
                     for name, value in batch_loss.loss_output.per_class.items():
                         epoch_class_losses.setdefault(name, []).append(float(value.detach().cpu()))
+                    _accumulate_future_distance(
+                        epoch_future_distance_sums,
+                        epoch_future_distance_counts,
+                        batch_loss.loss_output,
+                    )
 
                 if self.config.train.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.train.grad_clip)
@@ -293,6 +317,17 @@ class TrainingLoop:
                 dev_per_class=epoch_validation.per_class if epoch_validation is not None else {},
                 average_input_timesteps=epoch_input_timesteps / epoch_examples,
                 average_enemy_future_timesteps=epoch_enemy_future_timesteps / epoch_examples,
+                input_timestep_percentiles=_timestep_percentiles(epoch_input_timestep_counts),
+                enemy_future_timestep_percentiles=_timestep_percentiles(
+                    epoch_enemy_future_timestep_counts
+                ),
+                train_future_distance=_finalize_future_distance(
+                    epoch_future_distance_sums,
+                    epoch_future_distance_counts,
+                ),
+                dev_future_distance=(
+                    epoch_validation.future_distance if epoch_validation is not None else {}
+                ),
                 total_tokens_ingested=self.total_tokens_ingested,
                 total_unique_tokens_seen=len(self.unique_token_ids_seen),
                 tokens_per_second=epoch_tokens / epoch_training_duration,
@@ -372,6 +407,7 @@ class TrainingLoop:
                 batch.class_labels,
                 scored_mask=scored_mask,
                 position_weights=corruption.position_weights,
+                prediction_distances=batch.canvas_prediction_distances,
             )
             confidence_loss = auxiliary_confidence_loss(canvas_logits.float(), batch.target_canvas, scored_mask)
             weighted_confidence_loss = confidence_loss * self.config.train.confidence_loss_weight
@@ -435,6 +471,59 @@ class TrainingLoop:
             int(token_id) for token_id in checkpoint.get("unique_token_ids_seen", [])
         }
 
+    def load_model_weights(self, path: str | Path) -> None:
+        """Warm-start ONLY the model weights from a checkpoint (fine-tuning).
+
+        This is deliberately a *different* code path from `load_checkpoint`
+        (full resume). A full resume is for continuing an interrupted run of
+        the SAME training job: it restores the optimizer's momentum/variance
+        buffers, the LR-schedule position (`global_step`), and every training
+        counter (`completed_epochs`, `best_train_loss`, etc.) so training
+        picks up exactly where it left off.
+
+        A "warm start" for fine-tuning is different: we want to begin a BRAND
+        NEW training run (fresh optimizer, fresh LR schedule starting at
+        step 0, fresh epoch counters) but initialize the model's learned
+        weights from a previously pretrained checkpoint instead of random
+        initialization. Copying the optimizer/scheduler/step state across
+        would be wrong here because:
+          - the fine-tune uses a different (much smaller) learning rate, so
+            reusing the old optimizer's Adam moment estimates would apply
+            stale momentum computed under a different LR regime;
+          - the fine-tune's LR schedule (warmup + cosine decay) is meant to
+            restart from step 0 over its own `epochs`/`max_steps` budget, not
+            continue partway through the pretrain schedule;
+          - epoch/step counters must start at 0 so fine-tune metrics files
+            (which begin at epoch 1) are not confused with pretrain epochs.
+
+        Only two tensors are copied out of the checkpoint dict: the plain
+        model's `state_dict()` and, if present, the EMA (exponential moving
+        average) model's `state_dict()`. Everything else in the checkpoint
+        (optimizer, scheduler, global_step, completed_epochs, ...) is
+        ignored entirely — `self.optimizer`, `self.scheduler`,
+        `self.global_step`, and the other counters are left exactly as they
+        were set by `__init__` (i.e. fresh).
+
+        Args:
+            path: filesystem path to a checkpoint previously written by
+                `save_checkpoint` (e.g. the pretrained run's `last.pt`).
+        """
+
+        checkpoint = torch.load(Path(path), map_location=self.device, weights_only=False)
+        # Copy the plain model's weights.
+        self.model.load_state_dict(checkpoint["model"])
+        # The EMA (shadow) model tracks a smoothed copy of the weights used at
+        # evaluation time. Older checkpoints may lack an "ema_model" key, in
+        # which case we fall back to seeding the EMA copy with the same plain
+        # model weights so both start out identical, as they would for a
+        # freshly constructed loop.
+        self.ema_model.load_state_dict(checkpoint.get("ema_model", checkpoint["model"]))
+        # NOTE: optimizer, scheduler, global_step, completed_epochs,
+        # best_train_loss, epochs_without_improvement, elapsed_wall_seconds,
+        # total_tokens_ingested, and unique_token_ids_seen are intentionally
+        # left untouched here -- that is what makes this a "warm start"
+        # rather than a "resume".
+
     def _lr_multiplier(self, step_index: int) -> float:
         warmup = max(1, self.config.train.warmup)
         max_steps = max(warmup + 1, self.config.train.max_steps)
@@ -459,12 +548,17 @@ class TrainingLoop:
             name: float(value.detach().cpu())
             for name, value in sorted(batch_loss.loss_output.per_class.items())
         }
+        future_distance = {
+            name: float(value.detach().cpu())
+            for name, value in sorted(batch_loss.loss_output.future_distance.items())
+        }
         return TrainStepLog(
             step=self.global_step,
             loss=float(batch_loss.loss.detach().cpu()),
             denoising_loss=float(batch_loss.denoising_loss.detach().cpu()),
             confidence_loss=float(batch_loss.confidence_loss.detach().cpu()),
             per_class=per_class,
+            future_distance=future_distance,
             lr=float(self.optimizer.param_groups[0]["lr"]),
             t_mean=float(batch_loss.corruption.t.detach().mean().cpu()),
             masked_fraction=float(batch_loss.scored_mask.float().mean().detach().cpu()),
@@ -533,7 +627,15 @@ class TrainingLoop:
     def _write_epoch_metrics(self, metrics: EpochMetrics) -> None:
         if self.epoch_metrics_path is None:
             return
-        class_names = [_metric_class_name(name) for name in CLASS_ID_TO_NAME.values()]
+        # Use the SAME 6-class (pretraining) or 7-class (debut) name map that
+        # CanvasCrossEntropyLoss used to build per-class losses, so the CSV
+        # columns declared here always match the keys that
+        # `train_per_class`/`dev_per_class` (below) actually contain. See
+        # `active_class_id_to_name`'s docstring in model/loss.py for why this
+        # single shared helper is required to keep pretraining's columns
+        # byte-for-byte unchanged when debut mode is off.
+        active_class_map = active_class_id_to_name(self.config)
+        class_names = [_metric_class_name(name) for name in active_class_map.values()]
         fieldnames = [
             "epoch",
             "train_loss",
@@ -542,6 +644,20 @@ class TrainingLoop:
             *(f"dev_{name}_loss" for name in class_names),
             "average_input_timesteps",
             "average_enemy_future_timesteps",
+            "input_timestep_p50",
+            "input_timestep_p90",
+            "input_timestep_p95",
+            "enemy_future_timestep_p50",
+            "enemy_future_timestep_p90",
+            "enemy_future_timestep_p95",
+            *(
+                f"train_enemy_future_loss_distance_{name}"
+                for name in FUTURE_DISTANCE_BUCKETS
+            ),
+            *(
+                f"dev_enemy_future_loss_distance_{name}"
+                for name in FUTURE_DISTANCE_BUCKETS
+            ),
             "total_tokens_ingested",
             "total_unique_tokens_seen",
             "tokens_per_second",
@@ -558,16 +674,48 @@ class TrainingLoop:
             "tokens_per_second": metrics.tokens_per_second,
             "wall_clock_elapsed_seconds": metrics.wall_clock_elapsed_seconds,
         }
-        for source_name in CLASS_ID_TO_NAME.values():
+        for percentile in ("p50", "p90", "p95"):
+            row[f"input_timestep_{percentile}"] = metrics.input_timestep_percentiles[percentile]
+            row[f"enemy_future_timestep_{percentile}"] = (
+                metrics.enemy_future_timestep_percentiles[percentile]
+            )
+        for name in FUTURE_DISTANCE_BUCKETS:
+            row[f"train_enemy_future_loss_distance_{name}"] = (
+                metrics.train_future_distance.get(name, "")
+            )
+            row[f"dev_enemy_future_loss_distance_{name}"] = (
+                metrics.dev_future_distance.get(name, "")
+            )
+        for source_name in active_class_map.values():
             name = _metric_class_name(source_name)
             row[f"train_{name}_loss"] = metrics.train_per_class.get(source_name, "")
             row[f"dev_{name}_loss"] = metrics.dev_per_class.get(source_name, "")
-        write_header = not self.epoch_metrics_path.exists() or self.epoch_metrics_path.stat().st_size == 0
+        write_header = self._prepare_epoch_metrics_file(fieldnames)
         with self.epoch_metrics_path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             if write_header:
                 writer.writeheader()
             writer.writerow(row)
+
+    def _prepare_epoch_metrics_file(self, fieldnames: list[str]) -> bool:
+        if self.epoch_metrics_path is None:
+            return False
+        if not self.epoch_metrics_path.exists() or self.epoch_metrics_path.stat().st_size == 0:
+            return True
+        with self.epoch_metrics_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames == fieldnames:
+                return False
+            existing_rows = list(reader)
+        migration_path = self.epoch_metrics_path.with_suffix(
+            f"{self.epoch_metrics_path.suffix}.schema-migration"
+        )
+        with migration_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(existing_rows)
+        migration_path.replace(self.epoch_metrics_path)
+        return False
 
     def _record_training_batch_metrics(self, batch: DiffusionBatch) -> int:
         input_tokens = batch.input_token_ids[batch.input_attention_mask]
@@ -645,11 +793,18 @@ class TrainingLoop:
         self.ema_model.eval()
         losses: list[torch.Tensor] = []
         class_totals: dict[str, list[torch.Tensor]] = {}
+        future_distance_sums: dict[str, float] = {}
+        future_distance_counts: dict[str, int] = {}
         for batch in dataloader:
             batch_loss = self.compute_batch_loss(batch, fixed_t=fixed_t, model=self.ema_model)
             losses.append(batch_loss.loss.detach())
             for name, value in batch_loss.loss_output.per_class.items():
                 class_totals.setdefault(name, []).append(value.detach())
+            _accumulate_future_distance(
+                future_distance_sums,
+                future_distance_counts,
+                batch_loss.loss_output,
+            )
         if was_training:
             self.ema_model.train()
         if not losses:
@@ -658,7 +813,14 @@ class TrainingLoop:
             name: float(torch.stack(values).mean().cpu())
             for name, values in sorted(class_totals.items())
         }
-        return ValidationLog(loss=float(torch.stack(losses).mean().cpu()), per_class=per_class)
+        return ValidationLog(
+            loss=float(torch.stack(losses).mean().cpu()),
+            per_class=per_class,
+            future_distance=_finalize_future_distance(
+                future_distance_sums,
+                future_distance_counts,
+            ),
+        )
 
 
 def auxiliary_confidence_loss(
@@ -682,6 +844,38 @@ def _metric_class_name(name: str) -> str:
     return name.strip("[]").replace("-", "_").lower()
 
 
+def _timestep_percentiles(values: list[int]) -> dict[str, float]:
+    if not values:
+        return {"p50": 0.0, "p90": 0.0, "p95": 0.0}
+    tensor = torch.tensor(values, dtype=torch.float64)
+    return {
+        name: float(torch.quantile(tensor, quantile).item())
+        for name, quantile in (("p50", 0.50), ("p90", 0.90), ("p95", 0.95))
+    }
+
+
+def _accumulate_future_distance(
+    sums: dict[str, float],
+    counts: dict[str, int],
+    loss_output: LossOutput,
+) -> None:
+    for name, value in loss_output.future_distance.items():
+        count = loss_output.future_distance_counts[name]
+        sums[name] = sums.get(name, 0.0) + float(value.detach().cpu()) * count
+        counts[name] = counts.get(name, 0) + count
+
+
+def _finalize_future_distance(
+    sums: dict[str, float],
+    counts: dict[str, int],
+) -> dict[str, float]:
+    return {
+        name: sums[name] / counts[name]
+        for name in FUTURE_DISTANCE_BUCKETS
+        if counts.get(name, 0) > 0
+    }
+
+
 def move_batch_to_device(batch: DiffusionBatch, device: torch.device) -> DiffusionBatch:
     non_blocking = device.type == "cuda"
     features = batch.input_features
@@ -702,6 +896,10 @@ def move_batch_to_device(batch: DiffusionBatch, device: torch.device) -> Diffusi
         truncated=batch.truncated.to(device, non_blocking=non_blocking),
         input_timestep_counts=batch.input_timestep_counts,
         enemy_future_timestep_counts=batch.enemy_future_timestep_counts,
+        canvas_prediction_distances=batch.canvas_prediction_distances.to(
+            device,
+            non_blocking=non_blocking,
+        ),
         input_records=batch.input_records,
         canvas_metadata=batch.canvas_metadata,
         input_features=moved_features,
