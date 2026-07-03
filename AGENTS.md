@@ -52,4 +52,11 @@
 
 ## Child DOX Index
 
-- No child `AGENTS.md` files currently exist.
+- `src/thesis_ml/AGENTS.md`: the importable package contract; owns config loading and tokenization/serialization and indexes the `data`, `vocab`, `model`, `train`, `inference`, `eval`, and `pipeline` subpackages.
+- `config/AGENTS.md`: canonical `default.yaml` base configuration validated by `src/thesis_ml/config.py`.
+- `configs/AGENTS.md`: local proof-of-life run profiles that override `default.yaml`.
+- `data/AGENTS.md`: on-disk `raw/`/`processed/` dataset layout (git-ignored contents) plus the master entity-list builder and token dictionary.
+- `scripts/AGENTS.md`: standalone context-window analysis and GPU pre-flight utilities.
+- `tests/AGENTS.md`: pytest suite, owner-provided extractor fixtures, and thin Windows launchers.
+- Parent-owned scaffolding folders (no child `AGENTS.md` yet; roles fixed by `SPEC.md` §15): `prompts/` executable agent prompts (`NNN-name.md`, moved to `prompts/completed/` when done), `plans/` implementation plans, `research/` research outputs, `diagnostics/` audits and failure analyses, `notebooks/` exploratory notebooks, and `experiments/` reproducible experiment entry points. `checkpoints/` holds generated run state; make no durable architecture claims from it.
+- Root architecture and operating docs stay parent-owned: `SPEC.md` (architecture source of truth), `SCHEMA.md`, `RUN.md`, `EVAL.md`, `CLAUDE.md`, `README.md`, and `TODO.md`.
