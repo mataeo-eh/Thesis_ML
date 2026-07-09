@@ -15,7 +15,7 @@
 - `[MASK]` is the absorbing noise state and is never a content target. `[PAD]` is a real content token that surplus canvas positions denoise into.
 - `[WIN]`/`[LOSS]` are reserved from day one so embeddings exist, but are used only in outcome fine-tuning (`SPEC.md` §8).
 - The vocabulary contains no tokens for coordinates, frame numbers, or absolute times.
-- Concrete content-token contents derive from the extractor schema documented in `SCHEMA.md`; do not assume field names ahead of it.
+- Concrete content-token contents derive from the extractor schema documented in `SCHEMA.md`; do not assume field names ahead of it. Engine-created ability pseudo-entities that the extractor marks untracked, including `kd8charge` and creep tumor variants, must not be content tokens.
 
 ## Work Guidance
 

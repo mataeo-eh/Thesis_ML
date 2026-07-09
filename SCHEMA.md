@@ -167,7 +167,6 @@ gateway
 hatchery
 immortal
 infestationpit
-kd8charge
 larva
 marauder
 marine
@@ -201,7 +200,7 @@ zealot
 zergling
 ```
 
-These names are raw content-token vocabulary candidates observed in the fixtures. The full prompt 002 vocabulary should be seeded from `data/Token_Dictionary.json`, which was built from the broader processed replay dataset and therefore contains many entity and upgrade names not visible in the five fixtures. Token identity must be location-agnostic and must not include positions, regions, counts, frame numbers, timestamps, or player ownership.
+These names are raw content-token vocabulary candidates observed in the fixtures after pseudo-entity filtering. The full prompt 002 vocabulary should be seeded from `data/Token_Dictionary.json`, which was built from the broader processed replay dataset and therefore contains many entity and upgrade names not visible in the five fixtures. Token identity must be location-agnostic and must not include positions, regions, counts, frame numbers, timestamps, player ownership, or engine-created ability pseudo-entities such as `kd8charge` and creep tumors.
 
 ## Snapshot Ordering
 
