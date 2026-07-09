@@ -7,13 +7,13 @@ import torch
 from torch import nn
 
 from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.dataset import CLASS_DELIMITER, CLASS_ENEMY_FUTURE, CLASS_PAD
+from thesis_ml.data.dataset import CLASS_DELIMITER, CLASS_ENEMY_FUTURE, CLASS_PAD, CLASS_WINLOSS
 from thesis_ml.eval.buildorder import BuildOrderEvent, extract_build_order, extract_build_order_from_frame
 from thesis_ml.eval.harness import evaluate_examples
 from thesis_ml.eval.metrics import compare_build_orders
 from thesis_ml.train.train import make_synthetic_examples
 from thesis_ml.vocab.content_vocab import build_content_vocabulary
-from thesis_ml.vocab.special_tokens import DELIMITER_ID, PAD_ID
+from thesis_ml.vocab.special_tokens import DELIMITER_ID, PAD_ID, WIN_ID
 
 
 def test_harness_computes_accuracy_f1_on_heldout_examples() -> None:
@@ -130,17 +130,21 @@ def test_metric_correctness_with_tolerance_and_miss() -> None:
 
 
 def test_boundary_truncated_timesteps_are_not_dropped() -> None:
-    config = _small_config(canvas_budget=4)
+    config = _small_config(canvas_budget=5)
     base = make_synthetic_examples(config, count=1)[0]
+    # Canvas leads with the position-0 [WIN] outcome token; the single timestep
+    # (token 100) follows before the truncating [DELIMITER]/[PAD] tail.
     truncated = replace(
         base,
-        target_canvas=torch.tensor([100, DELIMITER_ID, PAD_ID, PAD_ID], dtype=torch.long),
-        class_labels=torch.tensor([CLASS_ENEMY_FUTURE, CLASS_DELIMITER, CLASS_PAD, CLASS_PAD], dtype=torch.long),
+        target_canvas=torch.tensor([WIN_ID, 100, DELIMITER_ID, PAD_ID, PAD_ID], dtype=torch.long),
+        class_labels=torch.tensor(
+            [CLASS_WINLOSS, CLASS_ENEMY_FUTURE, CLASS_DELIMITER, CLASS_PAD, CLASS_PAD], dtype=torch.long
+        ),
         terminated=False,
         truncated=True,
         canvas_metadata=[],
     )
-    model = FixedCanvasModel(torch.tensor([100, DELIMITER_ID, PAD_ID, PAD_ID]), vocab_size=128)
+    model = FixedCanvasModel(torch.tensor([WIN_ID, 100, DELIMITER_ID, PAD_ID, PAD_ID]), vocab_size=128)
 
     report = evaluate_examples(
         model=model,

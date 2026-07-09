@@ -7,7 +7,15 @@ import yaml
 from thesis_ml.pipeline.acquire_data import CredentialError, run_acquisition
 from thesis_ml.pipeline.storage import StorageResolver, parse_s3_uri
 from thesis_ml.config import load_config
-from thesis_ml.pipeline.train_pipeline import _select_replays, run_training_pipeline
+from thesis_ml.pipeline.train_pipeline import _perspectives, _select_replays, run_training_pipeline
+
+
+def test_training_and_finetune_perspectives_require_both_players() -> None:
+    assert _perspectives("p1,p2") == ("p1", "p2")
+    assert _perspectives("p2, p1") == ("p1", "p2")
+    for invalid in ("", "p1", "p2", "p1,p1", "p1,p2,p1", "observer,p1"):
+        with pytest.raises(ValueError, match="exactly p1,p2"):
+            _perspectives(invalid)
 
 
 def test_master_pipeline_smoke_run_writes_checkpoint_and_resumes(tmp_path: Path) -> None:
@@ -94,6 +102,103 @@ def test_real_manifest_pipeline_uses_workers_and_resumes(tmp_path: Path) -> None
     assert (tmp_path / "real-checkpoints" / "last.pt").exists()
     assert (tmp_path / "real-logs" / "epoch_metrics.csv").exists()
     assert (tmp_path / "real-logs" / "replay_selection.json").exists()
+
+
+def test_proper_finish_writes_durable_finished_model(tmp_path: Path) -> None:
+    """A real full-epoch finish writes the separated raw/EMA finished bundle.
+
+    Uses ``max_steps: 0`` so the run trains a genuine full epoch (a proper
+    finish), not a bounded ``--max-steps`` verification -- the latter must NOT
+    produce a finished model. Asserts the finished/ layout, that the EMA
+    safetensors is loadable and matches the recorded vocab size, and that a
+    SECOND proper finish archives (never destroys) the prior finished model.
+    """
+
+    import json
+
+    from safetensors.torch import load_file
+
+    root = Path(__file__).resolve().parents[1]
+    raw = yaml.safe_load((root / "config" / "default.yaml").read_text(encoding="utf-8"))
+    checkpoint_root = tmp_path / "real-checkpoints"
+    raw["storage"].update(
+        {
+            "data_uri": str(root / "tests" / "fixtures"),
+            "checkpoint_uri": str(checkpoint_root),
+            "log_uri": str(tmp_path / "real-logs"),
+            "local_cache_dir": str(tmp_path / "real-cache"),
+        }
+    )
+    raw["data"].update(
+        {
+            "input_budget_tokens": 512,
+            "canvas_budget_tokens": 256,
+            "tokenized_replay_dir": str(tmp_path / "tokenized"),
+            "window_manifest_path": str(tmp_path / "manifest.jsonl"),
+        }
+    )
+    raw["pipeline"].update(
+        {
+            "smoke": False,
+            "batch_size": 2,
+            "replay_glob": "match_4745722_game_state.parquet",
+            "token_dictionary_uri": str(root / "data" / "Token_Dictionary.json"),
+            "num_workers": 0,
+            "test_fraction": 0.0,
+            "dev_fraction": 0.0,
+        }
+    )
+    raw["data_source"]["workers"] = 1
+    raw["model"].update({"d_model": 32, "layers": 1, "heads": 4, "ffn": 64})
+    raw["train"].update(
+        {
+            "max_steps": 0,  # 0 -> train a genuine full epoch (proper finish)
+            "epochs": 1,
+            "precision": "fp32",
+            "warmup": 1,
+            "target_effective_batch_tokens": 0,
+            "val_interval": 0,
+            "checkpoint_interval": 100,
+        }
+    )
+    config_path = tmp_path / "finish.yaml"
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    run_training_pipeline(config_path)
+
+    finished = checkpoint_root / "finished"
+    for name in (
+        "model.raw.safetensors",
+        "model.ema.safetensors",
+        "finished.pt",
+        "config.json",
+        "finished_metadata.json",
+    ):
+        assert (finished / name).exists(), f"missing finished artifact: {name}"
+
+    metadata = json.loads((finished / "finished_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["stop_reason"] == "completed_all_epochs"
+    assert metadata["default_serving_weights"] == "ema"
+    assert metadata["weights"] == {
+        "raw": "model.raw.safetensors",
+        "ema": "model.ema.safetensors",
+    }
+
+    ema_state = load_file(str(finished / "model.ema.safetensors"))
+    assert "output_head.weight" in ema_state
+    assert int(metadata["vocab_size"]) == ema_state["output_head.weight"].shape[0]
+
+    # config.json is valid JSON carrying the model architecture the run used.
+    config_json = json.loads((finished / "config.json").read_text(encoding="utf-8"))
+    assert config_json["model"]["d_model"] == 32
+
+    # Durability: a second proper finish archives the previous finished model to
+    # a finished_superseded_* sibling instead of destroying it, and writes a new
+    # finished/ in place.
+    run_training_pipeline(config_path)
+    superseded = list(checkpoint_root.glob("finished_superseded_*"))
+    assert superseded, "prior finished model was not archived on re-finish"
+    assert (finished / "model.ema.safetensors").exists()
 
 
 def test_storage_resolver_routes_local_and_s3(tmp_path: Path) -> None:

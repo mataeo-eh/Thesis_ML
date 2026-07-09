@@ -1,6 +1,7 @@
 """Tests for the cloud-readiness hardening: split, RAM cache, checkpoint sync, metrics."""
 
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import pandas as pd
@@ -41,6 +42,25 @@ def test_split_replays_is_deterministic_disjoint_and_covers_all() -> None:
     # A different seed yields a different partition.
     other = split_replays(paths, seed=9999, test_fraction=0.15, dev_fraction=0.10)
     assert other != first
+
+
+def test_split_replays_supports_exact_counts_and_holds_out_every_remainder() -> None:
+    paths = [f"replay_{index}.parquet" for index in range(943)]
+
+    split = split_replays(
+        paths,
+        seed=2718,
+        test_fraction=0.15,
+        dev_fraction=0.10,
+        train_count=870,
+        dev_count=50,
+    )
+
+    assert (len(split.train), len(split.dev), len(split.test)) == (870, 50, 23)
+    assert set(split.train) | set(split.dev) | set(split.test) == set(paths)
+    assert set(split.train).isdisjoint(split.dev)
+    assert set(split.train).isdisjoint(split.test)
+    assert set(split.dev).isdisjoint(split.test)
 
 
 def test_cache_budget_divides_across_workers() -> None:
@@ -89,7 +109,17 @@ def test_training_loop_writes_metrics_jsonl_and_publishes(tmp_path: Path) -> Non
 
     torch.manual_seed(5)
     examples = make_synthetic_examples(config, count=2)
-    batch = next(iter(DataLoader(examples, batch_size=2, shuffle=False, collate_fn=collate_diffusion_examples)))
+    # Pre-training fixtures (make_synthetic_examples) -> pre-training collate.
+    batch = next(
+        iter(
+            DataLoader(
+                examples,
+                batch_size=2,
+                shuffle=False,
+                collate_fn=partial(collate_diffusion_examples, debut_mode=False),
+            )
+        )
+    )
     model = SC2StrategyDiffusionModel(config, vocab_size=128)
     loop = TrainingLoop(
         model=model,
@@ -109,6 +139,13 @@ def test_training_loop_writes_metrics_jsonl_and_publishes(tmp_path: Path) -> Non
     assert len(lines) == 2
     first = json.loads(lines[0])
     assert "loss" in first and "per_class" in first and first["step"] == 1
+    # Pre-training JSONL carries the t-bucket / perspective breakdowns but must
+    # be grep-clean of the fine-tuning-only "future_distance" key: the writer
+    # strips it from the serialized record entirely (not even an empty {}).
+    assert "t_bucket_loss" in first
+    assert "perspective_loss" in first
+    assert "future_distance" not in lines[0]
+    assert "future_distance" not in lines[1]
     assert first["step_wall_seconds"] > 0
     assert first["tokens_per_second"] > 0
     assert first["cuda_max_memory_allocated_bytes"] == 0
@@ -147,7 +184,8 @@ def test_collated_model_features_exclude_absolute_game_time(tmp_path: Path) -> N
     config = _small_config(tmp_path)
     torch.manual_seed(13)
     examples = make_synthetic_examples(config, count=2)
-    batch = collate_diffusion_examples(examples)
+    # Pre-training fixtures -> pre-training collate mode.
+    batch = collate_diffusion_examples(examples, debut_mode=False)
     model = SC2StrategyDiffusionModel(config, vocab_size=128)
     model.eval()
 

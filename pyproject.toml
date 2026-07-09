@@ -16,16 +16,19 @@ authors = [{ name = "Mataeo John Anderson" }]
 dependencies = [
     "boto3>=1.34",
     "kaggle>=1.6",
+    "matplotlib>=3.7",
     "pandas>=2.1",
     "psutil>=5.9",
     "pyarrow>=12.0",
     "PyYAML>=6.0",
+    "safetensors>=0.8.0",
     "torch>=2.2",
 ]
 
 [project.scripts]
 thesis-ml-acquire = "thesis_ml.pipeline.acquire_data:main"
 thesis-ml-train = "thesis_ml.pipeline.train_pipeline:main"
+thesis-ml-viz = "thesis_ml.viz.diagnostics:main"
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
@@ -35,6 +38,27 @@ explicit = true
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: end-to-end tests that build artifacts / sample the model (deselect with -m 'not slow')",
+]
+# Never collect from generated launcher-run artifacts under tests/output/ (they
+# contain scratch .py files and OS-permission-locked directories that break
+# collection); "output" extends pytest's default norecursedirs set, which is
+# restated here because setting the option REPLACES the defaults.
+norecursedirs = [
+    "*.egg",
+    ".*",
+    "_darcs",
+    "build",
+    "CVS",
+    "dist",
+    "node_modules",
+    "venv",
+    "output",
+    "{arch}",
 ]
 
 [tool.setuptools.packages.find]

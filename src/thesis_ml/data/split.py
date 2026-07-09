@@ -36,6 +36,8 @@ def split_replays(
     seed: int,
     test_fraction: float,
     dev_fraction: float,
+    train_count: int = 0,
+    dev_count: int = 0,
 ) -> ReplaySplit:
     """Deterministically partition replay paths into train/dev/test.
 
@@ -68,6 +70,19 @@ def split_replays(
     shuffled = [paths[index] for index in order]
 
     total = len(shuffled)
+    if train_count < 0 or dev_count < 0:
+        raise ValueError("train_count and dev_count must be non-negative")
+    if train_count > 0:
+        if train_count + dev_count > total:
+            raise ValueError(
+                f"requested {train_count} train + {dev_count} dev replays, "
+                f"but only {total} are available"
+            )
+        train = shuffled[:train_count]
+        dev = shuffled[train_count : train_count + dev_count]
+        test = shuffled[train_count + dev_count :]
+        return ReplaySplit(train=tuple(train), dev=tuple(dev), test=tuple(test))
+
     test_count = int(round(total * test_fraction))
     test = shuffled[:test_count]
     train_and_dev = shuffled[test_count:]

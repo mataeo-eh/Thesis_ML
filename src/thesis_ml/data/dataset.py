@@ -1,9 +1,27 @@
-"""Dataset construction for masked-diffusion pretraining examples."""
+"""Dataset construction for masked-diffusion training examples (both modes).
+
+Two training modes are served from the same manifest-backed dataset class:
+
+- PRE-TRAINING (``config.data.debut_mode`` False): the input is LITERALLY
+  ABSENT -- no fog, no self/enemy input blocks, zero-length input tensors.
+  The model sequence is 100% output canvas (the published MDLM/LLaDA pure
+  reconstruction objective): the leading [WIN]/[LOSS] outcome token, then the
+  full enemy reconstruction + future roll-out. Every content token is labeled
+  with the single collapsed CLASS_CONTENT class.
+
+- DEBUT FINE-TUNING (``debut_mode`` True): a clamped, fog-filtered input is
+  served alongside a sparse debut-event canvas. The input interleaves
+  [self records][enemy records][ONE delimiter] per timestep, fog omits enemy
+  content tokens of every kind (entities and upgrades), and canvas labels use
+  the 7-class debut taxonomy (visible/fogged/future-debut + structural +
+  win-loss).
+"""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -45,6 +63,16 @@ CLASS_PAD = 5
 # existing ids are NOT renumbered so pretraining canvases keep the same labels.
 CLASS_WINLOSS = 6
 
+# Pre-training-only alias. In pre-training there is no input and no fog, so
+# the observed/fogged/future three-way split that fine-tuning uses does not
+# apply: every enemy content token collapses into this single class. Reuses
+# CLASS_ENEMY_OBSERVED's value (0) rather than allocating a new id -- the two
+# names are interchangeable, they just describe the same id in two different
+# training modes. CLASS_ENEMY_FOGGED (1) and CLASS_ENEMY_FUTURE (2) are left
+# defined above, unused, and un-renumbered, because fine-tuning still needs
+# them.
+CLASS_CONTENT = CLASS_ENEMY_OBSERVED
+
 CLASS_LABELS: dict[str, int] = {
     "enemy-observed": CLASS_ENEMY_OBSERVED,
     "enemy-fogged": CLASS_ENEMY_FOGGED,
@@ -66,6 +94,23 @@ DEBUT_CLASS_ID_TO_NAME: dict[int, str] = {
     CLASS_DELIMITER: "delimiter",
     CLASS_END: "end",
     CLASS_PAD: "pad",
+    CLASS_WINLOSS: "win-loss",
+}
+
+# Pre-training-only class-id -> human-readable-name map (mirrors
+# DEBUT_CLASS_ID_TO_NAME's role, but for the pre-training canvas). Pre-training
+# never emits ids 1 or 2 (CLASS_ENEMY_FOGGED / CLASS_ENEMY_FUTURE): there is no
+# fog and no input/future split in this mode, since the canvas IS the entire
+# reconstruction target, so every content token is CLASS_CONTENT. Those two
+# ids are intentionally ABSENT here -- this map is sparse (5 entries, ids
+# 0/3/4/5/6), not a dense 0..N range. Any consumer that builds an id-indexed
+# buffer (e.g. per-class loss weights) MUST size it by max(id) + 1, not
+# len(map), or it will under-allocate.
+PRETRAIN_CLASS_ID_TO_NAME: dict[int, str] = {
+    CLASS_CONTENT: "content",
+    CLASS_DELIMITER: "[DELIMITER]",
+    CLASS_END: "[END]",
+    CLASS_PAD: "[PAD]",
     CLASS_WINLOSS: "win-loss",
 }
 
@@ -106,7 +151,15 @@ class DatasetExample:
 
 
 class SC2DiffusionDataset(Dataset[DatasetExample]):
-    """Lazy manifest-backed clamped-input and clean-canvas examples."""
+    """Lazy manifest-backed training examples for both training modes.
+
+    Pre-training (``config.data.debut_mode`` False) serves CANVAS-ONLY
+    examples: ``input_token_ids`` / ``clean_input_token_ids`` are zero-length,
+    ``input_records`` is empty, and no fog is ever sampled (``config.fog`` is
+    None for pre-training configs and is never read here). Debut fine-tuning
+    (True) serves the clamped, per-serving fog-filtered interleaved input plus
+    the sparse debut canvas. See the module docstring for the two grammars.
+    """
 
     def __init__(
         self,
@@ -137,22 +190,38 @@ class SC2DiffusionDataset(Dataset[DatasetExample]):
         replay = self._replay(window.artifact_path)
         enemy_player = _enemy_player(window.perspective_player)
         rng = self._rng_for_index(index)
-        fog_rate = self._sample_fog_rate(rng)
 
-        input_records, clean_records, fogged_counts, observed_counts = _build_artifact_input(
-            replay,
-            window,
-            self.vocabulary,
-            fog_rate=fog_rate,
-            rng=rng,
-        )
-
-        # Choose the target builder based on the fine-tuning flag. When
-        # debut_mode is False (the default), the pretraining path below runs
-        # exactly as before. When True, we resolve the replay's win/loss outcome
-        # for this perspective and build the debut build-order canvas instead.
         if self.config.data.debut_mode:
-            outcome_id = resolve_replay_outcome(window.replay_path, window.perspective_player)
+            # Fine-tuning: sample one fog rate for this served example and use
+            # it both to build the fogged input and (via fogged_counts) to
+            # drive the debut target's fog/future class split below.
+            fog_rate = self._sample_fog_rate(rng)
+            input_records, clean_records, fogged_counts, observed_counts = _build_artifact_input(
+                replay,
+                window,
+                self.vocabulary,
+                fog_rate=fog_rate,
+                rng=rng,
+            )
+        else:
+            # Pre-training: the input is LITERALLY ABSENT -- the model
+            # sequence becomes 100% output canvas (no fog paradigm at all).
+            # No fog rate is sampled and `config.fog` is never read here,
+            # since it may be None/missing for pre-training configs. The
+            # empty lists below produce zero-length input tensors below,
+            # which contribute zero sequence positions downstream.
+            input_records = []
+            clean_records = []
+            fogged_counts = {}
+            observed_counts = {}
+
+        # Both training modes now begin the canvas with the win/loss outcome
+        # token (leading position 0, denoised last), so resolve it up front for
+        # either target builder. debut_mode selects only the canvas BODY:
+        #   - False (pre-training): full enemy reconstruction + future roll-out.
+        #   - True  (debut fine-tuning): sparse first-appearance debut events.
+        outcome_id = resolve_replay_outcome(window.replay_path, window.perspective_player)
+        if self.config.data.debut_mode:
             target = _build_debut_target(
                 replay,
                 window,
@@ -170,6 +239,7 @@ class SC2DiffusionDataset(Dataset[DatasetExample]):
                 enemy_player,
                 fogged_counts=fogged_counts,
                 budget=self.config.data.canvas_budget_tokens,
+                outcome_id=outcome_id,
             )
 
         return DatasetExample(
@@ -226,11 +296,54 @@ def _build_artifact_input(
     fog_rate: float,
     rng: np.random.Generator,
 ) -> tuple[list[TokenRecord], list[TokenRecord], dict[tuple[int, str], int], dict[tuple[int, str], int]]:
+    """Build the fine-tuning input: per-timestep interleaved self+enemy blocks.
+
+    This grammar is fine-tuning (debut_mode) ONLY -- pre-training has no input
+    at all, so callers must not invoke this function when
+    ``config.data.debut_mode`` is False.
+
+    Layout, walking timesteps from ``window.start_timestep`` to
+    ``window.end_timestep``:
+        [self records for this timestep]
+        [enemy records for this timestep -- fog-filtered for the fogged
+         variant, unfiltered for the clean variant]
+        [ONE [DELIMITER]]
+    This replaces the old ``[all self timesteps][all enemy timesteps]``
+    grammar (one delimiter per PLAYER per timestep) with exactly ONE
+    delimiter per TIMESTEP, placed after that timestep's enemy records.
+
+    Fog is applied uniformly to enemy content tokens of every ``token_kind``
+    (entity AND upgrade) -- there is no longer an entity-only special case.
+
+    Parameters:
+        replay: Memory-mapped tokenized replay to read timestep records from.
+        window: Manifest entry giving the perspective player and the
+            input-window's start/end timesteps.
+        vocabulary: Content vocabulary used to name token ids.
+        fog_rate: Per-example probability that an enemy content token is
+            omitted from the fogged input variant.
+        rng: Random generator used for the fog Bernoulli draws (one draw per
+            enemy content token, in serialization order).
+
+    Returns:
+        A 4-tuple ``(fogged_records, clean_records, fogged_counts,
+        observed_counts)``:
+            fogged_records: the interleaved input with fog applied.
+            clean_records: the interleaved input with zero fog (used for the
+                "clean" input variant carried alongside the fogged one).
+            fogged_counts / observed_counts: per-(relative timestep, token
+                name) counts of enemy content tokens omitted / kept by the
+                fog draw, across all token kinds -- consumed by
+                ``_build_debut_target`` to label fog/future debut classes.
+
+    Calls:
+        ``_artifact_timestep_records``, ``_artifact_delimiter``.
+    """
+
     self_code = P1_CODE if window.perspective_player == "p1" else P2_CODE
     enemy_code = P2_CODE if self_code == P1_CODE else P1_CODE
-    self_block: list[TokenRecord] = []
-    clean_enemy_block: list[TokenRecord] = []
-    fogged_enemy_block: list[TokenRecord] = []
+    fogged_records: list[TokenRecord] = []
+    clean_records: list[TokenRecord] = []
     fogged_counts: dict[tuple[int, str], int] = {}
     observed_counts: dict[tuple[int, str], int] = {}
     for relative_timestep, timestep in enumerate(range(window.start_timestep, window.end_timestep)):
@@ -238,21 +351,28 @@ def _build_artifact_input(
         delimiter = _artifact_delimiter(replay, timestep)
         self_records = [record for code, record in records if code == self_code]
         enemy_records = [record for code, record in records if code == enemy_code]
-        self_block.extend(self_records)
-        self_block.append(delimiter)
-        clean_enemy_block.extend(enemy_records)
-        clean_enemy_block.append(delimiter)
+
+        # Fog every enemy content token regardless of kind (entity or
+        # upgrade) -- the old entity-only guard is removed.
+        fogged_enemy_records: list[TokenRecord] = []
         for record in enemy_records:
             key = (relative_timestep, record.token_name)
-            if record.token_kind == "entity" and rng.random() < fog_rate:
+            if rng.random() < fog_rate:
                 _increment(fogged_counts, key)
                 continue
             _increment(observed_counts, key)
-            fogged_enemy_block.append(record)
-        fogged_enemy_block.append(delimiter)
+            fogged_enemy_records.append(record)
+
+        fogged_records.extend(self_records)
+        fogged_records.extend(fogged_enemy_records)
+        fogged_records.append(delimiter)
+
+        clean_records.extend(self_records)
+        clean_records.extend(enemy_records)
+        clean_records.append(delimiter)
     return (
-        self_block + fogged_enemy_block,
-        self_block + clean_enemy_block,
+        fogged_records,
+        clean_records,
         fogged_counts,
         observed_counts,
     )
@@ -266,12 +386,47 @@ def _build_artifact_target(
     *,
     fogged_counts: dict[tuple[int, str], int],
     budget: int,
+    outcome_id: int,
 ) -> CanvasBuild:
+    """Build the pre-training canvas: win/loss token + full enemy roll-out.
+
+    Layout of the returned canvas:
+        position 0: the ``outcome_id`` token (``WIN_ID`` or ``LOSS_ID``) labeled
+            ``CLASS_WINLOSS``. It is denoised LAST at inference via the
+            ``sampler.outcome_last`` constraint, mirroring the debut target.
+        then, walking enemy timesteps from ``window.start_timestep`` to game end:
+            the full enemy reconstruction (observed + fogged past/present) plus
+            the enemy future continuation, each timestep followed by one
+            ``[DELIMITER]``.
+        finally: ``[END]`` (if the game end is reached) then ``[PAD]`` padding out
+            to ``budget``.
+
+    The outcome token consumes canvas position 0, so the reconstruction + future
+    roll-out fits within ``budget - 1``. The in-window reconstruction is bounded
+    by ``canvas_recon_fraction`` (see ``windowing._reconstruction_limit``), which
+    is far below ``budget``, so the leading outcome token never forces an
+    in-window overflow.
+
+    Parameters:
+        outcome_id: The win/loss token id to place at position 0, resolved by
+            ``resolve_replay_outcome``. Both pre-training and debut fine-tuning
+            now carry this token so the frozen-prior model never has to learn it
+            fresh at fine-tune time.
+    """
+
     enemy_code = P1_CODE if enemy_player == "p1" else P2_CODE
     remaining_fogged = dict(fogged_counts)
     token_ids: list[int] = []
     class_labels: list[int] = []
     metadata: list[dict[str, Any]] = []
+
+    # Canvas position 0 is always the single win/loss outcome token (identical
+    # placement to _build_debut_target so the sampler's outcome_last constraint
+    # and the CLASS_WINLOSS loss weighting apply uniformly across both modes).
+    token_ids.append(outcome_id)
+    class_labels.append(CLASS_WINLOSS)
+    metadata.append({"token_kind": "outcome", "timestep_index": None, "token_name": "[WIN/LOSS]"})
+
     truncated = False
     reached_game_end = False
     for timestep in range(window.start_timestep, replay.timestep_count):
@@ -297,7 +452,13 @@ def _build_artifact_target(
         for record in records:
             token_ids.append(record.token_id)
             class_labels.append(
-                _canvas_label(record, relative_timestep, window.timestep_count, remaining_fogged)
+                _canvas_label(
+                    record,
+                    relative_timestep,
+                    window.timestep_count,
+                    remaining_fogged,
+                    debut_mode=False,
+                )
             )
             metadata.append(_canvas_metadata(record, relative_timestep))
         if is_final_game_timestep:
@@ -375,7 +536,7 @@ def resolve_replay_outcome(replay_path: str | Path, perspective_player: str) -> 
     if not metadata_path.exists():
         raise ValueError(f"replay outcome metadata not found: {metadata_path}")
 
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata = _read_replay_metadata(str(metadata_path))
     players = metadata.get("players")
     if not isinstance(players, dict) or perspective_player not in players:
         raise ValueError(
@@ -389,6 +550,13 @@ def resolve_replay_outcome(replay_path: str | Path, perspective_player: str) -> 
     raise ValueError(
         f"unresolvable result {result!r} for {perspective_player} in {metadata_path}"
     )
+
+
+@lru_cache(maxsize=256)
+def _read_replay_metadata(metadata_path: str) -> dict[str, Any]:
+    """Read immutable replay metadata once per DataLoader worker process."""
+
+    return json.loads(Path(metadata_path).read_text(encoding="utf-8"))
 
 
 def _build_debut_target(
@@ -465,72 +633,100 @@ def _build_debut_target(
     class_labels.append(CLASS_WINLOSS)
     metadata.append({"token_kind": "outcome", "timestep_index": None, "token_name": "[WIN/LOSS]"})
 
-    # Cross-timestep first-appearance state. entity_running_max maps a token name
-    # to the largest count of that type seen in any single timestep so far;
-    # seen_upgrades holds upgrade token names already emitted once.
-    entity_running_max: dict[str, int] = {}
-    seen_upgrades: set[str] = set()
+    # Cross-timestep first-appearance state, UNIFIED across entity AND upgrade
+    # token kinds (the old entity-vs-upgrade special case is removed).
+    # running_max maps a token id to the largest per-timestep count of that
+    # token seen so far; a token instance "debuts" the first N times its
+    # per-timestep count exceeds that running max, N = count_now -
+    # running_max_before. For upgrades -- cumulative flags whose per-timestep
+    # count is always 0 or 1 -- this fires exactly once, on first appearance,
+    # which is provably identical to the old seen_upgrades first-appearance
+    # set (verified locally against real and synthetic replay data; see the
+    # worker report). Operating on the memory-mapped arrays avoids
+    # constructing TokenRecord objects for every non-debut unit in the
+    # remainder of the replay. Debut canvases are sparse, so that object
+    # construction was the dominant fine-tuning loader cost.
+    running_max: dict[int, int] = {}
 
     truncated = False
     reached_game_end = False
     for timestep in range(window.start_timestep, replay.timestep_count):
         relative_timestep = timestep - window.start_timestep
-        enemy_records = [
-            record
-            for code, record in _artifact_timestep_records(
-                replay, timestep, vocabulary, window.perspective_player
-            )
-            if code == enemy_code
+        token_slice = replay.token_slice(timestep)
+        enemy_positions = [
+            position
+            for position in range(token_slice.start, token_slice.stop)
+            if int(replay.owners[position]) == enemy_code
         ]
 
-        # Count how many of each entity type are present this timestep so we can
-        # tell how many are NEW relative to the running max.
-        entity_counts_this_step: dict[str, int] = {}
-        for record in enemy_records:
-            if record.token_kind == "entity":
-                name = record.token_name
-                entity_counts_this_step[name] = entity_counts_this_step.get(name, 0) + 1
+        # Count how many of each token id (entity instance OR upgrade) are
+        # present this timestep so we can tell how many are NEW relative to
+        # the running max.
+        counts_this_step: dict[int, int] = {}
+        for position in enemy_positions:
+            token_id = int(replay.token_ids[position])
+            counts_this_step[token_id] = counts_this_step.get(token_id, 0) + 1
 
-        # Collect this timestep's debut events in the artifact's natural order
-        # (entities precede upgrades). For entities, only the first N new
-        # instances of a type debut, where N = count_now - running_max_before.
-        debut_records: list[TokenRecord] = []
-        emitted_per_entity: dict[str, int] = {}
-        for record in enemy_records:
-            if record.token_kind == "entity":
-                name = record.token_name
-                new_instances = entity_counts_this_step[name] - entity_running_max.get(name, 0)
-                already_emitted = emitted_per_entity.get(name, 0)
-                if already_emitted < new_instances:
-                    debut_records.append(record)
-                    emitted_per_entity[name] = already_emitted + 1
-            elif record.token_kind == "upgrade":
-                if record.token_name not in seen_upgrades:
-                    seen_upgrades.add(record.token_name)
-                    debut_records.append(record)
+        # Collect this timestep's debut events in the artifact's natural
+        # order. Only the first N new instances of a token type debut, where
+        # N = count_now - running_max_before (N is 0 or 1 for upgrades).
+        debut_positions: list[int] = []
+        emitted_per_token: dict[int, int] = {}
+        for position in enemy_positions:
+            token_id = int(replay.token_ids[position])
+            new_instances = counts_this_step[token_id] - running_max.get(token_id, 0)
+            already_emitted = emitted_per_token.get(token_id, 0)
+            if already_emitted < new_instances:
+                debut_positions.append(position)
+                emitted_per_token[token_id] = already_emitted + 1
 
         # Update running max AFTER deciding debuts for this timestep.
-        for name, count in entity_counts_this_step.items():
-            if count > entity_running_max.get(name, 0):
-                entity_running_max[name] = count
+        for token_id, count in counts_this_step.items():
+            if count > running_max.get(token_id, 0):
+                running_max[token_id] = count
 
         # Every timestep contributes its debut events plus one delimiter. Empty
         # timesteps therefore produce a bare delimiter (back-to-back delimiters).
-        timestep_records = debut_records + [_artifact_delimiter(replay, timestep)]
         is_final_game_timestep = timestep == replay.timestep_count - 1
         # Reserve one extra slot for [END] on the final timestep.
-        required = len(timestep_records) + (1 if is_final_game_timestep else 0)
+        required = len(debut_positions) + 1 + (1 if is_final_game_timestep else 0)
         if len(token_ids) + required > budget:
             # Long game overflows the canvas: drop this and all later whole
             # timesteps and mark the example truncated.
             truncated = True
             break
-        for record in timestep_records:
+        for position in debut_positions:
+            record = _artifact_canvas_record(
+                replay,
+                timestep,
+                position,
+                vocabulary,
+                window.perspective_player,
+            )
             token_ids.append(record.token_id)
             class_labels.append(
-                _canvas_label(record, relative_timestep, window.timestep_count, remaining_fogged)
+                _canvas_label(
+                    record,
+                    relative_timestep,
+                    window.timestep_count,
+                    remaining_fogged,
+                    debut_mode=True,
+                )
             )
             metadata.append(_canvas_metadata(record, relative_timestep))
+        token_ids.append(DELIMITER_ID)
+        class_labels.append(CLASS_DELIMITER)
+        metadata.append(
+            {
+                "token_id": DELIMITER_ID,
+                "token_name": "[DELIMITER]",
+                "token_kind": "delimiter",
+                "timestep_index": relative_timestep,
+                "owner": None,
+                "instance_id": None,
+                "game_loop": int(replay.game_loops[timestep]),
+            }
+        )
         if is_final_game_timestep:
             reached_game_end = True
             break
@@ -547,6 +743,31 @@ def _build_debut_target(
         class_labels.append(CLASS_PAD)
         metadata.append({"token_kind": "pad", "timestep_index": None, "token_name": "[PAD]"})
     return CanvasBuild(token_ids, class_labels, metadata, terminated, truncated)
+
+
+def _artifact_canvas_record(
+    replay: TokenizedReplay,
+    timestep: int,
+    position: int,
+    vocabulary: ContentVocabulary,
+    perspective_player: str,
+) -> TokenRecord:
+    """Materialize only the fields consumed by canvas labels and metadata."""
+
+    owner_code = int(replay.owners[position])
+    owner = "p1" if owner_code == P1_CODE else "p2"
+    token_id = int(replay.token_ids[position])
+    token_name = vocabulary.token_name_for(token_id)
+    return TokenRecord(
+        token_id=token_id,
+        token_name=token_name,
+        token_kind="entity" if int(replay.kinds[position]) == ENTITY_CODE else "upgrade",
+        owner=owner,
+        allegiance="self" if owner == perspective_player else "enemy",
+        game_loop=int(replay.game_loops[timestep]),
+        timestamp_seconds=_optional_artifact_timestamp(replay.timestamps[timestep]),
+        entity_type=token_name,
+    )
 
 
 def _artifact_timestep_records(
@@ -638,8 +859,12 @@ def build_input_records(
         self_block.extend(self_records)
         self_block.append(delimiter)
 
+        # Fog every enemy content token regardless of kind (entity or
+        # upgrade) -- mirrors the same guard removal in _build_artifact_input,
+        # kept consistent here since this is a legacy fallback copy of the
+        # same fog-application logic.
         for record in enemy_records:
-            if record.token_kind == "entity" and rng.random() < fog_rate:
+            if rng.random() < fog_rate:
                 _increment(fogged_counts, (timestep_index, record.token_name))
                 continue
             _increment(observed_counts, (timestep_index, record.token_name))
@@ -706,9 +931,43 @@ def _canvas_label(
     timestep_index: int,
     input_timestep_count: int,
     fogged_counts: dict[tuple[int, str], int],
+    *,
+    debut_mode: bool = True,
 ) -> int:
+    """Assign a class id to one non-outcome canvas token.
+
+    Parameters:
+        record: The token whose class is being decided.
+        timestep_index: Relative timestep index of this record within the
+            canvas (0-based from the window start).
+        input_timestep_count: Number of timesteps in the input window. Only
+            consulted when ``debut_mode`` is True, to tell whether this
+            record's timestep lies beyond the input window (the "future").
+        fogged_counts: Mutable per-(timestep, token name) remaining-fogged
+            counts; one count is consumed each time a fogged token is
+            labeled. Only consulted when ``debut_mode`` is True -- pre-training
+            has no fog at all.
+        debut_mode: True for fine-tuning canvases, which keep the 3-way
+            visible/fogged/future split (part of the 7-class debut
+            taxonomy). False for pre-training canvases, where every content
+            token collapses to the single ``CLASS_CONTENT`` class, because
+            pre-training has no input and no fog (the published MDLM/LLaDA
+            pure-reconstruction objective: the whole canvas is one
+            undifferentiated reconstruction target).
+
+    Returns:
+        ``CLASS_DELIMITER`` for delimiter tokens; otherwise ``CLASS_CONTENT``
+        when ``debut_mode`` is False, or one of ``CLASS_ENEMY_OBSERVED`` /
+        ``CLASS_ENEMY_FOGGED`` / ``CLASS_ENEMY_FUTURE`` when ``debut_mode`` is
+        True.
+    """
+
     if record.token_id == DELIMITER_ID:
         return CLASS_DELIMITER
+    if not debut_mode:
+        # Pre-training: no fog, no input/future split -- every content token
+        # collapses to CLASS_CONTENT (alias of CLASS_ENEMY_OBSERVED).
+        return CLASS_CONTENT
     if timestep_index >= input_timestep_count:
         return CLASS_ENEMY_FUTURE
     key = (timestep_index, record.token_name)

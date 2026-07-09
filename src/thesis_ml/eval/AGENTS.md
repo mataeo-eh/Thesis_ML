@@ -18,6 +18,7 @@
 - One bucket equals `sampling_interval_s`. Decoded count increases emit one event per new unit; instance IDs do not exist on the prediction side.
 - Matching is entity-type exact within `timing_tolerance_buckets`; each event matches at most one counterpart. Report precision, recall, F1, and accuracy.
 - Keep every decoded timestep; valid canvases cannot contain a partial final timestep. Token cross-entropy is never a reported metric.
+- The harness exposes raw predicted and ground-truth canvas IDs for read-only diagnostics. Final-canvas logits are populated only when explicitly requested and are not part of normal evaluation metrics. Its default path remains iterative sampling; visualization diagnostics may explicitly select the one-pass denoising path.
 
 ## Work Guidance
 

@@ -143,7 +143,10 @@ class MultiHeadSelfAttention(nn.Module):
         # O(seq^2) allocation and Windows shared-memory spillover. CPU retains
         # its only available implementation for unit tests and diagnostics.
         kernel_context = (
-            sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
+            sdpa_kernel(
+                [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION],
+                set_priority=True,
+            )
             if q.is_cuda
             else nullcontext()
         )

@@ -32,19 +32,34 @@ END_TOKEN_COUNT = 1
 
 @dataclass(frozen=True)
 class ReplayTokenCounts:
-    """Unpadded full-replay token lengths for both player perspectives."""
+    """Unpadded full-replay token lengths for both player perspectives.
+
+    Two separate input token counts are reported because the input grammar is
+    now training-mode-dependent (see ``estimate_replay`` and
+    ``thesis_ml.data.dataset``):
+        pretrain_input_tokens: always 0. Pre-training's model sequence is
+            100% output canvas -- there is no input at all (no self/enemy
+            blocks, no fog, no delimiters devoted to an input segment).
+        finetune_input_tokens: all self tokens plus all zero-fog enemy
+            tokens, interleaved per timestep with exactly ONE delimiter per
+            timestep (``_build_artifact_input``'s fine-tuning grammar).
+    The output/target canvas token counts are unaffected by this mode split
+    (the reconstruction-target grammar is unchanged across both modes) and
+    stay per-perspective as before.
+    """
 
     replay: str
     timesteps: int
     p1_content_tokens: int
     p2_content_tokens: int
-    input_tokens: int
+    pretrain_input_tokens: int
+    finetune_input_tokens: int
     p1_perspective_output_tokens: int
     p2_perspective_output_tokens: int
 
 
 def estimate_replay(parquet_path: Path) -> ReplayTokenCounts:
-    """Count full-replay model tokens without loading the wide table."""
+    """Count full-replay model tokens, for both training modes, without loading the wide table."""
 
     parquet = pq.ParquetFile(parquet_path)
     timesteps = parquet.metadata.num_rows
@@ -62,10 +77,18 @@ def estimate_replay(parquet_path: Path) -> ReplayTokenCounts:
     p1_content = entity_counts["p1"] + upgrade_counts["p1"]
     p2_content = entity_counts["p2"] + upgrade_counts["p2"]
 
-    # Input grammar is [all self timesteps][all zero-fog enemy timesteps], so
-    # each timestep contributes one delimiter to each block.  The output canvas
-    # contains the enemy block, one delimiter per timestep, then [END].
-    input_tokens = p1_content + p2_content + (2 * timesteps)
+    # Pre-training: the input is LITERALLY ABSENT -- the model sequence is
+    # 100% output canvas (the published MDLM/LLaDA pure-reconstruction
+    # objective). No self/enemy blocks, no fog, no delimiters.
+    pretrain_input_tokens = 0
+
+    # Fine-tuning: input interleaves [self][enemy] records per timestep with
+    # exactly ONE delimiter per timestep (previously: one delimiter per
+    # PLAYER per timestep, i.e. 2 per timestep -- that old grammar is gone).
+    finetune_input_tokens = p1_content + p2_content + timesteps
+
+    # Output/target canvas grammar is unchanged across both modes: the full
+    # enemy reconstruction, one delimiter per timestep, then [END].
     p1_output = p2_content + timesteps + END_TOKEN_COUNT
     p2_output = p1_content + timesteps + END_TOKEN_COUNT
     return ReplayTokenCounts(
@@ -73,52 +96,72 @@ def estimate_replay(parquet_path: Path) -> ReplayTokenCounts:
         timesteps=timesteps,
         p1_content_tokens=p1_content,
         p2_content_tokens=p2_content,
-        input_tokens=input_tokens,
+        pretrain_input_tokens=pretrain_input_tokens,
+        finetune_input_tokens=finetune_input_tokens,
         p1_perspective_output_tokens=p1_output,
         p2_perspective_output_tokens=p2_output,
     )
 
 
 def build_report(replays: Sequence[ReplayTokenCounts]) -> dict[str, object]:
-    """Build auditable aggregate statistics over replay-perspective samples."""
+    """Build auditable aggregate statistics over replay-perspective samples.
+
+    Reports statistics for BOTH training-mode input grammars side by side
+    (pre-training's absent input and fine-tuning's interleaved input) so this
+    script stays a useful context-window planning tool for either pipeline.
+    The output/target canvas statistics are shared (mode-independent).
+    """
 
     if not replays:
         raise ValueError("at least one replay is required")
 
-    input_lengths: list[int] = []
+    pretrain_input_lengths: list[int] = []
+    finetune_input_lengths: list[int] = []
     output_lengths: list[int] = []
-    combined_lengths: list[int] = []
+    pretrain_combined_lengths: list[int] = []
+    finetune_combined_lengths: list[int] = []
     timestep_counts = [replay.timesteps for replay in replays]
     for replay in replays:
         for output_length in (
             replay.p1_perspective_output_tokens,
             replay.p2_perspective_output_tokens,
         ):
-            input_lengths.append(replay.input_tokens)
+            pretrain_input_lengths.append(replay.pretrain_input_tokens)
+            finetune_input_lengths.append(replay.finetune_input_tokens)
             output_lengths.append(output_length)
-            combined_lengths.append(replay.input_tokens + output_length)
+            pretrain_combined_lengths.append(replay.pretrain_input_tokens + output_length)
+            finetune_combined_lengths.append(replay.finetune_input_tokens + output_length)
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "dataset": {
             "parquet_files": len(replays),
-            "perspective_samples": len(input_lengths),
+            "perspective_samples": len(output_lengths),
             "file_pattern": DEFAULT_PATTERN,
         },
         "token_accounting": {
             "sample_unit": "one replay from one player perspective",
             "entity": "one token per entity instance with a non-null attribute at a timestep",
             "upgrade": "one token per listed cumulative upgrade at a timestep",
-            "input": "all self tokens plus all zero-fog enemy tokens, with one delimiter per player per timestep",
+            "pretrain_input": (
+                "always 0 -- pre-training has no input at all; the model sequence is "
+                "100% output canvas (see SC2DiffusionDataset.__getitem__, debut_mode=false)"
+            ),
+            "finetune_input": (
+                "all self tokens plus all zero-fog enemy tokens, interleaved per timestep "
+                "([self][enemy] per timestep) with exactly one delimiter per timestep"
+            ),
             "output": "all enemy tokens, with one delimiter per timestep and one terminal [END] token",
             "padding": "excluded",
         },
         "statistics": {
             "timesteps": _descriptive_statistics(timestep_counts),
-            "input_tokens": _descriptive_statistics(input_lengths),
+            "pretrain_input_tokens": _descriptive_statistics(pretrain_input_lengths),
+            "finetune_input_tokens": _descriptive_statistics(finetune_input_lengths),
             "output_tokens": _descriptive_statistics(output_lengths),
-            "combined_input_output_tokens": _descriptive_statistics(combined_lengths),
+            "pretrain_combined_input_output_tokens": _descriptive_statistics(pretrain_combined_lengths),
+            "finetune_combined_input_output_tokens": _descriptive_statistics(finetune_combined_lengths),
         },
         "replays": [asdict(replay) for replay in replays],
     }

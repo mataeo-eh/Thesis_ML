@@ -36,6 +36,12 @@ def corrupt_batch(
     masking level t per example, mask canvas positions iid with probability t,
     and weight masked-position CE by approximately 1/t. The clamped input is
     returned by reference and is never edited here.
+
+    When ``t`` is not supplied (the real training pipelines), a per-example
+    fraction of the batch is OVERSAMPLED to t=1.0 exactly -- see
+    `_resolve_t` for the exact mechanism. Callers that pass an explicit ``t``
+    (eval/validation/the sampler) are unaffected: oversampling only applies to
+    the "None" (uniform-schedule) path.
     """
 
     if schedule.name != "linear":
@@ -78,11 +84,49 @@ def _resolve_t(
     generator: torch.Generator | None,
     t: torch.Tensor | float | None,
 ) -> torch.Tensor:
+    """Resolve the per-example masking level t used by `corrupt_batch`.
+
+    Three cases, in priority order:
+      1. ``t is None`` (the real training pipelines): this is where t=1.0
+         OVERSAMPLING happens. Each example independently draws a
+         Bernoulli(``schedule.t_one_fraction``) coin; examples that "win"
+         that coin flip get t forced to exactly 1.0 (fully masked canvas),
+         regardless of where their uniform draw landed. Every other example
+         keeps the existing behavior: t drawn uniformly over
+         ``[schedule.min, schedule.max]``. This makes t_one_fraction the
+         EXPECTED oversampled fraction per epoch (a per-example Bernoulli,
+         not an exact per-batch quota). Both the Bernoulli draw and the
+         uniform draw consume the caller's ``generator`` so a fixed seed
+         reproduces training exactly.
+      2. ``t`` is a tensor: used directly (explicit-t callers -- eval,
+         validation, the sampler -- bypass oversampling entirely).
+      3. ``t`` is a plain float: broadcast to every example in the batch
+         (also bypasses oversampling).
+
+    In every case the returned t is clamped to ``MIN_T`` so `inverse_t_weights`
+    never divides by (near) zero; this clamp is a no-op for the oversampled
+    t=1.0 examples since 1.0 is already far above MIN_T.
+    """
+
     batch_size = target_canvas.shape[0]
     device = target_canvas.device
     if t is None:
-        sampled = torch.rand(batch_size, device=device, generator=generator)
-        sampled = schedule.min + sampled * (schedule.max - schedule.min)
+        # Step 1: per-example Bernoulli(t_one_fraction) selects which examples
+        # get t forced to exactly 1.0 this epoch (oversampling), independent
+        # of the uniform schedule draw in step 2.
+        oversample_draw = torch.rand(batch_size, device=device, generator=generator)
+        oversampled = oversample_draw < schedule.t_one_fraction
+
+        # Step 2: existing behavior, unchanged -- draw t uniformly over
+        # [schedule.min, schedule.max] for every example. This is still what
+        # determines t for the examples NOT selected for oversampling above.
+        uniform_draw = torch.rand(batch_size, device=device, generator=generator)
+        uniform_t = schedule.min + uniform_draw * (schedule.max - schedule.min)
+
+        # Step 3: wherever the Bernoulli coin selected oversampling, overwrite
+        # the uniform draw with exactly 1.0; everywhere else, keep the
+        # uniform draw as before.
+        sampled = torch.where(oversampled, torch.ones_like(uniform_t), uniform_t)
     elif isinstance(t, torch.Tensor):
         sampled = t.to(device=device, dtype=torch.float32)
         if sampled.ndim == 0:

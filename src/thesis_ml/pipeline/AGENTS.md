@@ -6,7 +6,7 @@
 
 ## Ownership
 
-- `train_pipeline.py` owns config-only preprocessing, training, checkpoint, and resume orchestration (`run_training_pipeline`, `main` → `thesis-ml-train`, smoke path).
+- `train_pipeline.py` owns config-only preprocessing, exact/fractional replay splitting, training, checkpoint/resume orchestration, and debut-mode held-out reporting (`run_training_pipeline`, `main` → `thesis-ml-train`, smoke path).
 - `acquire_data.py` owns decoupled replay acquisition wrapping `SC2-gamestate-extractor` (`run_acquisition`, `main` → `thesis-ml-acquire`, `CredentialError`, `AcquisitionResult`).
 - `finetune_pipeline.py` owns the debut/outcome fine-tuning pipeline (`run_finetune_pipeline`, `_select_eval_examples`, `main`).
 - `storage.py` owns the generic path resolver over local filesystem and S3 (`StorageResolver`, `S3Uri`, `parse_s3_uri`).
@@ -20,11 +20,14 @@
 - The overfit profile fails when CUDA reserved memory reaches `max_cuda_reserved_gb` and logs timing, throughput, allocated peak, and reserved memory every step.
 - Secrets (Kaggle, AWS) come from environment/config only, never hardcoded or committed.
 - Model scale, token budgets, paths, subset selection, epochs, and checkpoint intervals stay config-owned.
+- Debut-mode full training evaluates the EMA model with the fine-tune report schema against the true test split; uncapped evaluation remains lazy instead of materializing every window in host RAM.
+- Both real pipelines require `pipeline.perspectives` to contain exactly `p1,p2`, canonicalize that order, and reject stale manifests that do not record both perspectives.
 
 ## Work Guidance
 
 - Extend this orchestration rather than adding a parallel entry point; it drives the `data`, `train`, and (for fine-tuning) `eval` subpackages.
 - Keep the real DataLoader path memory-mapped and bounded to one replay per worker; drop raw metadata before worker IPC and use pinned, non-blocking CUDA transfers.
+- Keep worker persistence config-owned. Both local overfit and full-corpus profiles retain workers to avoid repeated Windows process startup; worker-exit messages after manually terminating a run are expected teardown fallout.
 - Keep the `metrics.jsonl` / epoch-CSV fields and CLI flags aligned with `RUN.md`.
 
 ## Verification

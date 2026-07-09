@@ -32,6 +32,13 @@ model:
   self_conditioning: false
   gradient_checkpointing: true
 
+diffusion:
+  mask_schedule:
+    # Explicit here (not just inherited from config/default.yaml) per the
+    # refactor owner's instruction: every configs/ YAML states this knob
+    # explicitly so the oversampling rate is never a silent inheritance.
+    t_one_fraction: 0.1
+
 train:
   epochs: 200
   max_steps: 0

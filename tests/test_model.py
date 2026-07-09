@@ -4,13 +4,23 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from thesis_ml.config import ProjectConfig, load_config
+from thesis_ml.config import (
+    ClassLossWeightsConfig,
+    FogConfig,
+    ProjectConfig,
+    UniformDistributionConfig,
+    load_config,
+)
 from thesis_ml.data.dataset import (
+    CLASS_CONTENT,
     CLASS_DELIMITER,
+    CLASS_END,
     CLASS_ENEMY_FOGGED,
     CLASS_ENEMY_FUTURE,
     CLASS_ENEMY_OBSERVED,
     CLASS_PAD,
+    CLASS_WINLOSS,
+    PRETRAIN_CLASS_ID_TO_NAME,
 )
 from thesis_ml.model.loss import CanvasCrossEntropyLoss
 from thesis_ml.model import backbone as backbone_module
@@ -40,6 +50,39 @@ def _small_config(
             ffn=ffn,
             qk_norm=qk_norm,
             self_conditioning=self_conditioning,
+        ),
+    )
+
+
+def _small_debut_config(**kwargs) -> ProjectConfig:
+    """Fine-tuning (debut_mode=True) variant of `_small_config`.
+
+    The future-distance loss decomposition (and per-class config weighting) is
+    now FINE-TUNING-ONLY, so tests of those behaviors must build the loss from
+    a debut-mode config. A debut config is required (by
+    `_validate_debut_mode_sections` / `CanvasCrossEntropyLoss`) to carry `fog`
+    and `loss.class_loss_weights`, so both are populated with plain uniform
+    values here -- their exact numbers are not what these tests assert.
+    """
+
+    base = _small_config(**kwargs)
+    return replace(
+        base,
+        data=replace(base.data, debut_mode=True),
+        fog=FogConfig(
+            rate_distribution=UniformDistributionConfig(name="uniform", min=0.0, max=0.8)
+        ),
+        loss=replace(
+            base.loss,
+            class_loss_weights=ClassLossWeightsConfig(
+                enemy_observed_reconstruction=1.0,
+                enemy_fogged_reconstruction=1.0,
+                enemy_future_prediction=1.0,
+                delimiter=1.0,
+                end=1.0,
+                pad=1.0,
+                win_loss=1.0,
+            ),
         ),
     )
 
@@ -302,7 +345,9 @@ def test_loss_is_canvas_only() -> None:
     changed_full_logits = full_logits.clone()
     changed_full_logits[:, :input_len, :] = 100.0
     target = torch.tensor([[1, 2, 3, 4]])
-    labels = torch.tensor([[CLASS_ENEMY_OBSERVED, CLASS_ENEMY_FOGGED, CLASS_DELIMITER, CLASS_PAD]])
+    # Pre-training labels: content tokens collapse to the single CLASS_CONTENT
+    # class (ids 1/2 are never emitted in this mode).
+    labels = torch.tensor([[CLASS_CONTENT, CLASS_CONTENT, CLASS_DELIMITER, CLASS_PAD]])
 
     loss_a = loss_fn(full_logits[:, input_len:], target, labels).loss
     loss_b = loss_fn(changed_full_logits[:, input_len:], target, labels).loss
@@ -311,21 +356,29 @@ def test_loss_is_canvas_only() -> None:
 
 
 def test_per_class_logging_populated_and_consistent() -> None:
+    # Pre-training config -> the per-class decomposition uses the COLLAPSED
+    # 5-name taxonomy (PRETRAIN_CLASS_ID_TO_NAME): every content token is
+    # "content"; the old enemy-observed/-fogged/-future names must not appear.
     config = _small_config()
     loss_fn = CanvasCrossEntropyLoss(config)
     logits = torch.zeros(1, 4, 8)
     target = torch.tensor([[1, 2, 3, 4]])
-    labels = torch.tensor([[CLASS_ENEMY_OBSERVED, CLASS_ENEMY_FOGGED, CLASS_DELIMITER, CLASS_PAD]])
+    labels = torch.tensor([[CLASS_CONTENT, CLASS_CONTENT, CLASS_DELIMITER, CLASS_PAD]])
 
     result = loss_fn(logits, target, labels)
 
-    assert set(result.per_class) == {"enemy-observed", "enemy-fogged", "[DELIMITER]", "[PAD]"}
+    assert set(result.per_class) == {"content", "[DELIMITER]", "[PAD]"}
+    assert set(result.per_class) <= set(PRETRAIN_CLASS_ID_TO_NAME.values())
+    assert "enemy-observed" not in result.per_class
+    assert "enemy-fogged" not in result.per_class
     expected = torch.stack(list(result.per_class.values())).mean()
     assert torch.allclose(result.loss, expected)
 
 
 def test_future_loss_is_bucketed_by_prediction_distance() -> None:
-    loss_fn = CanvasCrossEntropyLoss(_small_config())
+    # Future-distance decomposition is FINE-TUNING-ONLY now (pre-training has
+    # no future class at all), so the loss must be built from a debut config.
+    loss_fn = CanvasCrossEntropyLoss(_small_debut_config())
     logits = torch.zeros(1, 6, 8)
     target = torch.tensor([[1, 2, 3, 4, 5, 6]])
     labels = torch.full((1, 6), CLASS_ENEMY_FUTURE, dtype=torch.long)
@@ -346,6 +399,110 @@ def test_future_loss_is_bucketed_by_prediction_distance() -> None:
         value.item() == pytest.approx(expected)
         for value in result.future_distance.values()
     )
+
+
+def test_pretraining_loss_never_emits_future_distance_even_with_distances() -> None:
+    """The pre-training loss emits NO future-distance keys, even when the
+    collate path hands it a distances tensor -- the decomposition is gated on
+    debut_mode, not merely on the label never appearing."""
+
+    loss_fn = CanvasCrossEntropyLoss(_small_config())
+    logits = torch.zeros(1, 4, 8)
+    target = torch.tensor([[1, 2, 3, 4]])
+    labels = torch.tensor([[CLASS_CONTENT, CLASS_CONTENT, CLASS_DELIMITER, CLASS_PAD]])
+    distances = torch.tensor([[1, 2, 3, 4]])
+
+    result = loss_fn(logits, target, labels, prediction_distances=distances)
+
+    assert result.future_distance == {}
+    assert result.future_distance_counts == {}
+
+
+def test_t_bucket_edges_are_contiguous_exhaustive_and_perspectives_emit_both_keys() -> None:
+    """Every t in [0, 1] lands in EXACTLY one t-bucket, with the documented edges.
+
+    The five buckets partition [0, 1]: exact t==1.0 -> t_eq_1; [0.7, 1.0) ->
+    t_0_7_to_1_0 (so t=0.995 goes there, NOT in t_eq_1); then [0.5, 0.7),
+    [0.3, 0.5), and [0.0, 0.3). Also proves the perspective breakdown emits
+    both `p1` and `p2` keys for a batch containing both perspectives.
+    """
+
+    loss_fn = CanvasCrossEntropyLoss(_small_config())
+
+    def bucket_for(t_value: float) -> str:
+        # One single-position example whose sampled t is t_value: exactly one
+        # bucket key must appear in the decomposition.
+        logits = torch.zeros(1, 1, 8)
+        target = torch.tensor([[1]])
+        labels = torch.tensor([[CLASS_CONTENT]])
+        result = loss_fn(logits, target, labels, sampled_t=torch.tensor([t_value]))
+        assert len(result.t_bucket) == 1, f"t={t_value} mapped to {set(result.t_bucket)}"
+        return next(iter(result.t_bucket))
+
+    # A dense grid over [0, 1] plus every boundary: each t maps to exactly one
+    # bucket (asserted inside bucket_for) and to the DOCUMENTED bucket.
+    def expected_bucket(t_value: float) -> str:
+        if t_value == 1.0:
+            return "t_eq_1"
+        if t_value >= 0.7:
+            return "t_0_7_to_1_0"
+        if t_value >= 0.5:
+            return "t_0_5_to_0_7"
+        if t_value >= 0.3:
+            return "t_0_3_to_0_5"
+        return "t_0_0_to_0_3"
+
+    grid = [index / 100.0 for index in range(101)]
+    for t_value in [*grid, 0.995, 0.2999, 0.3, 0.5, 0.7, 0.9999]:
+        assert bucket_for(t_value) == expected_bucket(t_value), f"t={t_value}"
+
+    # The two spelled-out cases from the metric contract.
+    assert bucket_for(0.995) == "t_0_7_to_1_0"
+    assert bucket_for(1.0) == "t_eq_1"
+
+    # Perspective split: a two-example batch built from p1 and p2 perspectives
+    # emits BOTH keys (1 -> "p1", 2 -> "p2" per collate's integer encoding).
+    logits = torch.zeros(2, 2, 8)
+    target = torch.tensor([[1, 2], [3, 4]])
+    labels = torch.tensor([[CLASS_CONTENT, CLASS_PAD], [CLASS_CONTENT, CLASS_PAD]])
+    result = loss_fn(
+        logits,
+        target,
+        labels,
+        sampled_t=torch.tensor([0.4, 0.8]),
+        perspective_ids=torch.tensor([1, 2]),
+    )
+    assert set(result.perspective) == {"p1", "p2"}
+    # And the two different sampled ts populate their two different buckets.
+    assert set(result.t_bucket) == {"t_0_3_to_0_5", "t_0_7_to_1_0"}
+
+
+def test_pretraining_loss_weights_are_uniform_with_zero_pad_and_never_read_class_weight_config() -> None:
+    """Pre-training loss weighting is fully uniform (published MDLM style).
+
+    The weight buffer must be length 7 (max class id 6 + 1, even though the
+    pre-training map is sparse with 5 entries), hold exactly 1.0 for every
+    class except `[PAD]` (zeroed so padding never contributes), and be built
+    WITHOUT reading `config.loss.class_loss_weights` -- which is None for a
+    pre-training config, so any read would crash.
+    """
+
+    config = _small_config()
+    # Precondition making the "never reads the knob" claim meaningful: the
+    # pre-training config genuinely has no class-weight section to read.
+    assert config.loss.class_loss_weights is None
+
+    loss_fn = CanvasCrossEntropyLoss(config)
+    weights = loss_fn.class_weights
+
+    assert weights.shape == (7,)
+    assert weights[CLASS_PAD].item() == 0.0
+    for class_id in (CLASS_CONTENT, CLASS_DELIMITER, CLASS_END, CLASS_WINLOSS):
+        assert weights[class_id].item() == 1.0
+    # The unused ids 1/2 keep the uniform fill too (they are never emitted in
+    # pre-training, but the buffer is id-indexed so they must exist).
+    assert weights[CLASS_ENEMY_FOGGED].item() == 1.0
+    assert weights[CLASS_ENEMY_FUTURE].item() == 1.0
 
 
 def test_attention_is_bidirectional() -> None:

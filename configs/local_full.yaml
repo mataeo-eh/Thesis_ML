@@ -3,42 +3,86 @@ extends: ../config/default.yaml
 storage:
   data_uri: ../data/quickstart/parquet
   checkpoint_uri: checkpoints/local-full
-  log_uri: tests/output/smallTrainingTest
+  log_uri: tests/output/smallTrainingTestV2
   local_cache_dir: .pipeline_cache/local-full
 
+# PRE-TRAINING profile (smallTrainingTestV2.bat -> thesis_ml.pipeline.train_pipeline).
+# debut_mode is False, so the dataset builds the full enemy reconstruction + future
+# roll-out target (_build_artifact_target), now led by the [WIN]/[LOSS] outcome
+# token at canvas position 0. Fine-tuning is the SEPARATE pathway:
+# configs/local_overfit_v2_finetune.yaml run via thesis_ml.pipeline.finetune_pipeline
+# (smallFinetuneTest.bat).
 data:
   sampling_interval_s: 1
   input_budget_tokens: 4096
   canvas_budget_tokens: 4096
   canvas_recon_fraction: 0.5
+  debut_mode: false
   tokenized_replay_dir: data/processed/local/tokenized_replays
-  window_manifest_path: data/processed/local/window_manifest.jsonl
+  # Pre-training (reconstruction-bounded) window manifest -- a SEPARATE file from
+  # the debut manifest so the two pathways never share or overwrite windows.
+  window_manifest_path: data/processed/local/full_window_manifest.jsonl
 
 pipeline:
   seed: 2718
   split_seed: 2718
-  batch_size: 8
+  batch_size: 9
   replay_glob: "*.parquet"
-  num_workers: 3
+  num_workers: 10
+  prefetch_factor: 4
+  persistent_workers: true
+  train_replay_count: 870
   replay_subset_size: 0
-  validation_replay_count: 0
+  validation_replay_count: 50
 
 model:
   d_model: 256
   layers: 10
   heads: 4
   ffn: 1024
-  self_conditioning: false
+  self_conditioning: true
+  gradient_checkpointing: true
+
+diffusion:
+  mask_schedule:
+    # Explicit here (not just inherited from config/default.yaml) per the
+    # refactor owner's instruction: every configs/ YAML states this knob
+    # explicitly so the oversampling rate is never a silent inheritance.
+    t_one_fraction: 0.1
 
 train:
+  # Learning-rate schedule for FROM-SCRATCH pre-training. Declared explicitly
+  # here (rather than inherited from config/default.yaml) so this profile owns
+  # its own LR and can never silently pick up a value meant for another run --
+  # e.g. the 1e-6 fine-tuning rate in configs/local_overfit_v2_finetune.yaml.
+  #   - lr: the PEAK base learning rate (3e-4 is a standard from-scratch value).
+  #   - warmup: steps to linearly ramp from ~0 up to lr. Keep this WELL BELOW the
+  #     run's total steps, otherwise the effective LR stays a tiny fraction of lr
+  #     for most of the run (a short local run with the old warmup=2000 spent
+  #     ~all its steps ramping, which looked like "a super low learning rate").
+  #     The loop prints an `lr_schedule ...` line at startup (with a WARNING when
+  #     warmup >= target_steps) so the effective rate is never a surprise.
+  # To toggle the LR for a one-off run without editing this file, pass --lr
+  # (e.g. `smallTrainingTestV2.bat --lr 1e-4`).
+  lr: 3.0e-4
+  warmup: 200
   epochs: 8
   max_steps: 0
   early_stopping_patience_epochs: 0
   early_stopping_min_relative_improvement: 0.001
   accumulation_steps: 1
   target_effective_batch_tokens: 0
-  checkpoint_interval: 250
+  checkpoint_interval: 50
   val_interval: 0
-  self_cond_prob: 0.0
+  self_cond_prob: 0.5
   precision: bf16
   require_cuda: true
+  max_cuda_reserved_gb: 7.5
+  empty_cuda_cache_after_epoch: true
+
+sampler:
+  outcome_last: true
+
+eval:
+  heldout_split: test
+  debut_max_examples: 0

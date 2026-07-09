@@ -50,8 +50,13 @@ def validate_canvas(token_ids: Sequence[int]) -> CanvasValidation:
     except ValueError:
         end_index = None
 
-    if WIN_ID in token_ids or LOSS_ID in token_ids:
-        return CanvasValidation(False, "outcome token is not valid in pretraining canvas", None, False, False)
+    # The pre-training canvas now leads with exactly one [WIN]/[LOSS] outcome
+    # token at position 0 (denoised last), the same leading-outcome-token layout
+    # as the debut grammar. It may not appear at any other position.
+    if token_ids[0] not in (WIN_ID, LOSS_ID):
+        return CanvasValidation(False, "canvas must start with a [WIN]/[LOSS] outcome token", None, False, False)
+    if WIN_ID in token_ids[1:] or LOSS_ID in token_ids[1:]:
+        return CanvasValidation(False, "outcome token may appear only at position 0", None, False, False)
 
     if first_pad is not None and end_index is not None and first_pad < end_index:
         return CanvasValidation(False, "[PAD] appears before [END]", end_index, False, False)
@@ -70,7 +75,9 @@ def validate_canvas(token_ids: Sequence[int]) -> CanvasValidation:
         return CanvasValidation(True, None, end_index, False, False)
 
     active_end = first_pad if first_pad is not None else len(token_ids)
-    if active_end == 0 or token_ids[active_end - 1] != DELIMITER_ID:
+    # active_end <= 1 means only the outcome token precedes the padding (no
+    # timesteps at all); token_ids[active_end - 1] would be the outcome token.
+    if active_end <= 1 or token_ids[active_end - 1] != DELIMITER_ID:
         return CanvasValidation(False, "truncated canvas must end on a timestep boundary", None, True, False)
     return CanvasValidation(True, None, None, True, False)
 
@@ -183,16 +190,19 @@ def decode_canvas(
         return DecodedCanvas(validation, [], validation.truncated, validation.partial_final_timestep)
 
     names = _id_to_name(vocabulary)
+    # Skip position 0 (the [WIN]/[LOSS] outcome token) -- timestep parsing begins
+    # after it. validate_canvas has already confirmed exactly one outcome token
+    # sits there.
     if validation.end_index is not None:
-        active = token_ids[: validation.end_index]
+        active = token_ids[1 : validation.end_index]
     else:
         try:
-            active = token_ids[: token_ids.index(PAD_ID)]
+            active = token_ids[1 : token_ids.index(PAD_ID)]
         except ValueError:
-            active = token_ids
+            active = token_ids[1:]
     timesteps: list[dict[str, int]] = []
     current: dict[str, int] = {}
-    for index, token_id in enumerate(active):
+    for index, token_id in enumerate(active, start=1):
         if token_id == DELIMITER_ID:
             timesteps.append(current)
             current = {}

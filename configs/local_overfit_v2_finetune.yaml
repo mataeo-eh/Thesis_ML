@@ -3,15 +3,15 @@
 # This config extends the pre-training overfit profile (local_overfit_v2.yaml)
 # so it inherits the SAME replay selection seeds (pipeline.seed=1729,
 # pipeline.split_seed=1729, replay_subset_size=25, validation_replay_count=3)
-# and the SAME data.* window budgets (sampling_interval_s, input_budget_tokens,
-# canvas_budget_tokens, canvas_recon_fraction) -- none of those are overridden
-# here, which is what lets `finetune_pipeline.py` reuse the pre-training
-# window manifest instead of rebuilding it.
+# and the SAME data.* token budgets. Fine-tuning owns a separate window
+# manifest because its non-overlapping input windows are bounded only by input
+# length; each debut target may overlap neighboring targets as it extends from
+# the input-window start to replay end or the canvas token budget.
 #
 # Only the settings needed to turn the pre-trained checkpoint into a debut
 # fine-tune are overridden below:
 #   - a much smaller learning rate (fine-tuning, not training from scratch)
-#   - a fresh 100-epoch fine-tune budget
+#   - a fresh 150-epoch fine-tune budget
 #   - the warm-start source checkpoint (weights only, see TrainingLoop.load_model_weights)
 #   - debut_mode / outcome_last so the dataset builds the 7-class debut target
 #     and the sampler denoises the [WIN]/[LOSS] outcome token LAST
@@ -21,11 +21,44 @@ extends: local_overfit_v2.yaml
 
 train:
   lr: 1.0e-6
-  epochs: 100
+  epochs: 150
   init_from_checkpoint: checkpoints/local-overfitV2/last.pt
 
 data:
   debut_mode: true
+  window_manifest_path: data/processed/local/finetune_window_manifest.jsonl
+
+# `fog` and `loss.class_loss_weights` are now FINE-TUNING-ONLY config sections
+# (see src/thesis_ml/config.py `_validate_debut_mode_sections`): pre-training
+# configs must not carry them, and debut_mode=true configs like this one must.
+# The values below are carried forward UNCHANGED from what this profile
+# effectively inherited before the refactor: fog.rate_distribution came from
+# config/default.yaml, and class_loss_weights is config/default.yaml's values
+# with the pad: 0.2 override that used to live in local_overfit_v2.yaml (that
+# override moved here because pre-training no longer reads class weights at
+# all). No behavior change for fine-tuning.
+fog:
+  rate_distribution:
+    name: uniform
+    min: 0.0
+    max: 0.8
+
+diffusion:
+  mask_schedule:
+    # Explicit here (not just inherited from config/default.yaml) per the
+    # refactor owner's instruction: every configs/ YAML states this knob
+    # explicitly so the oversampling rate is never a silent inheritance.
+    t_one_fraction: 0.1
+
+loss:
+  class_loss_weights:
+    enemy_observed_reconstruction: 1.0
+    enemy_fogged_reconstruction: 1.0
+    enemy_future_prediction: 1.0
+    delimiter: 1.0
+    end: 1.0
+    pad: 0.2
+    win_loss: 1.0
 
 sampler:
   outcome_last: true

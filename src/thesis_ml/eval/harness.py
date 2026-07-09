@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import torch
@@ -14,7 +14,7 @@ from thesis_ml.data.dataset import DatasetExample
 from thesis_ml.eval.buildorder import BuildOrderEvent, extract_build_order, extract_build_order_from_parquet
 from thesis_ml.eval.metrics import BuildOrderMetrics, aggregate_metrics, compare_build_orders
 from thesis_ml.inference.decode import decode_canvas
-from thesis_ml.inference.sampler import sample_canvas
+from thesis_ml.inference.sampler import denoise_canvas_once, sample_canvas
 from thesis_ml.inference.timing import TimedTimestep, attach_absolute_times
 from thesis_ml.vocab.content_vocab import ContentVocabulary
 
@@ -26,6 +26,22 @@ class EvaluationExampleResult:
     metrics: BuildOrderMetrics
     prediction_valid: bool
     dropped_final_timestep: bool
+    # Per-timestep entity-type count grids at model (sampling-interval)
+    # resolution, exposed so read-only diagnostics (e.g. the viz module) can
+    # render the intermediates this harness already decodes without rebuilding
+    # any sampling/decode logic. Both are decoded canvases (predicted vs the
+    # clamped ground-truth target canvas), so they are resolution-matched to
+    # each other. Empty when the predicted canvas failed grammar validation.
+    predicted_counts: tuple[TimedTimestep, ...] = ()
+    ground_truth_counts: tuple[TimedTimestep, ...] = ()
+    predicted_canvas: tuple[int, ...] = ()
+    ground_truth_canvas: tuple[int, ...] = ()
+    final_canvas_logits: torch.Tensor | None = field(default=None, repr=False, compare=False)
+    # Per-position provenance of ``predicted_canvas`` (aligned 1:1): True where the
+    # position was REVEALED as ground truth (an infill start, see ``mask_rate``)
+    # and False where the MODEL predicted it. Empty when not tracked; under the
+    # default ``mask_rate=1.0`` every position is model-predicted (all False).
+    predicted_canvas_revealed_mask: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,14 +99,32 @@ def evaluate_example(
     vocabulary: ContentVocabulary,
     config: ProjectConfig,
     device: torch.device | str = "cpu",
+    include_canvas_logits: bool = False,
+    bypass_sampler: bool = False,
+    mask_rate: float = 1.0,
 ) -> EvaluationExampleResult:
-    batch = collate_diffusion_examples([example])
-    sampled = sample_canvas(model, batch, config, device=device)
+    batch = collate_diffusion_examples([example], debut_mode=config.data.debut_mode)
+    prediction_fn = denoise_canvas_once if bypass_sampler else sample_canvas
+    sampled = prediction_fn(
+        model,
+        batch,
+        config,
+        device=device,
+        return_final_logits=include_canvas_logits,
+        mask_rate=mask_rate,
+    )
     predicted = decode_canvas(sampled.canvas[0].tolist(), vocabulary)
 
     predicted_timesteps = _timed(predicted.timesteps, example, config)
     predicted_events = extract_build_order(predicted_timesteps, drop_final_timestep=False) if predicted.validation.valid else ()
     truth_events = _ground_truth_events(example, vocabulary, config)
+    # Decode the clamped ground-truth target canvas to a per-timestep count grid
+    # at the same model resolution as the prediction. This reuses the identical
+    # decode_canvas + attach_absolute_times path already used for the prediction,
+    # so the two grids are resolution-matched and share the §7 whole-timestep
+    # truncation handling (decode_canvas never emits a partial final timestep).
+    truth_decoded = decode_canvas(example.target_canvas.tolist(), vocabulary)
+    ground_truth_timesteps = _timed(truth_decoded.timesteps, example, config)
     metrics = compare_build_orders(
         predicted_events,
         truth_events,
@@ -102,6 +136,18 @@ def evaluate_example(
         metrics=metrics,
         prediction_valid=predicted.validation.valid,
         dropped_final_timestep=False,
+        predicted_counts=tuple(predicted_timesteps),
+        ground_truth_counts=tuple(ground_truth_timesteps),
+        predicted_canvas=tuple(int(token_id) for token_id in sampled.canvas[0].tolist()),
+        ground_truth_canvas=tuple(int(token_id) for token_id in example.target_canvas.tolist()),
+        final_canvas_logits=(
+            sampled.final_canvas_logits[0] if sampled.final_canvas_logits is not None else None
+        ),
+        predicted_canvas_revealed_mask=(
+            tuple(bool(flag) for flag in sampled.revealed_mask[0].tolist())
+            if sampled.revealed_mask is not None
+            else ()
+        ),
     )
 
 

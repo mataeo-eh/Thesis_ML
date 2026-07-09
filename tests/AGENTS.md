@@ -8,7 +8,7 @@
 
 - `test_*.py` own package regression coverage (config, serialization, windowing, dataset, model, training, sampler, eval, pipeline, fine-tune report, launcher checks).
 - `fixtures/` owns owner-provided sample extractor parquet (`match_*_game_state.parquet`); it is the ground truth for schema-dependent tests.
-- `overfit.bat`, `smallTrainingTest.bat`, and `overfit-fine-tune.BAT` are thin launchers; training behavior stays owned by YAML and the Python entry points.
+- `overfit.bat`, `smallTrainingTestV2.bat`, and `overfit-fine-tune.BAT` are thin launchers; training behavior stays owned by YAML and the Python entry points.
 - `output/` holds per-run launcher artifacts and console logs (generated; not durable contract material).
 
 ## Local Contracts

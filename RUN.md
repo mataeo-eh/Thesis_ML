@@ -45,11 +45,11 @@ uv run thesis-ml-train --config configs/local_full.yaml
 ```
 
 On Windows, equivalent thin launchers write console output and run artifacts to
-`tests\output\overfitV2\` and `tests\output\smallTrainingTest\`:
+`tests\output\overfitV2\` and `tests\output\smallTrainingTestV2\`:
 
 ```bat
 tests\overfit.bat
-tests\smallTrainingTest.bat
+tests\smallTrainingTestV2.bat
 ```
 
 Both launchers forward extra CLI arguments, so `--max-steps 1` provides a
@@ -74,7 +74,12 @@ All input/output locations are in `config/default.yaml`:
 - `data.input_budget_tokens` / `data.canvas_budget_tokens`: hard per-window bounds.
 - `data.canvas_recon_fraction`: maximum canvas share used by in-window enemy reconstruction; the remainder is reserved for whole future timesteps.
 - `data.tokenized_replay_dir` / `data.window_manifest_path`: preprocessing outputs.
+- Debut fine-tuning uses a separate manifest: input windows tile whole
+  timesteps under `input_budget_tokens` only, while each output runs from its
+  input-window start to replay end or the canvas budget and may overlap the
+  neighboring output horizon.
 - `pipeline.replay_subset_size`: seeded training-replay subset (`0` means all).
+- `pipeline.train_replay_count`: when positive, use an exact count split with this many train replays, `validation_replay_count` dev replays, and every remainder in test; `0` keeps fraction-based splitting.
 - `train.epochs`: used when `train.max_steps` is `0`.
 - `train.early_stopping_patience_epochs`: consecutive sub-threshold epochs before stopping (`0` disables).
 - `train.early_stopping_min_relative_improvement`: relative improvement required to reset patience.
@@ -155,7 +160,19 @@ are padded only to their batch maxima and carry exact attention/loss masks. The
 overfit profile uses four persistent workers with four batches prefetched per
 worker. Workers build model features, then omit raw record/metadata object graphs
 from training batches before IPC; the custom batch pins its tensors and transfers
-them to CUDA non-blockingly.
+them to CUDA non-blockingly. Debut targets scan memory-mapped token ids and
+materialize only emitted events, and replay outcome JSON is cached per worker.
+Worker persistence is config-owned. `local_full.yaml` keeps the same persistent
+four-worker, four-prefetch feed path and releases unused CUDA cache after completed
+epochs. Step telemetry distinguishes current allocation, lifetime peak allocation,
+reserved allocator memory, inactive split memory, device-wide VRAM use, and the
+device-minus-reserved gap. Epoch CSV rows average the last two measurements across
+optimizer steps so drift outside PyTorch's caching allocator is visible.
+
+`configs/local_full.yaml` runs the full debut/outcome task for eight epochs with
+870 train replays, 50 dev replays, and all 23 remaining quickstart replays held
+out for test. It writes the normal step/epoch telemetry plus
+`finetune_report.json` against the true test split.
 
 ### Pre-flight GPU smoke test
 
@@ -170,6 +187,21 @@ uv run python scripts/gpu_smoke_test.py --batch-size 1 --input-len 2048 --steps 
 Pass `--vocab-size` matching your real vocabulary for an accurate parameter
 count, and raise `--batch-size` until VRAM headroom runs out to find the largest
 micro-batch your GPU supports.
+
+### Checkpoint diagnostics
+
+Render held-out replay diagnostics with the EMA checkpoint weights:
+
+```powershell
+.\.venv\Scripts\python.exe -m thesis_ml.viz.diagnostics --checkpoint <last.pt> --replay-dir <features-dir> --out-dir <output-dir>
+```
+
+The default output is PNG/SVG figures plus a combined PDF. Add `--csv` to write
+one side-by-side comparison CSV per example
+(`sequenceindex,modelprediction,groundtruth,correct`) lining the predicted and
+ground-truth canvases up position-by-position. Add `--json` to write `canvas_logits.json` with the final-canvas top-10
+raw logits and softmax confidence values at every sequence position. These
+exports are independent and are not created when their flags are omitted.
 
 ## Extractor Wrapper
 

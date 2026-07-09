@@ -9,6 +9,16 @@ train:
   epochs: 200
   early_stopping_patience_epochs: 0
 
-loss:
-  class_loss_weights:
-    pad: 0.2
+diffusion:
+  mask_schedule:
+    # Explicit here (not just inherited from config/default.yaml) per the
+    # refactor owner's instruction: every configs/ YAML states this knob
+    # explicitly so the oversampling rate is never a silent inheritance.
+    t_one_fraction: 0.1
+
+# NOTE: this profile is PRE-TRAINING (data.debut_mode=false, inherited from
+# local_overfit.yaml -> config/default.yaml). Pre-training loss is now
+# uniform (no per-class weighting), so the `loss.class_loss_weights.pad: 0.2`
+# override that used to live here has been REMOVED -- that knob must not
+# exist in a pre-training config. The equivalent override is preserved,
+# fine-tuning-only, in configs/local_overfit_v2_finetune.yaml.

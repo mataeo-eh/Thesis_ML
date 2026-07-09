@@ -20,7 +20,12 @@ from thesis_ml.vocab.content_vocab import ContentVocabulary
 
 TOKENIZED_ARTIFACT_VERSION = 1
 MANIFEST_VERSION = 2
-TARGET_SEMANTICS = "reconstruction-plus-whole-future-timesteps-v2"
+# v3: the pre-training canvas now leads with the win/loss outcome token at
+# position 0 (folded in from the debut task). The window geometry is unchanged,
+# but the target contract is not, so bump the semantics string to force any
+# pre-outcome-token pretraining manifest to be rebuilt rather than silently reused.
+PRETRAIN_TARGET_SEMANTICS = "outcome-token-plus-reconstruction-plus-whole-future-timesteps-v3"
+DEBUT_TARGET_SEMANTICS = "input-tiled-debut-to-replay-end-or-canvas-budget-v1"
 P1_CODE = 1
 P2_CODE = 2
 ENTITY_CODE = 1
@@ -124,13 +129,14 @@ def preprocess_replays(
         "manifest_version": MANIFEST_VERSION,
         "tokenized_artifact_version": TOKENIZED_ARTIFACT_VERSION,
         "config_stamp": manifest_config_stamp(config),
-        "target_semantics": TARGET_SEMANTICS,
+        "target_semantics": _target_semantics(config),
         "sampling_interval_s": config.data.sampling_interval_s,
         "input_budget_tokens": config.data.input_budget_tokens,
         "canvas_budget_tokens": config.data.canvas_budget_tokens,
         "canvas_recon_fraction": config.data.canvas_recon_fraction,
         "replay_count": len(replay_paths),
         "window_count": len(entries),
+        "perspectives": list(perspectives),
     }
     with manifest_path.open("w", encoding="utf-8") as handle:
         handle.write(json.dumps(header, sort_keys=True) + "\n")
@@ -182,9 +188,16 @@ def build_replay_windows(
     *,
     perspectives: Sequence[str] = ("p1", "p2"),
 ) -> list[WindowManifestEntry]:
-    """Greedily tile a replay in whole timesteps under both token budgets."""
+    """Greedily tile a replay into non-overlapping whole-timestep inputs.
 
-    recon_limit = _reconstruction_limit(config)
+    Pretraining windows are bounded by both serialized input size and the
+    in-window enemy reconstruction allowance. Debut fine-tuning has no full
+    reconstruction target, so its input windows are bounded only by the input
+    token budget; each output independently extends from the input window's
+    first timestep to replay end or the canvas budget.
+    """
+
+    recon_limit = None if config.data.debut_mode else _reconstruction_limit(config)
     counts = _timestep_owner_counts(replay)
     entries: list[WindowManifestEntry] = []
     for perspective in perspectives:
@@ -198,9 +211,8 @@ def build_replay_windows(
                 p1_count, p2_count = counts[end]
                 candidate_input = input_count + int(p1_count + p2_count) + 2
                 candidate_enemy = enemy_count + int(p2_count if enemy_code == P2_CODE else p1_count) + 1
-                if (
-                    candidate_input > config.data.input_budget_tokens
-                    or candidate_enemy > recon_limit
+                if candidate_input > config.data.input_budget_tokens or (
+                    recon_limit is not None and candidate_enemy > recon_limit
                 ):
                     break
                 input_count = candidate_input
@@ -277,7 +289,7 @@ def validate_manifest_budgets(entries: Iterable[WindowManifestEntry], config: Pr
     for entry in entries:
         if entry.input_token_count > config.data.input_budget_tokens:
             violations.append(f"{entry.replay_id}:{entry.start_timestep}:input")
-        if entry.enemy_reconstruction_token_count > recon_limit:
+        if not config.data.debut_mode and entry.enemy_reconstruction_token_count > recon_limit:
             violations.append(f"{entry.replay_id}:{entry.start_timestep}:reconstruction")
         if not 0 <= entry.start_timestep < entry.end_timestep <= entry.replay_timestep_count:
             violations.append(f"{entry.replay_id}:{entry.start_timestep}:boundary")
@@ -287,7 +299,7 @@ def validate_manifest_budgets(entries: Iterable[WindowManifestEntry], config: Pr
 def manifest_config_stamp(config: ProjectConfig) -> str:
     stamp_fields = {
         "manifest_version": MANIFEST_VERSION,
-        "target_semantics": TARGET_SEMANTICS,
+        "target_semantics": _target_semantics(config),
         "sampling_interval_s": config.data.sampling_interval_s,
         "input_budget_tokens": config.data.input_budget_tokens,
         "canvas_budget_tokens": config.data.canvas_budget_tokens,
@@ -303,6 +315,10 @@ def _reconstruction_limit(config: ProjectConfig) -> int:
     if not 0.0 < fraction <= 1.0:
         raise ValueError("data.canvas_recon_fraction must be in (0, 1]")
     return int(config.data.canvas_budget_tokens * fraction)
+
+
+def _target_semantics(config: ProjectConfig) -> str:
+    return DEBUT_TARGET_SEMANTICS if config.data.debut_mode else PRETRAIN_TARGET_SEMANTICS
 
 
 def validate_manifest_integrity(entries: Iterable[WindowManifestEntry]) -> list[str]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 from functools import partial
+import gc
 import json
 from pathlib import Path
 from typing import Callable
@@ -15,6 +16,7 @@ from torch.utils.data import DataLoader
 from thesis_ml.config import ProjectConfig, load_config
 from thesis_ml.data.collate import collate_diffusion_examples
 from thesis_ml.data.dataset import SC2DiffusionDataset
+from thesis_ml.data.resumable_sampler import ResumableBatchSampler
 from thesis_ml.data.split import split_replays
 from thesis_ml.data.windowing import (
     MANIFEST_VERSION,
@@ -23,7 +25,9 @@ from thesis_ml.data.windowing import (
     preprocess_replays,
     read_manifest_metadata,
 )
+from thesis_ml.eval.finetune_report import build_and_write_finetune_report
 from thesis_ml.model.model import SC2StrategyDiffusionModel
+from thesis_ml.pipeline.finished_export import export_finished_model
 from thesis_ml.pipeline.storage import StorageResolver
 from thesis_ml.train.loop import TrainingLoop
 from thesis_ml.train.train import SMOKE_VOCAB_SIZE, make_synthetic_examples
@@ -38,6 +42,7 @@ class TrainingPipelineResult:
     smoke: bool
     parameter_count: int
     peak_vram_bytes: int
+    report_path: str | None = None
 
 
 def run_training_pipeline(
@@ -46,6 +51,7 @@ def run_training_pipeline(
     smoke: bool | None = None,
     storage: StorageResolver | None = None,
     max_steps_override: int | None = None,
+    lr_override: float | None = None,
 ) -> TrainingPipelineResult:
     config = load_config(config_path)
     resolver = storage or StorageResolver()
@@ -60,7 +66,9 @@ def run_training_pipeline(
     if use_smoke:
         result = _run_smoke_pipeline(config, resolver)
     else:
-        result = _run_real_pipeline(config, resolver, max_steps_override=max_steps_override)
+        result = _run_real_pipeline(
+            config, resolver, max_steps_override=max_steps_override, lr_override=lr_override
+        )
     _write_log(config, resolver, f"resumed={result.resumed} steps={result.steps} smoke={result.smoke}\n")
     return result
 
@@ -70,18 +78,30 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path("config/default.yaml"))
     parser.add_argument("--smoke", action="store_true", help="force the tiny synthetic smoke pipeline")
     parser.add_argument("--max-steps", type=int, default=None, help="bounded verification override")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help=(
+            "override train.lr for this run without editing the config -- the "
+            "quickest way to toggle the base learning rate between runs (e.g. "
+            "--lr 3e-4 for from-scratch pre-training vs --lr 1e-6 for fine-tuning)"
+        ),
+    )
     args = parser.parse_args()
     try:
         result = run_training_pipeline(
             args.config,
             smoke=True if args.smoke else None,
             max_steps_override=args.max_steps,
+            lr_override=args.lr,
         )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         parser.exit(1, f"ERROR: {exc}\n")
     print(
         f"checkpoint_uri={result.checkpoint_uri} resumed={result.resumed} steps={result.steps} "
-        f"parameters={result.parameter_count} peak_vram_bytes={result.peak_vram_bytes}"
+        f"parameters={result.parameter_count} peak_vram_bytes={result.peak_vram_bytes} "
+        f"report_path={result.report_path or ''}"
     )
 
 
@@ -111,7 +131,9 @@ def _run_smoke_pipeline(config: ProjectConfig, resolver: StorageResolver) -> Tra
         examples,
         batch_size=smoke_config.pipeline.batch_size,
         shuffle=False,
-        collate_fn=collate_diffusion_examples,
+        # Smoke fixtures are pre-training-shaped (absent input, collapsed
+        # taxonomy), so collate in pre-training mode.
+        collate_fn=partial(collate_diffusion_examples, debut_mode=False),
     )
     model = SC2StrategyDiffusionModel(smoke_config, vocab_size=SMOKE_VOCAB_SIZE)
     loop = TrainingLoop(model=model, config=smoke_config, seed=smoke_config.pipeline.seed)
@@ -133,6 +155,7 @@ def _run_real_pipeline(
     resolver: StorageResolver,
     *,
     max_steps_override: int | None = None,
+    lr_override: float | None = None,
 ) -> TrainingPipelineResult:
     torch.manual_seed(config.pipeline.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -154,13 +177,16 @@ def _run_real_pipeline(
         seed=config.pipeline.split_seed,
         test_fraction=config.pipeline.test_fraction,
         dev_fraction=config.pipeline.dev_fraction,
+        train_count=config.pipeline.train_replay_count,
+        dev_count=config.pipeline.validation_replay_count,
     )
     train_replays, dev_replays = _select_replays(
         list(split.train),
         list(split.dev),
         config,
     )
-    _record_replay_selection(config, resolver, train_replays, dev_replays)
+    test_replays = list(split.test)
+    _record_replay_selection(config, resolver, train_replays, dev_replays, test_replays)
     train_windows = load_window_manifest(
         config.data.window_manifest_path,
         config=config,
@@ -170,6 +196,11 @@ def _run_real_pipeline(
         config.data.window_manifest_path,
         config=config,
         replay_paths=dev_replays,
+    )
+    test_windows = load_window_manifest(
+        config.data.window_manifest_path,
+        config=config,
+        replay_paths=test_replays,
     )
     train_dataset = SC2DiffusionDataset(
         train_windows,
@@ -189,14 +220,34 @@ def _run_real_pipeline(
             fog_rate_override=None,
         )
         val_loader = _make_dataloader(dev_dataset, config, shuffle=False, device=device)
+    test_dataset = None
+    if config.data.debut_mode and test_windows:
+        test_dataset = SC2DiffusionDataset(
+            test_windows,
+            config,
+            vocabulary,
+            seed=config.pipeline.seed,
+            fog_rate_override=None,
+        )
 
     planned_steps = config.train.max_steps
     if planned_steps <= 0:
         planned_steps = len(train_loader) * config.train.epochs
+    # --lr overrides the base learning rate for this run without editing YAML.
+    # Applied here (before the optimizer is built inside TrainingLoop) so the
+    # override actually takes effect; None leaves the config value untouched.
+    effective_lr = config.train.lr if lr_override is None else lr_override
     training_config = replace(
         config,
-        train=replace(config.train, checkpoint_dir=str(checkpoint_dir), max_steps=planned_steps),
+        train=replace(
+            config.train,
+            checkpoint_dir=str(checkpoint_dir),
+            max_steps=planned_steps,
+            lr=effective_lr,
+        ),
     )
+    if lr_override is not None:
+        print(f"lr_override: train.lr set to {effective_lr:.3e} via --lr", flush=True)
     model = SC2StrategyDiffusionModel(training_config, vocab_size=vocabulary.vocab_size)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     metrics_dir = _local_metrics_dir(config, resolver)
@@ -218,14 +269,71 @@ def _run_real_pipeline(
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     requested_steps = training_config.train.max_steps if max_steps_override is None else max_steps_override
-    loop.fit(
-        train_loader,
-        val_dataloader=val_loader,
-        max_steps=requested_steps,
-        epochs=training_config.train.epochs,
-    )
+    # Guarantee DataLoader worker teardown on EVERY exit path (normal finish,
+    # exception, or Ctrl+C). With persistent_workers=True the loaders keep their
+    # worker processes and prefetch threads alive in loader._iterator until that
+    # iterator is garbage-collected; on Windows an interrupted run may not GC it
+    # promptly, orphaning python worker processes that keep pinning CPU. The
+    # finally block shuts them down deterministically rather than relying on GC.
+    try:
+        loop.fit(
+            train_loader,
+            val_dataloader=val_loader,
+            max_steps=requested_steps,
+            epochs=training_config.train.epochs,
+            retain_logs=False,
+        )
+    finally:
+        _shutdown_dataloader(train_loader)
+        _shutdown_dataloader(val_loader)
     peak_vram_bytes = torch.cuda.max_memory_allocated() if device == "cuda" else 0
     checkpoint_uri = _publish_checkpoint(config, resolver, checkpoint_dir / "last.pt")
+
+    # A "proper finish" is a real run that returned normally from loop.fit() --
+    # it trained through every configured epoch or stopped via early stopping.
+    # Reaching this line already guarantees the loop did not crash or get
+    # interrupted (those propagate out of the try/finally above). We ADDITIONALLY
+    # require this not to be a bounded --max-steps verification run
+    # (max_steps_override is None), matching the finetune-report guard below: a
+    # smoke/verification run is not a finished model. On a proper finish, write
+    # the durable, separately-tagged raw+EMA finished model alongside last.pt.
+    if max_steps_override is None:
+        stop_reason = (
+            "completed_all_epochs"
+            if loop.completed_epochs >= training_config.train.epochs
+            else "early_stopping"
+        )
+        export_finished_model(
+            checkpoint_dir=checkpoint_dir,
+            model=loop.model,
+            ema_model=loop.ema_model,
+            config=training_config,
+            vocab_size=vocabulary.vocab_size,
+            global_step=loop.global_step,
+            completed_epochs=loop.completed_epochs,
+            configured_epochs=training_config.train.epochs,
+            stop_reason=stop_reason,
+            publisher=_finished_publisher(config, resolver),
+        )
+
+    report_path: Path | None = None
+    if config.data.debut_mode and max_steps_override is None:
+        report_path = metrics_dir / "finetune_report.json"
+        build_and_write_finetune_report(
+            memorized_examples=_select_eval_examples(
+                train_dataset, training_config.eval.debut_max_examples
+            ),
+            test_examples=(
+                _select_eval_examples(test_dataset, training_config.eval.debut_max_examples)
+                if test_dataset is not None
+                else []
+            ),
+            model=loop.ema_model,
+            vocabulary=vocabulary,
+            config=training_config,
+            path=report_path,
+            device=device,
+        )
     return TrainingPipelineResult(
         checkpoint_uri=checkpoint_uri,
         resumed=resumed,
@@ -233,6 +341,7 @@ def _run_real_pipeline(
         smoke=False,
         parameter_count=parameter_count,
         peak_vram_bytes=peak_vram_bytes,
+        report_path=str(report_path) if report_path is not None else None,
     )
 
 
@@ -271,6 +380,7 @@ def _ensure_window_manifest(
     config: ProjectConfig,
     vocabulary,
 ) -> None:
+    perspectives = _perspectives(config.pipeline.perspectives)
     manifest_path = Path(config.data.window_manifest_path)
     rebuild = config.pipeline.rebuild_manifest or not manifest_path.exists()
     if not rebuild:
@@ -280,6 +390,7 @@ def _ensure_window_manifest(
                 metadata.get("manifest_version") != MANIFEST_VERSION,
                 metadata.get("config_stamp") != manifest_config_stamp(config),
                 metadata.get("replay_count") != len(replay_paths),
+                metadata.get("perspectives") != list(perspectives),
             )
         )
     if rebuild:
@@ -289,7 +400,7 @@ def _ensure_window_manifest(
             replay_paths,
             config,
             vocabulary,
-            perspectives=_perspectives(config.pipeline.perspectives),
+            perspectives=perspectives,
             force=config.pipeline.rebuild_manifest,
         )
 
@@ -299,15 +410,17 @@ def _record_replay_selection(
     resolver: StorageResolver,
     train: list[str],
     validation: list[str],
+    test: list[str],
 ) -> None:
     output = _local_metrics_dir(config, resolver) / "replay_selection.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         json.dumps(
             {
-                "seed": config.pipeline.seed,
+                "split_seed": config.pipeline.split_seed,
                 "train_replay_ids": [Path(path).stem for path in train],
                 "dev_replay_ids": [Path(path).stem for path in validation],
+                "test_replay_ids": [Path(path).stem for path in test],
             },
             indent=2,
             sort_keys=True,
@@ -343,20 +456,93 @@ def _make_dataloader(
 
     num_workers = max(0, config.pipeline.num_workers)
     kwargs: dict = {
-        "batch_size": config.pipeline.batch_size,
-        "shuffle": shuffle,
         # InputFeatures are built in the worker before raw TokenRecord metadata
         # is dropped. Training does not consume those Python object graphs, so
         # excluding them avoids expensive worker-to-main-process serialization.
-        "collate_fn": partial(collate_diffusion_examples, retain_metadata=False),
+        # debut_mode threads the pipeline mode EXPLICITLY into collate so the
+        # future telemetry is scoped correctly (fine-tuning-only). Both the
+        # pre-training and fine-tuning pipelines share this builder.
+        "collate_fn": partial(
+            collate_diffusion_examples,
+            retain_metadata=False,
+            debut_mode=config.data.debut_mode,
+        ),
         "num_workers": num_workers,
         "pin_memory": device == "cuda",
-        "drop_last": False,
     }
     if num_workers > 0:
         kwargs["prefetch_factor"] = config.pipeline.prefetch_factor
-        kwargs["persistent_workers"] = True
-    return DataLoader(dataset, **kwargs)
+        kwargs["persistent_workers"] = config.pipeline.persistent_workers
+    if shuffle:
+        # Training loader: replace the default shuffling RandomSampler with a
+        # resumable, per-epoch-seeded batch sampler. This makes the batch order
+        # reproducible across process restarts AND lets a run interrupted
+        # mid-epoch skip the batches it already trained on, so training actually
+        # advances through the epoch instead of replaying it from batch 1 on
+        # every resume. The batch sampler subsumes batch_size/shuffle/drop_last,
+        # which is why those keys must NOT also be passed to the DataLoader.
+        batch_sampler = ResumableBatchSampler(
+            dataset_size=len(dataset),
+            batch_size=config.pipeline.batch_size,
+            base_seed=config.pipeline.seed,
+            drop_last=False,
+        )
+        return DataLoader(dataset, batch_sampler=batch_sampler, **kwargs)
+    # Validation/eval loader: deterministic sequential order, and it is re-run
+    # from scratch each time, so no resumption machinery is needed.
+    return DataLoader(
+        dataset,
+        batch_size=config.pipeline.batch_size,
+        shuffle=False,
+        drop_last=False,
+        **kwargs,
+    )
+
+
+def _shutdown_dataloader(loader: DataLoader | None) -> None:
+    """Deterministically stop a DataLoader's worker processes and threads.
+
+    A DataLoader created with ``persistent_workers=True`` caches its live
+    iterator (with its worker subprocesses, prefetch threads, and the optional
+    pin-memory thread) on ``loader._iterator`` and keeps it running between
+    epochs -- and after the final epoch -- until that iterator object is
+    garbage-collected. If a run is interrupted (Ctrl+C, an exception, or spot
+    preemption) that GC can be delayed on Windows, leaving orphaned ``python``
+    worker processes that continue to consume CPU. Calling this from a
+    ``finally`` block frees them immediately regardless of how training ended.
+
+    The public DataLoader API has no ``close()``, so we invoke the same
+    ``_shutdown_workers`` routine the iterator's finalizer would eventually run,
+    then drop the reference so a fresh iterator is built on any later reuse.
+
+    Parameters:
+        loader: the DataLoader to tear down, or ``None`` (a no-op) so callers
+            can pass an optional validation loader without a guard.
+    """
+
+    if loader is None:
+        return
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is not None:
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
+        loader._iterator = None
+    # Reclaim the iterator (and any single-process resources) now instead of at
+    # an unpredictable later GC, so worker teardown is fully synchronous here.
+    gc.collect()
+
+
+def _select_eval_examples(dataset, cap: int):
+    """Return the lazy full dataset or a bounded evenly-strided sample."""
+
+    total = len(dataset)
+    if cap <= 0:
+        return dataset
+    if total <= cap:
+        return [dataset[index] for index in range(total)]
+    selected_indices = [(position * total) // cap for position in range(cap)]
+    return [dataset[index] for index in selected_indices]
 
 
 def _checkpoint_publisher(config: ProjectConfig, resolver: StorageResolver) -> Callable[[Path], None] | None:
@@ -373,6 +559,26 @@ def _checkpoint_publisher(config: ProjectConfig, resolver: StorageResolver) -> C
 
     def publish(local_path: Path) -> None:
         resolver.put_file(local_path, f"{checkpoint_uri.rstrip('/')}/{local_path.name}")
+
+    return publish
+
+
+def _finished_publisher(config: ProjectConfig, resolver: StorageResolver) -> Callable[[Path], None] | None:
+    """Return a callback that mirrors a finished-model file to remote storage.
+
+    None when checkpoints are local-only. Otherwise each finished artifact is
+    uploaded under the `finished/` prefix of the checkpoint URI (mirroring the
+    local `<checkpoint_dir>/finished/` layout), so `model.ema.safetensors` lands
+    at `<checkpoint_uri>/finished/model.ema.safetensors`. All finished files live
+    flat in one directory, so uploading by basename preserves the layout.
+    """
+
+    checkpoint_uri = config.storage.checkpoint_uri
+    if not resolver.is_s3(checkpoint_uri):
+        return None
+
+    def publish(local_path: Path) -> None:
+        resolver.put_file(local_path, f"{checkpoint_uri.rstrip('/')}/finished/{local_path.name}")
 
     return publish
 
@@ -478,9 +684,12 @@ def _materialize_replay_paths(config: ProjectConfig, resolver: StorageResolver) 
 
 def _perspectives(raw: str) -> tuple[str, ...]:
     values = tuple(item.strip() for item in raw.split(",") if item.strip())
-    if not values:
-        raise ValueError("pipeline.perspectives must contain at least one value")
-    return values
+    if len(values) != 2 or set(values) != {"p1", "p2"}:
+        raise ValueError(
+            "pipeline.perspectives must contain exactly p1,p2 so every replay is "
+            "represented once from each player's perspective"
+        )
+    return ("p1", "p2")
 
 
 if __name__ == "__main__":

@@ -49,9 +49,9 @@ from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.pipeline.storage import StorageResolver
 
 # Reuse (do NOT copy) the pre-training pipeline's private helpers. Importing
-# these keeps the fine-tune replay selection, manifest handling, dataloader
-# construction, and checkpoint/metrics publishing byte-for-byte identical to
-# pre-training, and means `train_pipeline.py` requires zero edits.
+# these keeps the fine-tune replay selection, mode-stamped manifest handling,
+# dataloader construction, and checkpoint/metrics publishing byte-for-byte
+# identical to pre-training.
 from thesis_ml.pipeline.train_pipeline import (
     _checkpoint_publisher,
     _dataset_available,
@@ -63,6 +63,7 @@ from thesis_ml.pipeline.train_pipeline import (
     _materialize_replay_paths,
     _metrics_publisher,
     _publish_checkpoint,
+    _select_eval_examples,
     _select_replays,
 )
 from thesis_ml.train.loop import TrainingLoop
@@ -78,44 +79,6 @@ class FinetunePipelineResult:
     parameter_count: int
     peak_vram_bytes: int
     report_path: str
-
-
-def _select_eval_examples(dataset, cap: int) -> list:
-    """Pick a bounded, evenly-strided sample of examples from a windowed dataset.
-
-    A windowed `SC2DiffusionDataset` turns each replay into many overlapping
-    windows, so scoring every one is both slow (one sampler run per example) and
-    memory-heavy (every 4096-token debut example materialized in host RAM at
-    once). This returns at most `cap` examples, chosen at evenly-spaced indices
-    so the sample spans early-game through late-game windows (keeping the
-    minute-based win/loss buckets populated) instead of clustering at the start.
-
-    Parameters:
-        dataset: A dataset supporting `len(...)` and integer indexing
-            (`SC2DiffusionDataset`); building an item lazily constructs its
-            debut target.
-        cap: Maximum number of examples to return. `cap <= 0` means "no cap"
-            (return every example) -- only sensible for tiny datasets.
-
-    Returns:
-        A list of materialized dataset examples (length `min(cap, len(dataset))`,
-        or the full dataset when `cap <= 0`).
-
-    Calls:
-        Only builtins plus the dataset's own `__len__`/`__getitem__`.
-    """
-
-    total = len(dataset)
-    # cap <= 0 disables the cap; also short-circuit when the dataset already
-    # fits under the cap so we never over-select.
-    if cap <= 0 or total <= cap:
-        return [dataset[index] for index in range(total)]
-
-    # Evenly spread `cap` indices across [0, total): index i maps to
-    # floor(i * total / cap). This is a simple, dependency-free way to stride
-    # across the whole dataset (start .. near-end) without importing numpy.
-    selected_indices = [(position * total) // cap for position in range(cap)]
-    return [dataset[index] for index in selected_indices]
 
 
 def run_finetune_pipeline(
@@ -191,6 +154,8 @@ def run_finetune_pipeline(
         seed=config.pipeline.split_seed,
         test_fraction=config.pipeline.test_fraction,
         dev_fraction=config.pipeline.dev_fraction,
+        train_count=config.pipeline.train_replay_count,
+        dev_count=config.pipeline.validation_replay_count,
     )
     train_replays, dev_replays = _select_replays(list(split.train), list(split.dev), config)
 
@@ -265,6 +230,7 @@ def run_finetune_pipeline(
         val_dataloader=val_loader,
         max_steps=requested_steps,
         epochs=training_config.train.epochs,
+        retain_logs=False,
     )
     peak_vram_bytes = torch.cuda.max_memory_allocated() if device == "cuda" else 0
     checkpoint_uri = _publish_checkpoint(config, resolver, checkpoint_dir / "last.pt")
@@ -277,8 +243,8 @@ def run_finetune_pipeline(
     # weights, and the evaluator generates canvases via the sampler rather
     # than reading raw logits, so training-mode dropout/etc. does not apply.
     # IMPORTANT (performance/memory): a windowed dataset expands each replay into
-    # many overlapping windows -- the 25 memorized replays alone become well over
-    # a thousand examples. The evaluator samples the diffusion model ONCE PER
+    # many input-tiled examples with overlapping output horizons. The evaluator
+    # samples the diffusion model ONCE PER
     # EXAMPLE, so scoring every window would fire thousands of sampler runs and
     # hold every materialized 4096-token debut example in host RAM at once. We
     # therefore score only a bounded, evenly-strided subset (config-driven cap).

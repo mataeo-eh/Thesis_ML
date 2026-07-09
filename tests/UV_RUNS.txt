@@ -1,0 +1,1 @@
+uv run thesis-ml-viz --checkpoint checkpoints/local-full/last.pt --replay-dir ../data/quickstart/parquet --config configs/local_full.yaml --out-dir tests/output/smallTrainingTestV2/Visualizations --n-replays 2 --n-windows 5 --json --show-input --csv --output-mask 1.0 0.99 0.5 0.1

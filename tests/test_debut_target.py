@@ -28,7 +28,7 @@ from thesis_ml.data.dataset import (
     _build_debut_target,
     resolve_replay_outcome,
 )
-from thesis_ml.data.windowing import ENTITY_CODE, P1_CODE, P2_CODE, WindowManifestEntry
+from thesis_ml.data.windowing import ENTITY_CODE, P1_CODE, P2_CODE, UPGRADE_CODE, WindowManifestEntry
 from thesis_ml.model.embedding import STAT_KEYS
 from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, LOSS_ID, PAD_ID, WIN_ID
 
@@ -52,6 +52,15 @@ class _FakeVocabulary:
 
     def token_name_for(self, token_id: int) -> str:
         return _TOKEN_NAMES[int(token_id)]
+
+
+class _CountingVocabulary(_FakeVocabulary):
+    def __init__(self) -> None:
+        self.lookups = 0
+
+    def token_name_for(self, token_id: int) -> str:
+        self.lookups += 1
+        return super().token_name_for(token_id)
 
 
 class _FakeReplay:
@@ -150,6 +159,26 @@ def test_debut_event_timestep_is_first_appearance() -> None:
     assert marine_positions == [0, 3]
 
 
+def test_debut_builder_materializes_only_emitted_records() -> None:
+    vocabulary = _CountingVocabulary()
+    build = _build_debut_target(
+        _FakeReplay(),
+        _window(),
+        vocabulary,
+        "p2",
+        fogged_counts={},
+        budget=64,
+        outcome_id=WIN_ID,
+    )
+
+    emitted_debuts = [
+        item
+        for item in build.metadata
+        if item.get("token_kind") in {"entity", "upgrade"}
+    ]
+    assert vocabulary.lookups == len(emitted_debuts) == 4
+
+
 def test_empty_timestep_produces_back_to_back_delimiters() -> None:
     build = _build({})
     # Sequence should be: outcome, marine, DELIM (t0), DELIM (t1 has no debut),
@@ -201,21 +230,120 @@ def test_whole_timestep_truncation_when_budget_overflows() -> None:
     assert PAD_ID in build.token_ids
 
 
-def test_pretraining_artifact_path_has_no_winloss_token() -> None:
-    # The debut_mode-off path (the existing artifact target) must never emit a
-    # win/loss token or the CLASS_WINLOSS label. This proves debut logic did not
-    # leak into the pretraining canvas.
-    build = _build_artifact_target(
-        _FakeReplay(),
+class _FakeReplayWithUpgrade:
+    """Synthetic replay whose enemy owns a CUMULATIVE upgrade token.
+
+    Upgrade tokens are cumulative flags in the artifact: once researched at t1,
+    "stimpack" is re-listed at EVERY subsequent timestep (t1, t2, t3, t4) with a
+    per-timestep count of exactly 1. The old debut detector special-cased this
+    with a `seen_upgrades` first-appearance set; the unified running-max rule
+    must reproduce that behavior exactly: the count never exceeds the running
+    max after t1, so the upgrade debuts exactly once, at t1.
+
+    Timesteps (enemy = p2, code 2):
+        t0: p2 marine (entity)
+        t1: p2 marine, p2 stimpack (upgrade researched here)
+        t2: p2 marine, p2 stimpack (upgrade persists -- must NOT re-debut)
+        t3: p2 marine, p2 stimpack (persists again)
+        t4: p2 marine, p2 stimpack (persists; final timestep)
+    """
+
+    def __init__(self) -> None:
+        # token 104 = the upgrade; interleaved [marine, stimpack] per timestep.
+        token_ids = [100, 100, 104, 100, 104, 100, 104, 100, 104]
+        kinds = [
+            ENTITY_CODE,
+            ENTITY_CODE,
+            UPGRADE_CODE,
+            ENTITY_CODE,
+            UPGRADE_CODE,
+            ENTITY_CODE,
+            UPGRADE_CODE,
+            ENTITY_CODE,
+            UPGRADE_CODE,
+        ]
+        self.token_ids = np.asarray(token_ids, dtype=np.int32)
+        self.owners = np.full(len(token_ids), P2_CODE, dtype=np.uint8)
+        self.kinds = np.asarray(kinds, dtype=np.uint8)
+        self.offsets = np.asarray([0, 1, 3, 5, 7, 9], dtype=np.int64)
+        feature_width = 2 + len(STAT_KEYS)
+        self.features = np.zeros((len(token_ids), feature_width), dtype=np.float32)
+        self.game_loops = np.asarray([0, 1, 2, 3, 4], dtype=np.int64)
+        self.timestamps = np.asarray([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+
+    def token_slice(self, timestep: int) -> slice:
+        return slice(int(self.offsets[timestep]), int(self.offsets[timestep + 1]))
+
+    @property
+    def timestep_count(self) -> int:
+        return len(self.offsets) - 1
+
+
+def test_unified_running_max_rule_debuts_persistent_upgrade_exactly_once_at_first_appearance() -> None:
+    """Debut unification: the running-max count-increase rule reproduces the old
+    `seen_upgrades` first-appearance behavior for cumulative upgrade tokens.
+
+    The upgrade persists across four consecutive timesteps (t1..t4) with a
+    per-timestep count of 1, so the running max fires exactly once -- at t1,
+    its first appearance -- and never again. This is the empirical-equivalence
+    claim behind deleting the upgrade special case from `_build_debut_target`.
+    """
+
+    # Register the upgrade token's name in the fake vocabulary.
+    _TOKEN_NAMES[104] = "stimpack"
+    build = _build_debut_target(
+        _FakeReplayWithUpgrade(),
         _window(),
         _FakeVocabulary(),
         "p2",
         fogged_counts={},
         budget=64,
+        outcome_id=WIN_ID,
     )
-    assert WIN_ID not in build.token_ids
-    assert LOSS_ID not in build.token_ids
-    assert CLASS_WINLOSS not in build.class_labels
+
+    upgrade_debuts = [
+        meta for meta in build.metadata if meta.get("token_name") == "stimpack"
+    ]
+    # Exactly ONE debut event for the upgrade...
+    assert len(upgrade_debuts) == 1
+    # ...at its FIRST appearance (relative timestep 1), not at any later
+    # timestep where the cumulative flag is merely still listed.
+    assert upgrade_debuts[0]["timestep_index"] == 1
+    assert upgrade_debuts[0]["token_kind"] == "upgrade"
+    # The marine (an ordinary entity with one instance) also debuts exactly
+    # once, at t0 -- the unified rule treats both kinds identically.
+    marine_debuts = [
+        meta["timestep_index"]
+        for meta in build.metadata
+        if meta.get("token_name") == "marine"
+    ]
+    assert marine_debuts == [0]
+
+
+def test_pretraining_artifact_path_leads_with_winloss_token() -> None:
+    # The debut_mode-off (pre-training) path now ALSO begins the canvas with the
+    # resolved outcome token at position 0, labeled CLASS_WINLOSS and denoised
+    # last, exactly once -- the outcome token is shared by both modes. The BODY
+    # after it is the full reconstruction/roll-out (delimiters + [END]), NOT the
+    # sparse debut events.
+    for outcome_id in (WIN_ID, LOSS_ID):
+        build = _build_artifact_target(
+            _FakeReplay(),
+            _window(),
+            _FakeVocabulary(),
+            "p2",
+            fogged_counts={},
+            budget=64,
+            outcome_id=outcome_id,
+        )
+        # Position 0 echoes the resolved outcome, labeled win-loss, and appears once.
+        assert build.token_ids[0] == outcome_id
+        assert build.class_labels[0] == CLASS_WINLOSS
+        assert build.class_labels.count(CLASS_WINLOSS) == 1
+        # Full roll-out body: game end reached within budget, delimiters present.
+        assert build.terminated is True
+        assert END_ID in build.token_ids
+        assert DELIMITER_ID in build.token_ids
 
 
 def test_debut_class_id_to_name_map_is_complete() -> None:

@@ -129,11 +129,20 @@ class InputContextEmbedding(nn.Module):
         input_features: InputFeatures | None = None,
         canvas_self_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        canvas_embeddings = self.embed_canvas(canvas_token_ids, canvas_self_conditioning=canvas_self_conditioning)
+        # Pre-training: the input is LITERALLY ABSENT (zero-length input tensor).
+        # Skip embed_input / the input contextual encodings entirely so the model
+        # sequence IS exactly the canvas: no separator/BOS token, no segment
+        # embedding, no reserved input slots, and RoPE position 0 lands on the
+        # first canvas token (the backbone runs over `canvas_embeddings` alone).
+        # The concat below would be a no-op on an empty input tensor anyway;
+        # skipping makes the absence explicit and avoids empty-tensor work.
+        if input_token_ids.shape[1] == 0:
+            return canvas_embeddings
         input_embeddings = self.embed_input(
             input_token_ids,
             input_features=input_features,
         )
-        canvas_embeddings = self.embed_canvas(canvas_token_ids, canvas_self_conditioning=canvas_self_conditioning)
         return torch.cat([input_embeddings, canvas_embeddings], dim=1)
 
     def embed_input(

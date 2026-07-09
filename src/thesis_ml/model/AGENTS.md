@@ -14,7 +14,7 @@
 ## Local Contracts
 
 - Single dense bidirectional stack: RMSNorm, SwiGLU FFN, vanilla multi-head attention (never grouped-query), config-gated QK-norm (default on), Llama 3.1 scaled RoPE for sequence position only.
-- Attention is full bidirectional with a padding mask only — no causal mask. CUDA attention is restricted to fused Flash or memory-efficient SDPA with a broadcast boolean key mask; math fallback is forbidden.
+- Attention is full bidirectional with a padding mask only — no causal mask. CUDA attention explicitly prioritizes fused Flash SDPA, falls back only to memory-efficient SDPA with a broadcast boolean key mask, and forbids math fallback.
 - The input region is clamped: never noised, never receives loss. Loss is computed on canvas positions only.
 - Additive contextual encodings are input-only; canvas tokens never receive map position or unit stats. Map position uses extrapolation-friendly Fourier/sinusoidal features, never a learned bin lookup.
 - Conditioning is clamping only: no encoder-decoder split, no cross-attention, no copy mechanism, no classification head, no set/pooling module (`SPEC.md` §14).

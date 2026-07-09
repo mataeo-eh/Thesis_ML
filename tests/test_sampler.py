@@ -11,12 +11,13 @@ from thesis_ml.inference.sampler import load_sampling_checkpoint, sample_canvas
 from thesis_ml.inference.timing import attach_absolute_times
 from thesis_ml.train.train import make_synthetic_examples
 from thesis_ml.vocab.content_vocab import build_content_vocabulary
-from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, MASK_ID, PAD_ID
+from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, MASK_ID, PAD_ID, WIN_ID
 
 
 def test_sampler_generated_canvas_validates_and_input_is_clamped() -> None:
     config = _small_config(canvas_budget=7, max_steps=10)
-    target = torch.tensor([100, DELIMITER_ID, 101, DELIMITER_ID, END_ID, PAD_ID, PAD_ID])
+    # Canvas now leads with the [WIN]/[LOSS] outcome token at position 0.
+    target = torch.tensor([WIN_ID, 100, DELIMITER_ID, 101, DELIMITER_ID, END_ID, PAD_ID])
     model = FixedCanvasModel(target, vocab_size=128)
     batch = _batch(config)
 
@@ -72,6 +73,23 @@ def test_sampler_self_conditioning_off_preserves_legacy_call_contract() -> None:
     assert model.self_conditioning_inputs == ["missing", "missing", "missing"]
 
 
+def test_sampler_optionally_returns_logits_conditioned_on_final_canvas() -> None:
+    config = _small_config(canvas_budget=3, max_steps=3, entropy_bound=100.0)
+    target = torch.tensor([100, 101, END_ID])
+    model = FixedCanvasModel(target, vocab_size=128)
+
+    output = sample_canvas(
+        model,
+        _batch(config),
+        config,
+        return_final_logits=True,
+    )
+
+    assert output.final_canvas_logits is not None
+    assert output.final_canvas_logits.shape == (1, 3, 128)
+    assert len(model.self_conditioning_inputs) == output.steps + 1
+
+
 def test_sampler_early_stops_and_respects_max_steps() -> None:
     config = _small_config(canvas_budget=5, max_steps=10, entropy_bound=100.0)
     target = torch.tensor([100, DELIMITER_ID, 101, END_ID, PAD_ID])
@@ -82,9 +100,47 @@ def test_sampler_early_stops_and_respects_max_steps() -> None:
     assert output.committed_mask.all()
 
 
+def test_sample_canvas_default_mask_is_fully_model_predicted() -> None:
+    """The default mask_rate=1.0 reveals nothing: the whole canvas is predicted."""
+    config = _small_config(canvas_budget=3, max_steps=3)
+    target = torch.tensor([100, 101, END_ID])
+    model = FixedCanvasModel(target, vocab_size=128)
+
+    output = sample_canvas(model, _batch(config), config)
+
+    assert output.revealed_mask is not None
+    assert not output.revealed_mask.any()  # t=1.0 -> every position is model-predicted
+
+
+def test_sample_canvas_partial_mask_reveals_ground_truth() -> None:
+    """mask_rate<1.0 pre-reveals ground truth positions the sampler never re-predicts."""
+    config = _small_config(canvas_budget=7, max_steps=10)
+    target = torch.tensor([WIN_ID, 100, DELIMITER_ID, 101, DELIMITER_ID, END_ID, PAD_ID])
+    model = FixedCanvasModel(target, vocab_size=128)
+    batch = _batch(config)
+
+    output = sample_canvas(model, batch, config, mask_rate=0.5)
+
+    assert output.revealed_mask is not None
+    revealed = output.revealed_mask[0]
+    ground_truth = batch.target_canvas[0]
+    # Every revealed position keeps its ground-truth token verbatim.
+    for position in range(config.data.canvas_budget_tokens):
+        if revealed[position]:
+            assert output.canvas[0, position] == ground_truth[position]
+    # The sampler still fills every position and terminates.
+    assert output.committed_mask.all()
+    # The reveal pattern is seeded from config.pipeline.seed, so it is reproducible
+    # across runs (only the canvas shape and seed drive it, not the data).
+    repeat = sample_canvas(model, _batch(config), config, mask_rate=0.5)
+    assert torch.equal(output.revealed_mask, repeat.revealed_mask)
+
+
 def test_decoder_roundtrips_known_canvas_and_flags_invalid() -> None:
     vocab = _vocab()
-    valid = [100, 100, DELIMITER_ID, 101, DELIMITER_ID, END_ID, PAD_ID, PAD_ID]
+    # Every canvas leads with the position-0 [WIN]/[LOSS] outcome token, which the
+    # decoder skips before parsing timesteps.
+    valid = [WIN_ID, 100, 100, DELIMITER_ID, 101, DELIMITER_ID, END_ID, PAD_ID]
     decoded = decode_canvas(valid, vocab)
 
     assert decoded.validation.valid
@@ -92,17 +148,22 @@ def test_decoder_roundtrips_known_canvas_and_flags_invalid() -> None:
     assert decoded.truncated is False
     assert decoded.partial_final_timestep is False
 
-    truncated = decode_canvas([100, DELIMITER_ID, PAD_ID, PAD_ID], vocab)
+    truncated = decode_canvas([WIN_ID, 100, DELIMITER_ID, PAD_ID, PAD_ID], vocab)
     assert truncated.validation.valid
     assert truncated.truncated is True
     assert truncated.partial_final_timestep is False
     assert truncated.timesteps == [{"marine": 1}]
 
-    partial = decode_canvas([100, DELIMITER_ID, 101], vocab)
+    partial = decode_canvas([WIN_ID, 100, DELIMITER_ID, 101], vocab)
     assert partial.validation.valid is False
     assert "boundary" in (partial.validation.diagnosis or "")
 
-    invalid = validate_canvas([100, PAD_ID, END_ID])
+    # Missing the leading outcome token is now itself a validation failure.
+    missing_outcome = validate_canvas([100, 100, DELIMITER_ID, END_ID, PAD_ID])
+    assert missing_outcome.valid is False
+    assert "outcome" in (missing_outcome.diagnosis or "")
+
+    invalid = validate_canvas([WIN_ID, 100, PAD_ID, END_ID])
     assert invalid.valid is False
     assert "[PAD]" in (invalid.diagnosis or "")
 
@@ -183,8 +244,10 @@ def _small_config(
 
 
 def _batch(config: ProjectConfig):
+    # make_synthetic_examples builds PRE-TRAINING fixtures (absent input,
+    # collapsed labels), so collate in pre-training mode.
     examples = make_synthetic_examples(config, count=1)
-    return collate_diffusion_examples(examples)
+    return collate_diffusion_examples(examples, debut_mode=False)
 
 
 def _vocab():

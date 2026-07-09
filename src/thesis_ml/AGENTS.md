@@ -40,3 +40,4 @@
 - `inference/AGENTS.md`: iterative confidence-based sampler, canvas grammar validation/decoding, external time recovery.
 - `eval/AGENTS.md`: build-order extraction, evaluation harness, precision/recall/F1 metrics, fine-tune reporting.
 - `pipeline/AGENTS.md`: config-only orchestration for data acquisition, training, fine-tuning, and storage abstraction.
+- `viz/AGENTS.md`: read-only checkpoint diagnostics, static figures, and opt-in raw canvas/logit exports.

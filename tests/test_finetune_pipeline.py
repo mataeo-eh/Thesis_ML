@@ -8,15 +8,15 @@ Two things are exercised here:
    optimizer state, `global_step`, and `completed_epochs` exactly as a
    freshly-constructed loop would have them (i.e. it does NOT also restore
    those counters the way `load_checkpoint` does).
-2. The fine-tune config (`configs/local_overfit_v2_finetune.yaml`) loads and
-   carries the expected overrides (debut_mode/outcome_last/init_from_checkpoint/
-   checkpoint_uri) while leaving the inherited data.* window budgets
-   untouched, so the fine-tune run reuses pre-training's window manifest.
+2. The fine-tune config (`configs/local_overfit_v2_finetune.yaml`) loads with
+   the expected overrides and pretraining token budgets, but owns a separate
+   input-tiled window manifest.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -64,7 +64,14 @@ def _fit_one_step(loop: TrainingLoop, config: ProjectConfig, *, seed: int) -> No
 
     torch.manual_seed(seed)
     examples = make_synthetic_examples(config, count=2)
-    dataloader = DataLoader(examples, batch_size=2, shuffle=False, collate_fn=collate_diffusion_examples)
+    # make_synthetic_examples builds PRE-TRAINING fixtures, and this helper's
+    # config is a pre-training one, so collate in pre-training mode.
+    dataloader = DataLoader(
+        examples,
+        batch_size=2,
+        shuffle=False,
+        collate_fn=partial(collate_diffusion_examples, debut_mode=False),
+    )
     batch = next(iter(dataloader))
     loop.fit([batch], max_steps=loop.global_step + 1, fixed_t=1.0)
 
@@ -132,14 +139,14 @@ def test_finetune_config_extends_overfit_v2_with_warm_start_and_debut_settings()
     assert config.train.init_from_checkpoint == "checkpoints/local-overfitV2/last.pt"
     assert config.storage.checkpoint_uri == "checkpoints/local-overfitV2-finetune"
     assert config.train.lr == 1.0e-6
-    assert config.train.epochs == 100
+    assert config.train.epochs == 150
 
     # Inherited from local_overfit_v2.yaml / local_overfit.yaml -- log_uri is
     # SHARED with pre-training on purpose (the pipeline prefixes filenames).
     assert config.storage.log_uri == "tests/output/overfitV2"
 
-    # data.* window budgets must be UNCHANGED so the fine-tune run reuses
-    # pre-training's window manifest rather than forcing a rebuild.
+    # Token budgets stay aligned, but fine-tuning owns a separate input-tiled
+    # manifest because its output canvases may overlap across input windows.
     assert config.data.sampling_interval_s == 1
     assert config.data.input_budget_tokens == 4096
     assert config.data.canvas_budget_tokens == 4096
@@ -150,6 +157,8 @@ def test_finetune_config_extends_overfit_v2_with_warm_start_and_debut_settings()
     # profile's existence: debut_mode/outcome_last default False, and
     # init_from_checkpoint defaults to "" (disabled).
     pretraining_config = load_config(REPO_ROOT / "configs" / "local_overfit_v2.yaml")
+    assert config.data.window_manifest_path == "data/processed/local/finetune_window_manifest.jsonl"
+    assert config.data.window_manifest_path != pretraining_config.data.window_manifest_path
     assert pretraining_config.data.debut_mode is False
     assert pretraining_config.sampler.outcome_last is False
     assert pretraining_config.train.init_from_checkpoint == ""

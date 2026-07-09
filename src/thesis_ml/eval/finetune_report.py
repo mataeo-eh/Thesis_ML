@@ -473,7 +473,9 @@ def _evaluate_example(
         ``_ground_truth_debut_events``, ``compare_build_orders``.
     """
 
-    batch = collate_diffusion_examples([example])
+    # Fine-tuning report path; debut_mode is always True here, threaded from
+    # config so collate scopes its future telemetry correctly.
+    batch = collate_diffusion_examples([example], debut_mode=config.data.debut_mode)
     sampled = sample_canvas(model, batch, config, device=device)
     canvas = sampled.canvas[0].tolist()
 

@@ -297,12 +297,15 @@ def test_relaxed_validator_rejects_malformed_canvases() -> None:
     assert validate_debut_canvas([WIN_ID, MARINE_ID, PAD_ID, PAD_ID]).valid is False
 
 
-def test_pretraining_validator_untouched() -> None:
-    # The existing pre-training grammar must still reject outcome tokens, proving
-    # we added a separate validator rather than loosening the old one.
+def test_pretraining_validator_requires_leading_outcome_token() -> None:
+    # The win/loss outcome token is now folded into PRE-TRAINING too, so the
+    # pre-training grammar REQUIRES exactly one outcome token at position 0
+    # (converging with the debut grammar). A canvas that leads with it is valid;
+    # one missing it is rejected.
     from thesis_ml.inference.decode import validate_canvas
 
-    assert validate_canvas([WIN_ID, MARINE_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is False
+    assert validate_canvas([WIN_ID, MARINE_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is True
+    assert validate_canvas([MARINE_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is False
 
 
 # ---------------------------------------------------------------------------

@@ -18,57 +18,50 @@ from thesis_ml.data.dataset import (
     CLASS_PAD,
     CLASS_WINLOSS,
     DEBUT_CLASS_ID_TO_NAME,
+    PRETRAIN_CLASS_ID_TO_NAME,
 )
-
-# The ORIGINAL 6-class pre-training id->name map. This constant must NEVER be
-# mutated, renamed, or reordered: `train/loop.py` and existing tests import it
-# directly, and pretraining's per-class loss keys / epoch-CSV columns must stay
-# byte-for-byte identical to what they were before debut-mode support existed.
-CLASS_ID_TO_NAME = {
-    CLASS_ENEMY_OBSERVED: "enemy-observed",
-    CLASS_ENEMY_FOGGED: "enemy-fogged",
-    CLASS_ENEMY_FUTURE: "enemy-future",
-    CLASS_DELIMITER: "[DELIMITER]",
-    CLASS_END: "[END]",
-    CLASS_PAD: "[PAD]",
-}
 
 
 def active_class_id_to_name(config: ProjectConfig) -> dict[int, str]:
     """Pick the class-id -> class-name map that matches the current run.
 
-    WHY this function exists: pre-training canvases only ever contain 6
-    classes (reconstruction/fogged/future/delimiter/end/pad), while debut
-    fine-tuning canvases (``config.data.debut_mode`` True) add a 7th class --
-    the single win/loss outcome token (``CLASS_WINLOSS``, id 6) -- and rename
-    the first three classes to describe "debut" state instead of plain
-    reconstruction (see ``DEBUT_CLASS_ID_TO_NAME`` in data/dataset.py, the
-    shared map produced by the dataset worker).
+    WHY this function exists: pre-training and debut fine-tuning use DIFFERENT
+    class taxonomies, but the loss module (per-class decomposition, below) and
+    the training loop (epoch-CSV column names, in train/loop.py) must always
+    agree on which class names exist. Both call this SAME helper so they can
+    never drift apart (e.g. loss.py emitting a per-class key that loop.py has
+    no CSV column for).
 
-    Both the loss module (class-weight buffer sizing + per-class loss
-    decomposition, below) and the training loop (epoch-CSV column names, in
-    train/loop.py) call this SAME helper so they always agree on which class
-    names exist for a given config. If either module built its own map
-    independently, the two could drift apart (e.g. loss.py emitting a
-    "win-loss" per-class key that loop.py has no CSV column for). Centralizing
-    the choice here is also what guarantees pretraining's per-class keys and
-    CSV columns stay byte-for-byte unchanged: when debut_mode is False this
-    always returns the original, untouched CLASS_ID_TO_NAME map.
+    The two maps are:
+      - Pre-training (``config.data.debut_mode`` False):
+        ``PRETRAIN_CLASS_ID_TO_NAME`` -- a SPARSE 5-entry map (ids 0/3/4/5/6).
+        Pre-training collapses the observed/fogged/future split into a single
+        "content" class (id 0) and never emits ids 1 or 2, so those two ids are
+        intentionally absent from the map. CRITICAL: because the map is sparse,
+        any id-indexed buffer (e.g. the class-weight buffer below) must be sized
+        ``max(map) + 1`` (= 7), NOT ``len(map)`` (= 5).
+      - Fine-tuning (``config.data.debut_mode`` True): ``DEBUT_CLASS_ID_TO_NAME``
+        -- the dense 7-entry debut taxonomy (visible/fogged/future-debut, the
+        structural tokens, and the win/loss outcome token).
 
     Args:
         config: The full project config. Only ``config.data.debut_mode`` is
             read.
 
     Returns:
-        ``DEBUT_CLASS_ID_TO_NAME`` (7 classes) when debut mode is active,
-        otherwise the original ``CLASS_ID_TO_NAME`` (6 classes).
+        ``DEBUT_CLASS_ID_TO_NAME`` when debut mode is active, otherwise
+        ``PRETRAIN_CLASS_ID_TO_NAME``.
     """
 
     if config.data.debut_mode:
         return DEBUT_CLASS_ID_TO_NAME
-    return CLASS_ID_TO_NAME
+    return PRETRAIN_CLASS_ID_TO_NAME
 
 
+# Future-distance decomposition buckets. FINE-TUNING ONLY: pre-training collapses
+# the future class into "content" and never labels a token CLASS_ENEMY_FUTURE, so
+# these buckets are computed only when ``config.data.debut_mode`` is True (see
+# CanvasCrossEntropyLoss.forward, which gates on ``self.debut_mode``).
 FUTURE_DISTANCE_BUCKETS = {
     "1": (1, 1),
     "2_5": (2, 5),
@@ -77,6 +70,32 @@ FUTURE_DISTANCE_BUCKETS = {
     "31_plus": (31, None),
 }
 
+# t-bucket loss-breakdown names, in the canonical order used for CSV columns.
+# Each training/eval example's sampled masking level t (from the corruption
+# step) lands in EXACTLY ONE of these contiguous, exhaustive buckets over [0, 1]:
+#   t == 1.0            -> "t_eq_1"
+#   0.7 <= t < 1.0      -> "t_0_7_to_1_0"
+#   0.5 <= t < 0.7      -> "t_0_5_to_0_7"
+#   0.3 <= t < 0.5      -> "t_0_3_to_0_5"
+#   0.0 <= t < 0.3      -> "t_0_0_to_0_3"  (MIN_T clamping keeps t > 0, still here)
+# Emitted in BOTH pre-training and fine-tuning.
+T_BUCKET_NAMES = (
+    "t_eq_1",
+    "t_0_7_to_1_0",
+    "t_0_5_to_0_7",
+    "t_0_3_to_0_5",
+    "t_0_0_to_0_3",
+)
+
+# Perspective-split loss-breakdown names. Each example is built from one player's
+# perspective (``DatasetExample.perspective_player``); "p1" means p1 is the
+# viewer and p2 is the reconstructed enemy, and vice versa for "p2". Emitted in
+# BOTH pipelines. Integer ids below are the representation carried on the batch
+# (see data/collate.py) so the perspective survives ``.to(device)``.
+PERSPECTIVE_NAMES = ("p1", "p2")
+PERSPECTIVE_P1 = 1
+PERSPECTIVE_P2 = 2
+
 
 @dataclass(frozen=True)
 class LossOutput:
@@ -84,6 +103,12 @@ class LossOutput:
     per_class: dict[str, torch.Tensor]
     future_distance: dict[str, torch.Tensor]
     future_distance_counts: dict[str, int]
+    # Masked-CE broken down by the example's sampled t-bucket and by the
+    # example's player perspective. Both follow the SAME emptiness convention as
+    # ``per_class``: a bucket/perspective with zero scored tokens is simply
+    # ABSENT from the dict (no key), rather than present-with-a-sentinel.
+    t_bucket: dict[str, torch.Tensor]
+    perspective: dict[str, torch.Tensor]
 
 
 class CanvasCrossEntropyLoss(nn.Module):
@@ -97,30 +122,41 @@ class CanvasCrossEntropyLoss(nn.Module):
     def __init__(self, config: ProjectConfig) -> None:
         super().__init__()
         self.use_fused_cross_entropy = config.loss.use_fused_cross_entropy
-        # Pick the 6-class (pretraining) or 7-class (debut fine-tuning) name
-        # map ONCE up front. Every downstream computation in this class (the
-        # weight buffer's length below, and the per-class decomposition in
-        # forward()) is derived from this single map, so pretraining and
-        # debut mode can never disagree with each other or with the CSV
-        # columns train/loop.py writes (which call the same helper). See
-        # active_class_id_to_name's docstring for the full rationale.
+        # Pick the taxonomy map ONCE up front (see active_class_id_to_name). The
+        # per-class decomposition in forward() derives its keys from this single
+        # map, so pre-training and debut mode can never disagree with each other
+        # or with the CSV columns train/loop.py writes (which call the same
+        # helper). ``debut_mode`` is cached because it also gates the
+        # future-distance decomposition (fine-tuning-only) in forward().
         self.class_id_to_name = active_class_id_to_name(config)
-        weights = config.loss.class_loss_weights
-        class_weights = torch.ones(len(self.class_id_to_name), dtype=torch.float32)
-        # Ids 0-5 mean the same positions in BOTH taxonomies (debut mode only
-        # renames them, it does not renumber them), so these assignments are
-        # correct regardless of which mode is active.
-        class_weights[CLASS_ENEMY_OBSERVED] = weights.enemy_observed_reconstruction
-        class_weights[CLASS_ENEMY_FOGGED] = weights.enemy_fogged_reconstruction
-        class_weights[CLASS_ENEMY_FUTURE] = weights.enemy_future_prediction
-        class_weights[CLASS_DELIMITER] = weights.delimiter
-        class_weights[CLASS_END] = weights.end
-        class_weights[CLASS_PAD] = weights.pad
-        if config.data.debut_mode:
-            # Id 6 (CLASS_WINLOSS) only exists in the debut taxonomy. Setting
-            # it only in this branch keeps the pretraining buffer exactly
-            # length-6 with exactly the same values as before this change.
+        self.debut_mode = config.data.debut_mode
+
+        # The weight buffer is indexed by raw class-id, so it MUST be sized by
+        # max(id) + 1, NOT len(map). Pre-training's map is SPARSE (ids 0/3/4/5/6,
+        # so len == 5) but ids still range up to 6 -- sizing by len would
+        # under-allocate and crash when indexing class-id 6. max(id)+1 == 7 in
+        # both taxonomies today.
+        buffer_size = max(self.class_id_to_name) + 1
+        class_weights = torch.ones(buffer_size, dtype=torch.float32)
+        if self.debut_mode:
+            # Fine-tuning: per-class config weighting (unchanged behavior). The
+            # config guarantees class_loss_weights is populated in debut mode.
+            weights = config.loss.class_loss_weights
+            class_weights[CLASS_ENEMY_OBSERVED] = weights.enemy_observed_reconstruction
+            class_weights[CLASS_ENEMY_FOGGED] = weights.enemy_fogged_reconstruction
+            class_weights[CLASS_ENEMY_FUTURE] = weights.enemy_future_prediction
+            class_weights[CLASS_DELIMITER] = weights.delimiter
+            class_weights[CLASS_END] = weights.end
+            class_weights[CLASS_PAD] = weights.pad
             class_weights[CLASS_WINLOSS] = weights.win_loss
+        else:
+            # Pre-training: fully uniform, published-MDLM-style loss weighting --
+            # 1.0 for every class (already the buffer's fill value) except PAD,
+            # which is zeroed so padding positions never contribute. NOTE: we
+            # deliberately do NOT read config.loss.class_loss_weights here; it is
+            # None for pre-training configs (fog / per-class weights are a
+            # fine-tuning-only concern per config validation).
+            class_weights[CLASS_PAD] = 0.0
         self.register_buffer("class_weights", class_weights)
 
     def forward(
@@ -132,6 +168,8 @@ class CanvasCrossEntropyLoss(nn.Module):
         scored_mask: torch.Tensor | None = None,
         position_weights: torch.Tensor | None = None,
         prediction_distances: torch.Tensor | None = None,
+        sampled_t: torch.Tensor | None = None,
+        perspective_ids: torch.Tensor | None = None,
     ) -> LossOutput:
         ce = F.cross_entropy(
             canvas_logits.transpose(1, 2),
@@ -154,7 +192,12 @@ class CanvasCrossEntropyLoss(nn.Module):
 
         future_distance: dict[str, torch.Tensor] = {}
         future_distance_counts: dict[str, int] = {}
-        if prediction_distances is not None:
+        # Future-distance decomposition is FINE-TUNING ONLY. Pre-training never
+        # labels a token CLASS_ENEMY_FUTURE (the future class is collapsed into
+        # "content"), so we gate explicitly on the mode rather than relying on
+        # the label simply never appearing -- pre-training must emit no
+        # future-distance keys at all.
+        if self.debut_mode and prediction_distances is not None:
             distances = prediction_distances.to(ce.device)
             future_mask = active & (class_labels == CLASS_ENEMY_FUTURE)
             for name, (minimum, maximum) in FUTURE_DISTANCE_BUCKETS.items():
@@ -166,9 +209,46 @@ class CanvasCrossEntropyLoss(nn.Module):
                     future_distance[name] = ce[bucket_mask].mean()
                     future_distance_counts[name] = count
 
+        # t-bucket breakdown (BOTH pipelines). Each example's single sampled t
+        # (shape [B]) assigns ALL that example's scored canvas positions to one
+        # bucket; the masked-CE mean is then taken over every scored position in
+        # that bucket across the batch. Empty buckets are omitted (per_class
+        # convention). See T_BUCKET_NAMES for the exact, exhaustive boundaries.
+        t_bucket: dict[str, torch.Tensor] = {}
+        if sampled_t is not None:
+            t_row = sampled_t.to(ce.device)
+            bucket_row_masks = {
+                "t_eq_1": t_row == 1.0,
+                "t_0_7_to_1_0": (t_row >= 0.7) & (t_row < 1.0),
+                "t_0_5_to_0_7": (t_row >= 0.5) & (t_row < 0.7),
+                "t_0_3_to_0_5": (t_row >= 0.3) & (t_row < 0.5),
+                "t_0_0_to_0_3": t_row < 0.3,
+            }
+            for name in T_BUCKET_NAMES:
+                bucket_mask = active & bucket_row_masks[name].unsqueeze(1)
+                if bucket_mask.any():
+                    t_bucket[name] = ce[bucket_mask].mean()
+
+        # Perspective breakdown (BOTH pipelines). Same shape of logic as the
+        # t-bucket split, but partitioning examples by which player perspective
+        # they were built from. Empty perspectives are omitted (per_class
+        # convention).
+        perspective: dict[str, torch.Tensor] = {}
+        if perspective_ids is not None:
+            perspective_row = perspective_ids.to(ce.device)
+            for name, perspective_id in (
+                ("p1", PERSPECTIVE_P1),
+                ("p2", PERSPECTIVE_P2),
+            ):
+                perspective_mask = active & (perspective_row == perspective_id).unsqueeze(1)
+                if perspective_mask.any():
+                    perspective[name] = ce[perspective_mask].mean()
+
         return LossOutput(
             loss=aggregate,
             per_class=per_class,
             future_distance=future_distance,
             future_distance_counts=future_distance_counts,
+            t_bucket=t_bucket,
+            perspective=perspective,
         )

@@ -12,13 +12,16 @@
 
 ## Local Contracts
 
-- Canvas corruption is uniform i.i.d. `[MASK]` at a sampled global level *t* (MDLM-style). Per-timestep-varying corruption is input-side fog and is never applied to the canvas.
-- Loss is masked-position cross-entropy over canvas positions only, reweighted by `1/t`; batch-shape padding is excluded from attention and loss.
+- Canvas corruption samples one `t ~ Uniform(mask_schedule.min, mask_schedule.max)` per example, then independently replaces each canvas position with `[MASK]` with probability `t`. Unmasked positions retain their ground-truth token; input tokens are clamped and unchanged.
+- Loss is cross-entropy only where canvas corruption actually produced `[MASK]`, intersected with the canvas loss mask, and reweighted by `1/max(t, 1e-4)`; batch-shape padding is excluded.
+- With the default 0.0-1.0 schedule, training spans nearly clean through nearly/all-masked canvases in expectation. Exact endpoints have measure zero under continuous sampling; finite canvases can still become completely unmasked or completely masked through the independent Bernoulli draws.
+- Per-timestep-varying corruption does not exist on the canvas. Input-side fog is a separate per-example enemy-token omission process owned by `data/dataset.py`.
 - Per-class loss logging is populated from the first run. Auxiliary confidence loss is config-weighted (`confidence_loss_weight`, `0.0` disables) and derived from logits, not a separate head (`SPEC.md` §3).
 - Maintain an EMA weight copy (decay `ema_decay`); use EMA weights for validation, the final checkpoint, sampling, and evaluation.
 - Self-conditioning training uses the two-pass procedure at `self_cond_prob` and shares the inference interface.
 - Epoch patience compares noisy resampled train loss against the best using the configured relative minimum improvement; a single flat epoch never stops a run.
 - Optimizer/schedule fields (`lr`, `betas`, `weight_decay`, `warmup`, `lr_floor`, `grad_clip`, `accum`, `precision`, `epochs`, `early_stopping_*`) are config-owned.
+- Production pipelines stream step metrics to disk without retaining returned log objects; validation aggregates scalar metrics on CPU. CUDA runs report current/peak allocation, reservation, inactive split bytes, device-wide used memory from `cudaMemGetInfo`, and the device-minus-reserved gap. Epoch CSVs average the latter two across optimizer steps. Profiles may trim unused cache at completed epoch boundaries via config.
 
 ## Work Guidance
 
