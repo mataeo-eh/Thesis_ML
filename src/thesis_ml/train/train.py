@@ -120,7 +120,7 @@ def make_synthetic_examples(config: ProjectConfig, *, count: int) -> list[Datase
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SC2 masked-diffusion training")
+    parser = argparse.ArgumentParser(description="SC2 clean-state diffusion training")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--smoke", action="store_true", help="run the tiny synthetic smoke-train")
     parser.add_argument("--steps", type=int, default=32)
@@ -133,7 +133,7 @@ def main() -> None:
     logs = run_smoke_train(max_steps=args.steps, seed=args.seed)
     for log in logs:
         per_class = ", ".join(f"{name}={value:.4f}" for name, value in sorted(log.per_class.items()))
-        print(f"step={log.step} loss={log.loss:.4f} lr={log.lr:.6g} masked={log.masked_fraction:.3f} {per_class}")
+        print(f"step={log.step} loss={log.loss:.4f} lr={log.lr:.6g} noise={log.noise_fraction:.3f} {per_class}")
 
 
 def _smoke_config(*, max_steps: int, checkpoint_dir: str | Path | None) -> ProjectConfig:

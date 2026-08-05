@@ -177,7 +177,7 @@ def test_ce_is_not_reported() -> None:
 
 
 class FixedCanvasModel(nn.Module):
-    def __init__(self, target_canvas: torch.Tensor, *, vocab_size: int, top_logit: float = 8.0) -> None:
+    def __init__(self, target_canvas: torch.Tensor, *, vocab_size: int, top_logit: float = 50.0) -> None:
         super().__init__()
         self.register_buffer("target_canvas", target_canvas.clone())
         self.vocab_size = vocab_size
@@ -207,8 +207,12 @@ def _small_config(*, canvas_budget: int) -> ProjectConfig:
     return replace(
         config,
         data=replace(config.data, input_budget_tokens=64, canvas_budget_tokens=canvas_budget),
-        model=replace(config.model, d_model=32, layers=1, heads=4, ffn=64),
-        sampler=replace(config.sampler, max_steps=4, entropy_bound=100.0),
+        model=replace(
+            config.model, d_model=32, layers=1, heads=4, ffn=64, self_conditioning=False
+        ),
+        sampler=replace(
+            config.sampler, max_steps=4, entropy_bound=100.0, adaptive_stop=False
+        ),
         eval=replace(config.eval, heldout_split="test", timing_tolerance_buckets=1, fog_rate=0.0),
     )
 

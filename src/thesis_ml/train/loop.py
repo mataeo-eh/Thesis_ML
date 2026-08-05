@@ -1,4 +1,4 @@
-"""Plain PyTorch training loop for SC2 masked discrete diffusion."""
+"""Plain PyTorch training loop for SC2 clean-state discrete diffusion."""
 
 from __future__ import annotations
 
@@ -27,7 +27,10 @@ from thesis_ml.model.loss import (
     LossOutput,
     active_class_id_to_name,
 )
-from thesis_ml.model.model import canvas_self_conditioning_from_logits
+from thesis_ml.model.model import (
+    canvas_self_conditioning_from_logits,
+    validate_checkpoint_compatibility,
+)
 from thesis_ml.train.corruption import CorruptionOutput, corrupt_batch
 
 
@@ -40,7 +43,7 @@ class BatchLoss:
     corruption: CorruptionOutput
     scored_mask: torch.Tensor
     canvas_logits: torch.Tensor
-    self_conditioning_used: bool
+    self_conditioning_mask: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -60,14 +63,14 @@ class TrainStepLog:
     confidence_loss: float
     per_class: dict[str, float]
     future_distance: dict[str, float]
-    # Masked-CE broken down by the example's sampled t-bucket and by player
+    # Clean-state CE broken down by the example's sampled t-bucket and by player
     # perspective. Emitted in BOTH pipelines. Empty buckets/perspectives are
     # simply absent from these dicts (per_class convention).
     t_bucket_loss: dict[str, float]
     perspective_loss: dict[str, float]
     lr: float
     t_mean: float
-    masked_fraction: float
+    noise_fraction: float
     step_wall_seconds: float
     tokens_per_second: float
     cuda_max_memory_allocated_bytes: int
@@ -446,7 +449,7 @@ class TrainingLoop:
                     },
                     lr=record["lr"],
                     t_mean=float(last["t_mean"].cpu()),
-                    masked_fraction=float(last["masked_fraction"].cpu()),
+                    noise_fraction=float(last["noise_fraction"].cpu()),
                     validation=validation,
                     step_wall_seconds=step_wall_seconds,
                     tokens_per_second=tokens_per_second,
@@ -537,7 +540,10 @@ class TrainingLoop:
                                 for name, value in batch_loss.loss_output.perspective.items()
                             },
                             "t_mean": batch_loss.corruption.t.detach().mean(),
-                            "masked_fraction": batch_loss.scored_mask.float().mean().detach(),
+                            "noise_fraction": (
+                                batch_loss.corruption.corrupted_positions
+                                & batch.canvas_loss_mask.to(batch_loss.corruption.corrupted_positions.device)
+                            ).sum().float() / batch.canvas_loss_mask.sum().clamp_min(1).float(),
                         }
                     )
                     # Host-tensor accumulation (no GPU dependency) stays inline
@@ -701,12 +707,17 @@ class TrainingLoop:
         corruption = corrupt_batch(
             input_token_ids=batch.input_token_ids,
             target_canvas=batch.target_canvas,
-            schedule=self.config.diffusion.mask_schedule,
+            process=self.config.diffusion.process,
+            schedule=self.config.diffusion.schedule,
+            vocab_size=int(getattr(self.model, "vocab_size")),
             generator=self.generator,
             t=fixed_t,
         )
 
-        scored_mask = corruption.masked_positions & batch.canvas_loss_mask
+        if self.config.diffusion.process == "uniform":
+            scored_mask = batch.canvas_loss_mask
+        else:
+            scored_mask = corruption.corrupted_positions & batch.canvas_loss_mask
         with torch.autocast(
             device_type=self.device.type,
             dtype=torch.bfloat16,
@@ -714,9 +725,14 @@ class TrainingLoop:
         ):
             active_model = self.model if model is None else model
             input_len = batch.input_token_ids.shape[1]
+            self_conditioning_mask = torch.zeros(
+                batch.target_canvas.shape[0], device=self.device, dtype=torch.bool
+            )
             canvas_self_conditioning = None
-            self_conditioning_used = model is None and self._use_self_conditioning()
-            if self_conditioning_used:
+            if model is None and self.config.model.self_conditioning:
+                self_conditioning_mask = self._sample_self_conditioning_rows(
+                    batch.target_canvas.shape[0]
+                )
                 with torch.no_grad():
                     estimate = active_model(
                         input_token_ids=corruption.input_token_ids,
@@ -726,8 +742,12 @@ class TrainingLoop:
                         input_features=batch.input_features,
                     )
                     canvas_self_conditioning = canvas_self_conditioning_from_logits(
-                        estimate.logits[:, input_len:, :]
+                        estimate.logits[:, input_len:, :],
+                        active_model.embedding.token_embedding.weight,
                     )
+                    canvas_self_conditioning = canvas_self_conditioning * self_conditioning_mask[
+                        :, None, None
+                    ].to(dtype=canvas_self_conditioning.dtype)
             forward_kwargs = {
                 "input_token_ids": corruption.input_token_ids,
                 "canvas_token_ids": corruption.noised_canvas,
@@ -764,7 +784,7 @@ class TrainingLoop:
             corruption=corruption,
             scored_mask=scored_mask,
             canvas_logits=canvas_logits,
-            self_conditioning_used=self_conditioning_used,
+            self_conditioning_mask=self_conditioning_mask.detach(),
         )
 
     @property
@@ -792,6 +812,8 @@ class TrainingLoop:
                 "feature_statistics_identity": getattr(
                     self.model, "feature_statistics_identity", None
                 ),
+                "architecture_identity": getattr(self.model, "architecture_identity", None),
+                "diffusion_process": getattr(self.model, "diffusion_process", None),
             },
             checkpoint_path,
         )
@@ -804,6 +826,7 @@ class TrainingLoop:
 
     def load_checkpoint(self, path: str | Path) -> None:
         checkpoint = torch.load(Path(path), map_location=self.device, weights_only=False)
+        validate_checkpoint_compatibility(checkpoint, self.model, str(Path(path)))
         self._validate_feature_statistics_identity(checkpoint, path)
         self.model.load_state_dict(checkpoint["model"])
         self.ema_model.load_state_dict(checkpoint.get("ema_model", checkpoint["model"]))
@@ -863,6 +886,7 @@ class TrainingLoop:
         """
 
         checkpoint = torch.load(Path(path), map_location=self.device, weights_only=False)
+        validate_checkpoint_compatibility(checkpoint, self.model, str(Path(path)))
         self._validate_feature_statistics_identity(checkpoint, path)
         # Copy the plain model's weights.
         self.model.load_state_dict(checkpoint["model"])
@@ -915,7 +939,7 @@ class TrainingLoop:
         perspective_loss: dict[str, float],
         lr: float,
         t_mean: float,
-        masked_fraction: float,
+        noise_fraction: float,
         validation: ValidationLog | None,
         step_wall_seconds: float,
         tokens_per_second: float,
@@ -941,7 +965,7 @@ class TrainingLoop:
             perspective_loss=dict(sorted(perspective_loss.items())),
             lr=lr,
             t_mean=t_mean,
-            masked_fraction=masked_fraction,
+            noise_fraction=noise_fraction,
             step_wall_seconds=step_wall_seconds,
             tokens_per_second=tokens_per_second,
             cuda_max_memory_allocated_bytes=cuda_max_memory_allocated_bytes,
@@ -988,7 +1012,7 @@ class TrainingLoop:
 
         Cheap append-per-step (no remote I/O) so it never bottlenecks training;
         remote publishing happens on the checkpoint cadence. Includes loss,
-        per-class losses, lr, masked fraction, and any validation log so the
+        per-class losses, lr, noise fraction, and any validation log so the
         run can be tracked and aborted early from the JSONL alone.
 
         Both modes retain input/fog/future telemetry because both now consume
@@ -1158,16 +1182,18 @@ class TrainingLoop:
             return configured
         return max(configured, math.ceil(target_tokens / microbatch_tokens))
 
-    def _use_self_conditioning(self) -> bool:
-        if not self.config.model.self_conditioning:
-            return False
+    def _sample_self_conditioning_rows(self, batch_size: int) -> torch.Tensor:
+        """Choose stopped estimate conditioning independently for each row."""
+
         probability = self.config.train.self_cond_prob
         if probability <= 0.0:
-            return False
+            return torch.zeros(batch_size, device=self.device, dtype=torch.bool)
         if probability >= 1.0:
-            return True
+            return torch.ones(batch_size, device=self.device, dtype=torch.bool)
         generator_device = self.device if self.device.type in {"cpu", "cuda"} else torch.device("cpu")
-        return bool(torch.rand((), device=generator_device, generator=self.generator).item() < probability)
+        return torch.rand(
+            batch_size, device=generator_device, generator=self.generator
+        ) < probability
 
     def _update_ema(self) -> None:
         decay = self.config.train.ema_decay

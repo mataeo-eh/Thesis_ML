@@ -38,9 +38,9 @@ class EvaluationExampleResult:
     ground_truth_canvas: tuple[int, ...] = ()
     final_canvas_logits: torch.Tensor | None = field(default=None, repr=False, compare=False)
     # Per-position provenance of ``predicted_canvas`` (aligned 1:1): True where the
-    # position was REVEALED as ground truth (an infill start, see ``mask_rate``)
+    # position was REVEALED as ground truth (an infill start, see ``noise_rate``)
     # and False where the MODEL predicted it. Empty when not tracked; under the
-    # default ``mask_rate=1.0`` every position is model-predicted (all False).
+    # default ``noise_rate=1.0`` every position is model-predicted (all False).
     predicted_canvas_revealed_mask: tuple[bool, ...] = ()
 
 
@@ -101,7 +101,7 @@ def evaluate_example(
     device: torch.device | str = "cpu",
     include_canvas_logits: bool = False,
     bypass_sampler: bool = False,
-    mask_rate: float = 1.0,
+    noise_rate: float = 1.0,
 ) -> EvaluationExampleResult:
     batch = collate_diffusion_examples([example], debut_mode=config.data.debut_mode)
     prediction_fn = denoise_canvas_once if bypass_sampler else sample_canvas
@@ -111,7 +111,7 @@ def evaluate_example(
         config,
         device=device,
         return_final_logits=include_canvas_logits,
-        mask_rate=mask_rate,
+        noise_rate=noise_rate,
     )
     predicted = decode_canvas(sampled.canvas[0].tolist(), vocabulary)
 

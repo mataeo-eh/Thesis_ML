@@ -61,7 +61,7 @@ def test_smoke_train_loss_decreases_and_first_step_per_class_logs(tmp_path: Path
     assert all(value > 0 for value in first.per_class.values())
 
 
-def test_corruption_never_masks_input_region() -> None:
+def test_uniform_corruption_never_noises_input_region() -> None:
     config = _small_config()
     input_token_ids = torch.tensor([[100, 101, 102], [103, 104, 105]])
     target_canvas = torch.tensor([[100, 101, 102, 103], [104, 105, 106, 107]])
@@ -71,15 +71,19 @@ def test_corruption_never_masks_input_region() -> None:
         corrupted = corrupt_batch(
             input_token_ids=input_token_ids,
             target_canvas=target_canvas,
-            schedule=config.diffusion.mask_schedule,
+            process=config.diffusion.process,
+            schedule=config.diffusion.schedule,
+            vocab_size=128,
             generator=generator,
             t=t,
         )
         assert torch.equal(corrupted.input_token_ids, input_token_ids)
         assert not (corrupted.input_token_ids == 0).any()
+        if t == 0.0:
+            assert torch.equal(corrupted.noised_canvas, target_canvas)
         if t == 1.0:
-            assert corrupted.masked_positions.all()
-            assert (corrupted.noised_canvas == 0).all()
+            assert corrupted.corrupted_positions.all()
+            assert (corrupted.noised_canvas != 0).all()
 
 
 def test_t_one_oversampling_hits_configured_fraction_and_zero_disables_it() -> None:
@@ -94,8 +98,7 @@ def test_t_one_oversampling_hits_configured_fraction_and_zero_disables_it() -> N
     """
 
     config = _small_config()
-    schedule = config.diffusion.mask_schedule
-    assert schedule.t_one_fraction == 0.1
+    schedule = replace(config.diffusion.schedule, t_one_fraction=0.1)
 
     batch = 10_000
     target_canvas = torch.zeros((batch, 4), dtype=torch.long)
@@ -105,7 +108,9 @@ def test_t_one_oversampling_hits_configured_fraction_and_zero_disables_it() -> N
     corrupted = corrupt_batch(
         input_token_ids=input_token_ids,
         target_canvas=target_canvas,
+        process="uniform",
         schedule=schedule,
+        vocab_size=128,
         generator=generator,
         t=None,
     )
@@ -117,21 +122,23 @@ def test_t_one_oversampling_hits_configured_fraction_and_zero_disables_it() -> N
     disabled = corrupt_batch(
         input_token_ids=input_token_ids,
         target_canvas=target_canvas,
+        process="uniform",
         schedule=disabled_schedule,
+        vocab_size=128,
         generator=generator,
         t=None,
     )
     assert int((disabled.t == 1.0).sum()) == 0
 
 
-def test_per_epoch_reseed_makes_masking_deterministic_and_epochs_distinct(
+def test_per_epoch_reseed_makes_corruption_deterministic_and_epochs_distinct(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """fit() reseeds the generator to base_seed+epoch at every epoch boundary.
 
     Three claims (the per-epoch reseed contract from train/loop.py):
-      1. Two runs with the same seed produce IDENTICAL per-epoch masking.
-      2. Within one run, epoch 0's and epoch 1's masks DIFFER (the reseed is
+      1. Two runs with the same seed produce IDENTICAL per-epoch corruption.
+      2. Within one run, epoch 0's and epoch 1's branch draws DIFFER (the reseed is
          per-epoch, not a frozen repeat of one stream).
       3. Reseeding a fresh generator to base_seed + epoch reproduces that
          epoch's corruption stream exactly (this is what makes a mid-training
@@ -141,14 +148,14 @@ def test_per_epoch_reseed_makes_masking_deterministic_and_epochs_distinct(
     import thesis_ml.train.loop as loop_module
 
     def run_and_capture(seed: int) -> list[torch.Tensor]:
-        """Run 2 epochs x 2 steps and record every corruption mask, in order."""
+        """Run 2 epochs x 2 steps and record every corruption branch, in order."""
 
         captured: list[torch.Tensor] = []
         real_corrupt_batch = corrupt_batch
 
         def spy_corrupt_batch(**kwargs):
             output = real_corrupt_batch(**kwargs)
-            captured.append(output.masked_positions.clone())
+            captured.append(output.corrupted_positions.clone())
             return output
 
         monkeypatch.setattr(loop_module, "corrupt_batch", spy_corrupt_batch)
@@ -158,7 +165,7 @@ def test_per_epoch_reseed_makes_masking_deterministic_and_epochs_distinct(
         loader = DataLoader(examples, batch_size=2, shuffle=False, collate_fn=_collate_pretrain)
         model = SC2StrategyDiffusionModel(config, vocab_size=128)
         loop = TrainingLoop(model=model, config=config, seed=seed)
-        # fixed_t=None so masking consumes the loop's own generator (the
+        # fixed_t=None so corruption consumes the loop's own generator (the
         # subject of the reseed); 2 batches/epoch x 2 epochs = 4 steps.
         loop.fit(loader, max_steps=4, epochs=2)
         monkeypatch.setattr(loop_module, "corrupt_batch", real_corrupt_batch)
@@ -168,11 +175,11 @@ def test_per_epoch_reseed_makes_masking_deterministic_and_epochs_distinct(
     second_run = run_and_capture(seed=123)
     assert len(first_run) == len(second_run) == 4
 
-    # 1. Same seed -> identical masking, step by step, across BOTH epochs.
+    # 1. Same seed -> identical corruption branches across BOTH epochs.
     for first_mask, second_mask in zip(first_run, second_run, strict=True):
         assert torch.equal(first_mask, second_mask)
 
-    # 2. Epoch 0 (steps 0-1) and epoch 1 (steps 2-3) draw DIFFERENT masks.
+    # 2. Epoch 0 and epoch 1 draw DIFFERENT corruption branches.
     epoch_zero = torch.cat([first_run[0], first_run[1]], dim=0)
     epoch_one = torch.cat([first_run[2], first_run[3]], dim=0)
     assert not torch.equal(epoch_zero, epoch_one)
@@ -193,36 +200,40 @@ def test_per_epoch_reseed_makes_masking_deterministic_and_epochs_distinct(
             replayed = corrupt_batch(
                 input_token_ids=batch.input_token_ids,
                 target_canvas=batch.target_canvas,
-                schedule=config.diffusion.mask_schedule,
+                process=config.diffusion.process,
+                schedule=config.diffusion.schedule,
+                vocab_size=128,
                 generator=replay_generator,
                 t=None,
             )
             recorded = first_run[epoch_index * 2 + step_in_epoch]
-            assert torch.equal(replayed.masked_positions, recorded)
+            assert torch.equal(replayed.corrupted_positions, recorded)
+            # The shared epoch generator also supplies the independent
+            # per-example self-conditioning gate after each corruption draw.
+            torch.rand(batch.target_canvas.shape[0], generator=replay_generator)
 
 
-def test_outcome_position_zero_is_masked_iid_and_scored_like_any_position(tmp_path: Path) -> None:
+def test_outcome_position_zero_is_noised_iid_and_scored_like_any_position(tmp_path: Path) -> None:
     """REGRESSION: canvas position 0 (the win/loss token) gets no training exemption.
 
-    Position 0 is masked iid at rate t exactly like every other canvas
+    Position 0 takes the corruption branch iid at rate t like every other canvas
     position and contributes to the loss with a NONZERO class weight in BOTH
-    training modes. `outcome_last` (denoise the outcome token last) is a
-    SAMPLER-only inference constraint -- nothing in corruption, scoring, or
-    loss weighting ever special-cases position 0 during training.
+    training modes. Nothing in corruption, scoring, loss weighting, or sampling
+    special-cases position 0.
     """
 
-    # t=1.0 masks EVERY canvas position -- including position 0.
+    # t=1.0 selects the corruption branch at every position, including position 0.
     config = _small_config(tmp_path)
     loop, batch = _loop_and_batch(config, seed=93)
     result = loop.compute_batch_loss(batch, fixed_t=1.0)
-    assert result.corruption.masked_positions[:, 0].all()
+    assert result.corruption.corrupted_positions[:, 0].all()
     assert result.scored_mask[:, 0].all()
     # The fixtures put CLASS_WINLOSS at position 0; its per-class loss is
     # therefore populated (it received loss like any other class).
     assert batch.class_labels[0, 0].item() == CLASS_WINLOSS
     assert "win-loss" in result.loss_output.per_class
 
-    # Its loss WEIGHT is nonzero in both modes (only [PAD] is ever zeroed).
+    # Its loss weight is nonzero in both modes; semantic [PAD] is also scored.
     from thesis_ml.model.loss import CanvasCrossEntropyLoss
 
     pretrain_weights = CanvasCrossEntropyLoss(config).class_weights
@@ -230,31 +241,77 @@ def test_outcome_position_zero_is_masked_iid_and_scored_like_any_position(tmp_pa
     assert pretrain_weights[CLASS_WINLOSS].item() > 0.0
     assert debut_weights[CLASS_WINLOSS].item() > 0.0
 
-    # And at intermediate t the mask at position 0 is a plain iid Bernoulli(t)
-    # draw: across many examples it is sometimes masked and sometimes not --
+    # And at intermediate t the corruption branch at position 0 is a plain iid
+    # Bernoulli(t) draw: across many examples it is sometimes selected and sometimes not --
     # never always-exempt (and never always-forced).
     generator = torch.Generator(device="cpu").manual_seed(7)
     target_canvas = torch.zeros((2_000, 4), dtype=torch.long)
     corrupted = corrupt_batch(
         input_token_ids=torch.zeros((2_000, 0), dtype=torch.long),
         target_canvas=target_canvas,
-        schedule=config.diffusion.mask_schedule,
+        process=config.diffusion.process,
+        schedule=config.diffusion.schedule,
+        vocab_size=128,
         generator=generator,
         t=0.5,
     )
-    position_zero_rate = float(corrupted.masked_positions[:, 0].float().mean())
+    position_zero_rate = float(corrupted.corrupted_positions[:, 0].float().mean())
     assert 0.4 <= position_zero_rate <= 0.6
 
 
-def test_training_scores_exactly_masked_canvas_positions(tmp_path: Path) -> None:
+def test_uniform_training_scores_every_valid_canvas_position(tmp_path: Path) -> None:
     config = _small_config(tmp_path)
     loop, batch = _loop_and_batch(config, seed=9)
 
     result = loop.compute_batch_loss(batch, fixed_t=0.5)
 
-    assert torch.equal(result.scored_mask, result.corruption.masked_positions)
-    assert not result.scored_mask[result.corruption.masked_positions.logical_not()].any()
+    assert torch.equal(result.scored_mask, batch.canvas_loss_mask)
+    assert result.scored_mask[result.corruption.corrupted_positions.logical_not()].any()
+    semantic_pad = batch.class_labels == CLASS_PAD
+    assert result.scored_mask[semantic_pad].all()
     assert result.canvas_logits.shape[1] == batch.target_canvas.shape[1]
+
+
+def test_uniform_replacement_can_equal_target_and_is_seed_reproducible() -> None:
+    config = _small_config()
+    target = torch.ones((64, 8), dtype=torch.long)
+    kwargs = {
+        "input_token_ids": torch.empty((64, 0), dtype=torch.long),
+        "target_canvas": target,
+        "process": "uniform",
+        "schedule": config.diffusion.schedule,
+        "vocab_size": 2,
+        "t": 1.0,
+    }
+    first = corrupt_batch(
+        **kwargs, generator=torch.Generator(device="cpu").manual_seed(44)
+    )
+    second = corrupt_batch(
+        **kwargs, generator=torch.Generator(device="cpu").manual_seed(44)
+    )
+    assert first.corrupted_positions.all()
+    assert not first.changed_positions.any()
+    assert torch.equal(first.noised_canvas, second.noised_canvas)
+    assert torch.equal(first.corrupted_positions, second.corrupted_positions)
+
+
+def test_absorbing_corruption_and_loss_retain_masked_inverse_time_objective(
+    tmp_path: Path,
+) -> None:
+    base = _small_config(tmp_path)
+    config = replace(base, diffusion=replace(base.diffusion, process="absorbing"))
+    loop, batch = _loop_and_batch(config, seed=15)
+    result = loop.compute_batch_loss(batch, fixed_t=0.5)
+
+    assert torch.equal(
+        result.scored_mask,
+        result.corruption.corrupted_positions & batch.canvas_loss_mask,
+    )
+    assert (result.corruption.noised_canvas[result.corruption.corrupted_positions] == 0).all()
+    assert torch.allclose(
+        result.corruption.position_weights,
+        inverse_t_weights(result.corruption.t, batch.target_canvas.shape[1]),
+    )
 
 
 def test_self_conditioning_training_uses_no_grad_estimate_then_grad_pass(tmp_path: Path) -> None:
@@ -271,7 +328,7 @@ def test_self_conditioning_training_uses_no_grad_estimate_then_grad_pass(tmp_pat
 
     result = loop.compute_batch_loss(batch, fixed_t=1.0)
 
-    assert result.self_conditioning_used is True
+    assert result.self_conditioning_mask.all()
     assert model.forward_records == [(False, False), (True, True)]
     assert loop.global_step == 0
     assert loop.optimizer.state_dict()["state"] == {}
@@ -291,7 +348,7 @@ def test_self_conditioning_off_uses_single_legacy_training_forward(tmp_path: Pat
 
     result = loop.compute_batch_loss(batch, fixed_t=1.0)
 
-    assert result.self_conditioning_used is False
+    assert not result.self_conditioning_mask.any()
     assert model.forward_records == [(True, False)]
 
 
@@ -344,7 +401,9 @@ def test_ema_tracks_training_and_validation_uses_ema_weights(tmp_path: Path) -> 
         for raw, ema in zip(loop.model.parameters(), loop.ema_model.parameters(), strict=True)
     )
 
+    loop.generator.manual_seed(900)
     validation = loop.validate([batch], fixed_t=1.0)
+    loop.generator.manual_seed(900)
     expected = loop.compute_batch_loss(batch, fixed_t=1.0, model=loop.ema_model)
     assert validation.loss == pytest.approx(float(expected.loss.detach()))
     assert validation.per_class
@@ -397,7 +456,7 @@ def test_seeded_smoke_runs_are_deterministic(tmp_path: Path) -> None:
     second = run_smoke_train(max_steps=5, seed=99, checkpoint_dir=tmp_path / "b")
 
     assert [log.loss for log in first] == pytest.approx([log.loss for log in second])
-    assert [log.masked_fraction for log in first] == pytest.approx([log.masked_fraction for log in second])
+    assert [log.noise_fraction for log in first] == pytest.approx([log.noise_fraction for log in second])
     assert [log.per_class for log in first] == [log.per_class for log in second]
 
 

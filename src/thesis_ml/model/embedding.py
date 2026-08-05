@@ -15,6 +15,7 @@ from thesis_ml.data.feature_stats import (
     STAT_KEYS,
     FeatureStatistics,
 )
+from thesis_ml.model.backbone import GeGLU, RMSNorm
 from thesis_ml.serialize import TokenRecord
 
 
@@ -111,7 +112,14 @@ class InputContextEmbedding(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
-        self.self_cond_projection = nn.Linear(vocab_size, d_model, bias=False) if self_conditioning else None
+        if self_conditioning:
+            self.self_cond_norm = RMSNorm(d_model)
+            self.self_cond_ffn = GeGLU(d_model, d_model)
+            self.self_cond_post_norm = RMSNorm(d_model, scale=False)
+        else:
+            self.self_cond_norm = None
+            self.self_cond_ffn = None
+            self.self_cond_post_norm = None
 
     def reset_joint_output(self) -> None:
         """Make the initialized joint branch exactly zero, preserving E."""
@@ -176,16 +184,19 @@ class InputContextEmbedding(nn.Module):
         canvas_self_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor:
         embeddings = self.token_embedding(canvas_token_ids)
-        if not self.self_conditioning or canvas_self_conditioning is None:
+        if not self.self_conditioning:
             return embeddings
-        expected_shape = (*canvas_token_ids.shape, self.vocab_size)
+        expected_shape = (*canvas_token_ids.shape, embeddings.shape[-1])
+        if canvas_self_conditioning is None:
+            canvas_self_conditioning = torch.zeros_like(embeddings)
         if tuple(canvas_self_conditioning.shape) != expected_shape:
             raise ValueError(
                 "canvas_self_conditioning must have shape "
                 f"{expected_shape}, got {tuple(canvas_self_conditioning.shape)}"
             )
-        projection = self.self_cond_projection(canvas_self_conditioning.to(dtype=embeddings.dtype))
-        return embeddings + projection
+        signal = canvas_self_conditioning.to(device=embeddings.device, dtype=embeddings.dtype)
+        residual = self.self_cond_ffn(self.self_cond_norm(signal))
+        return self.self_cond_post_norm(embeddings + residual)
 
 
 def _records_to_tensors(

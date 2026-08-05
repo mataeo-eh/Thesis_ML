@@ -67,24 +67,24 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
-class MaskScheduleConfig:
+class DiffusionScheduleConfig:
     name: str
     t_distribution: str
     min: float
     max: float
-    loss_reweight: str
     # Fraction of training examples that get OVERSAMPLED to t=1.0 exactly each
     # epoch, applied per-example as an independent Bernoulli draw (so this is
     # the fraction "in expectation", not an exact per-batch count). The
     # remaining (1 - t_one_fraction) of examples keep the existing uniform
     # draw over [min, max]. Must be a probability, so it is range-checked to
-    # [0, 1] by `_validate_mask_schedule` after the config tree is built.
+    # [0, 1] by `_validate_diffusion` after the config tree is built.
     t_one_fraction: float
 
 
 @dataclass(frozen=True)
 class DiffusionConfig:
-    mask_schedule: MaskScheduleConfig
+    process: str
+    schedule: DiffusionScheduleConfig
 
 
 @dataclass(frozen=True)
@@ -191,6 +191,7 @@ class TrainConfig:
 class TemperatureScheduleConfig:
     start: float
     end: float
+    exponent: float
 
 
 @dataclass(frozen=True)
@@ -198,13 +199,9 @@ class SamplerConfig:
     max_steps: int
     temperature: TemperatureScheduleConfig
     entropy_bound: float
-    confidence_threshold: float
-    min_commit_per_step: int
-    # Fine-tune sampler constraint (Worker 2). When True, the leading canvas
-    # position (index 0, the [WIN]/[LOSS] outcome token) is denoised LAST: it may
-    # only be committed after every other canvas position has been committed.
-    # Default False reproduces the pre-training sampler exactly.
-    outcome_last: bool
+    adaptive_stop: bool
+    entropy_threshold: float
+    stability_steps: int
 
 
 @dataclass(frozen=True)
@@ -276,7 +273,8 @@ def load_config(path: str | Path) -> ProjectConfig:
 
     raw = _load_config_mapping(Path(path).resolve(), stack=())
     config = _build_dataclass(ProjectConfig, raw, "config")
-    _validate_mask_schedule(config)
+    _validate_diffusion(config)
+    _validate_sampler(config)
     _validate_debut_mode_sections(config)
     return config
 
@@ -406,22 +404,50 @@ def _validate_value(expected_type: type[Any], value: Any, path: str) -> Any:
     raise TypeError(f"unsupported config field type at {path}: {expected_type!r}")
 
 
-def _validate_mask_schedule(config: ProjectConfig) -> None:
-    """Range-check `diffusion.mask_schedule.t_one_fraction`.
+def _validate_diffusion(config: ProjectConfig) -> None:
+    """Validate the process-neutral linear diffusion schedule."""
 
-    `_build_dataclass`/`_validate_value` only type-check scalar fields (int /
-    float / str / bool); they do not range-check values. t_one_fraction is a
-    per-example Bernoulli probability (the fraction of training examples that
-    get oversampled to t=1.0 each epoch), so it must land in [0, 1]. This is a
-    small, separate post-construction step -- not a general-purpose range-check
-    system -- kept deliberately minimal to match the existing validation style.
-    """
-
-    fraction = config.diffusion.mask_schedule.t_one_fraction
+    if config.diffusion.process not in {"uniform", "absorbing"}:
+        raise ConfigError(
+            "diffusion.process must be exactly 'uniform' or 'absorbing', "
+            f"got {config.diffusion.process!r}"
+        )
+    schedule = config.diffusion.schedule
+    if schedule.name != "linear":
+        raise ConfigError(f"diffusion.schedule.name must be 'linear', got {schedule.name!r}")
+    if schedule.t_distribution != "uniform":
+        raise ConfigError(
+            "diffusion.schedule.t_distribution must be 'uniform', "
+            f"got {schedule.t_distribution!r}"
+        )
+    if not (0.0 <= schedule.min <= schedule.max <= 1.0):
+        raise ConfigError(
+            "diffusion.schedule min/max must satisfy 0 <= min <= max <= 1, "
+            f"got min={schedule.min}, max={schedule.max}"
+        )
+    fraction = schedule.t_one_fraction
     if not (0.0 <= fraction <= 1.0):
         raise ConfigError(
-            f"diffusion.mask_schedule.t_one_fraction must be in [0, 1], got {fraction}"
+            f"diffusion.schedule.t_one_fraction must be in [0, 1], got {fraction}"
         )
+
+
+def _validate_sampler(config: ProjectConfig) -> None:
+    """Range-check entropy-bounded sampler settings."""
+
+    sampler = config.sampler
+    if not (1 <= sampler.max_steps <= 64):
+        raise ConfigError("sampler.max_steps must be in [1, 64]")
+    if sampler.temperature.start <= 0 or sampler.temperature.end <= 0:
+        raise ConfigError("sampler temperatures must be positive")
+    if sampler.temperature.exponent <= 0:
+        raise ConfigError("sampler.temperature.exponent must be positive")
+    if sampler.entropy_bound < 0:
+        raise ConfigError("sampler.entropy_bound must be non-negative")
+    if sampler.entropy_threshold < 0:
+        raise ConfigError("sampler.entropy_threshold must be non-negative")
+    if sampler.stability_steps < 1:
+        raise ConfigError("sampler.stability_steps must be at least 1")
 
 
 def _validate_debut_mode_sections(config: ProjectConfig) -> None:

@@ -92,8 +92,8 @@ def run_finetune_pipeline(
     Parameters:
         config_path: Path to the fine-tune YAML config (e.g.
             `configs/local_overfit_v2_finetune.yaml`). Must set
-            `data.debut_mode: true`, `sampler.outcome_last: true`, and a
-            non-empty `train.init_from_checkpoint`.
+            `data.debut_mode: true` and a non-empty
+            `train.init_from_checkpoint`.
         storage: Optional `StorageResolver` override (tests inject a fake).
         max_steps_override: When set, caps the number of optimizer steps
             regardless of the config's epoch/step budget -- used for a

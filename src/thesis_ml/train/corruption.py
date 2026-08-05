@@ -1,4 +1,4 @@
-"""Canvas-only absorbing-state corruption for MDLM/LLaDA training."""
+"""Canvas-only corruption for uniform diffusion and its absorbing ablation."""
 
 from __future__ import annotations
 
@@ -6,17 +6,19 @@ from dataclasses import dataclass
 
 import torch
 
-from thesis_ml.config import MaskScheduleConfig
+from thesis_ml.config import DiffusionScheduleConfig
 from thesis_ml.vocab.special_tokens import MASK_ID
 
 MIN_T = 1e-4
+SUPPORTED_PROCESSES = frozenset({"uniform", "absorbing"})
 
 
 @dataclass(frozen=True)
 class CorruptionOutput:
     input_token_ids: torch.Tensor
     noised_canvas: torch.Tensor
-    masked_positions: torch.Tensor
+    corrupted_positions: torch.Tensor
+    changed_positions: torch.Tensor
     t: torch.Tensor
     position_weights: torch.Tensor
 
@@ -25,108 +27,128 @@ def corrupt_batch(
     *,
     input_token_ids: torch.Tensor,
     target_canvas: torch.Tensor,
-    schedule: MaskScheduleConfig,
+    process: str,
+    schedule: DiffusionScheduleConfig,
+    vocab_size: int,
     generator: torch.Generator | None = None,
     t: torch.Tensor | float | None = None,
     mask_token_id: int = MASK_ID,
 ) -> CorruptionOutput:
-    """Apply linear MDLM/LLaDA absorbing-mask corruption to the canvas only.
+    """Apply the configured linear corruption process to the canvas only.
 
-    The project uses the LLaDA/MDLM linear masking objective: sample one global
-    masking level t per example, mask canvas positions iid with probability t,
-    and weight masked-position CE by approximately 1/t. The clamped input is
-    returned by reference and is never edited here.
-
-    When ``t`` is not supplied (the real training pipelines), a per-example
-    fraction of the batch is OVERSAMPLED to t=1.0 exactly -- see
-    `_resolve_t` for the exact mechanism. Callers that pass an explicit ``t``
-    (eval/validation/the sampler) are unaffected: oversampling only applies to
-    the "None" (uniform-schedule) path.
+    ``corrupted_positions`` records the Bernoulli corruption branch. In uniform
+    mode a sampled replacement may equal the target, so ``changed_positions``
+    separately records actual token inequality. The clamped input is returned
+    unchanged and is never noised.
     """
 
-    if schedule.name != "linear":
-        raise ValueError(f"unsupported mask schedule: {schedule.name}")
-    if schedule.t_distribution != "uniform":
-        raise ValueError(f"unsupported t distribution: {schedule.t_distribution}")
-    if schedule.loss_reweight != "inverse_t":
-        raise ValueError(f"unsupported loss reweighting: {schedule.loss_reweight}")
-
+    _validate_arguments(process, schedule, vocab_size, mask_token_id)
     sampled_t = _resolve_t(target_canvas, schedule, generator=generator, t=t)
     probabilities = sampled_t.unsqueeze(1).expand_as(target_canvas)
-    random = torch.rand(
+    branch_draw = torch.rand(
         target_canvas.shape,
         device=target_canvas.device,
         generator=generator,
     )
-    masked_positions = random < probabilities
-    noised_canvas = torch.where(masked_positions, torch.full_like(target_canvas, mask_token_id), target_canvas)
-    position_weights = inverse_t_weights(sampled_t, target_canvas.shape[1])
+    corrupted_positions = branch_draw < probabilities
+
+    if process == "uniform":
+        replacement = sample_uniform_non_mask(
+            target_canvas.shape,
+            vocab_size=vocab_size,
+            device=target_canvas.device,
+            generator=generator,
+        )
+        noised_canvas = torch.where(corrupted_positions, replacement, target_canvas)
+        position_weights = torch.ones_like(target_canvas, dtype=torch.float32)
+    else:
+        noised_canvas = torch.where(
+            corrupted_positions,
+            torch.full_like(target_canvas, mask_token_id),
+            target_canvas,
+        )
+        position_weights = inverse_t_weights(sampled_t, target_canvas.shape[1])
 
     return CorruptionOutput(
         input_token_ids=input_token_ids,
         noised_canvas=noised_canvas,
-        masked_positions=masked_positions,
+        corrupted_positions=corrupted_positions,
+        changed_positions=noised_canvas.ne(target_canvas),
         t=sampled_t,
         position_weights=position_weights,
     )
 
 
+def sample_uniform_non_mask(
+    shape: torch.Size | tuple[int, ...],
+    *,
+    vocab_size: int,
+    device: torch.device,
+    generator: torch.Generator | None,
+) -> torch.Tensor:
+    """Draw independent vocabulary states from ``[1, vocab_size)``."""
+
+    if vocab_size <= 1:
+        raise ValueError("vocab_size must include at least one non-[MASK] state")
+    return torch.randint(
+        1,
+        vocab_size,
+        shape,
+        device=device,
+        generator=generator,
+    )
+
+
 def inverse_t_weights(t: torch.Tensor, canvas_len: int) -> torch.Tensor:
-    """Return the linear MDLM/LLaDA per-position schedule weight."""
+    """Return absorbing diffusion's inverse-time per-position weight."""
 
     return (1.0 / t.clamp_min(MIN_T)).unsqueeze(1).expand(-1, canvas_len)
 
 
+def _validate_arguments(
+    process: str,
+    schedule: DiffusionScheduleConfig,
+    vocab_size: int,
+    mask_token_id: int,
+) -> None:
+    if process not in SUPPORTED_PROCESSES:
+        raise ValueError(f"unsupported diffusion process: {process!r}")
+    if schedule.name != "linear":
+        raise ValueError(f"unsupported diffusion schedule: {schedule.name}")
+    if schedule.t_distribution != "uniform":
+        raise ValueError(f"unsupported t distribution: {schedule.t_distribution}")
+    if mask_token_id != 0:
+        raise ValueError("uniform diffusion requires [MASK] to be vocabulary id zero")
+    if vocab_size <= 1:
+        raise ValueError("vocab_size must include at least one non-[MASK] state")
+
+
 def _resolve_t(
     target_canvas: torch.Tensor,
-    schedule: MaskScheduleConfig,
+    schedule: DiffusionScheduleConfig,
     *,
     generator: torch.Generator | None,
     t: torch.Tensor | float | None,
 ) -> torch.Tensor:
-    """Resolve the per-example masking level t used by `corrupt_batch`.
+    """Resolve one global noise level per example.
 
-    Three cases, in priority order:
-      1. ``t is None`` (the real training pipelines): this is where t=1.0
-         OVERSAMPLING happens. Each example independently draws a
-         Bernoulli(``schedule.t_one_fraction``) coin; examples that "win"
-         that coin flip get t forced to exactly 1.0 (fully masked canvas),
-         regardless of where their uniform draw landed. Every other example
-         keeps the existing behavior: t drawn uniformly over
-         ``[schedule.min, schedule.max]``. This makes t_one_fraction the
-         EXPECTED oversampled fraction per epoch (a per-example Bernoulli,
-         not an exact per-batch quota). Both the Bernoulli draw and the
-         uniform draw consume the caller's ``generator`` so a fixed seed
-         reproduces training exactly.
-      2. ``t`` is a tensor: used directly (explicit-t callers -- eval,
-         validation, the sampler -- bypass oversampling entirely).
-      3. ``t`` is a plain float: broadcast to every example in the batch
-         (also bypasses oversampling).
-
-    In every case the returned t is clamped to ``MIN_T`` so `inverse_t_weights`
-    never divides by (near) zero; this clamp is a no-op for the oversampled
-    t=1.0 examples since 1.0 is already far above MIN_T.
+    Exact-``t=1`` oversampling applies only to ordinary training calls where
+    ``t`` is omitted. Explicit diagnostic and validation values are used
+    exactly, including ``t=0``.
     """
 
     batch_size = target_canvas.shape[0]
     device = target_canvas.device
     if t is None:
-        # Step 1: per-example Bernoulli(t_one_fraction) selects which examples
-        # get t forced to exactly 1.0 this epoch (oversampling), independent
-        # of the uniform schedule draw in step 2.
-        oversample_draw = torch.rand(batch_size, device=device, generator=generator)
-        oversampled = oversample_draw < schedule.t_one_fraction
-
-        # Step 2: existing behavior, unchanged -- draw t uniformly over
-        # [schedule.min, schedule.max] for every example. This is still what
-        # determines t for the examples NOT selected for oversampling above.
         uniform_draw = torch.rand(batch_size, device=device, generator=generator)
-        uniform_t = schedule.min + uniform_draw * (schedule.max - schedule.min)
-
-        # Step 3: wherever the Bernoulli coin selected oversampling, overwrite
-        # the uniform draw with exactly 1.0; everywhere else, keep the
-        # uniform draw as before.
-        sampled = torch.where(oversampled, torch.ones_like(uniform_t), uniform_t)
+        sampled = schedule.min + uniform_draw * (schedule.max - schedule.min)
+        if schedule.t_one_fraction > 0.0:
+            oversample_draw = torch.rand(batch_size, device=device, generator=generator)
+            sampled = torch.where(
+                oversample_draw < schedule.t_one_fraction,
+                torch.ones_like(sampled),
+                sampled,
+            )
     elif isinstance(t, torch.Tensor):
         sampled = t.to(device=device, dtype=torch.float32)
         if sampled.ndim == 0:
@@ -136,4 +158,6 @@ def _resolve_t(
 
     if sampled.shape != (batch_size,):
         raise ValueError(f"t must be scalar or shape ({batch_size},), got {tuple(sampled.shape)}")
-    return sampled.clamp_min(MIN_T)
+    if not bool(((sampled >= 0.0) & (sampled <= 1.0)).all()):
+        raise ValueError("t must be in [0, 1]")
+    return sampled

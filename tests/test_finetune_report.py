@@ -29,7 +29,6 @@ from thesis_ml.data.dataset import (
 from thesis_ml.eval.buildorder import BuildOrderEvent
 from thesis_ml.eval.finetune_report import (
     _absolute_timing_diffs,
-    _denoise_last_ok,
     _example_fog_rate,
     assemble_finetune_report,
     build_debut_report,
@@ -127,11 +126,13 @@ def _example() -> DatasetExample:
 class FixedCanvasModel(nn.Module):
     """Stub model that makes the sampler reproduce ``target_canvas`` exactly."""
 
-    def __init__(self, target_canvas: torch.Tensor, *, vocab_size: int, top_logit: float = 8.0) -> None:
+    def __init__(self, target_canvas: torch.Tensor, *, vocab_size: int, top_logit: float = 50.0) -> None:
         super().__init__()
         self.register_buffer("target_canvas", target_canvas.clone())
         self.vocab_size = vocab_size
         self.top_logit = top_logit
+        self.embedding = nn.Module()
+        self.embedding.token_embedding = nn.Embedding(vocab_size, 32)
 
     def forward(
         self,
@@ -158,7 +159,9 @@ def _config():
         config,
         data=replace(config.data, input_budget_tokens=64, canvas_budget_tokens=CANVAS_BUDGET),
         model=replace(config.model, d_model=32, layers=1, heads=4, ffn=64),
-        sampler=replace(config.sampler, max_steps=4, entropy_bound=100.0),
+        sampler=replace(
+            config.sampler, max_steps=4, entropy_bound=100.0, adaptive_stop=False
+        ),
         eval=replace(config.eval, timing_tolerance_buckets=1),
     )
 
@@ -210,7 +213,6 @@ def test_section_has_all_required_nested_keys() -> None:
     # Structural booleans present and typed.
     structural = section["win_loss_structural"]
     assert isinstance(structural["position0_ok"], bool)
-    assert isinstance(structural["denoise_last_ok"], bool)
 
 
 def test_section_values_on_perfect_generation() -> None:
@@ -339,29 +341,3 @@ def test_fog_rate_definition() -> None:
     )
     # 3 fogged / (3 fogged + 1 observed) = 0.75.
     assert _example_fog_rate(example) == pytest.approx(0.75)
-
-
-# ---------------------------------------------------------------------------
-# Denoise-last structural helper
-# ---------------------------------------------------------------------------
-
-
-def _fake_trace(commit_steps: list[list[bool]]):
-    """Build a fake sampler trace from a list of per-step commit masks."""
-
-    return [
-        SimpleNamespace(step=index + 1, committed_this_step=torch.tensor([mask], dtype=torch.bool))
-        for index, mask in enumerate(commit_steps)
-    ]
-
-
-def test_denoise_last_ok_true_when_outcome_committed_last() -> None:
-    # Step 1 commits positions 1 and 2; step 2 commits position 0 (outcome last).
-    trace = _fake_trace([[False, True, True], [True, False, False]])
-    assert _denoise_last_ok(trace) is True
-
-
-def test_denoise_last_ok_false_when_outcome_committed_early() -> None:
-    # Step 1 commits position 0 (outcome first); step 2 commits the rest.
-    trace = _fake_trace([[True, False, False], [False, True, True]])
-    assert _denoise_last_ok(trace) is False

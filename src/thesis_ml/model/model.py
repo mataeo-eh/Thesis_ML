@@ -1,4 +1,4 @@
-"""Assembled SC2 masked-diffusion transformer model."""
+"""Assembled SC2 clean-state diffusion transformer model."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from thesis_ml.config import ProjectConfig
 from thesis_ml.data.feature_stats import FeatureStatistics
 from thesis_ml.model.backbone import BidirectionalTransformer, RMSNorm
 from thesis_ml.model.embedding import InputContextEmbedding, InputFeatures
+
+ARCHITECTURE_ID = "uniform-gemma4-dense-v1"
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,9 @@ class SC2StrategyDiffusionModel(nn.Module):
                 f"got {model_config.rope_scaling.rope_type!r}"
             )
         self.self_conditioning = model_config.self_conditioning
+        self.vocab_size = vocab_size
+        self.architecture_identity = ARCHITECTURE_ID
+        self.diffusion_process = config.diffusion.process
         statistics = feature_statistics or FeatureStatistics.identity_for_tests()
         self.feature_statistics_identity = statistics.identity
         # Enabling QK-norm or self-conditioning changes the architecture; pre-009 checkpoints need retraining.
@@ -101,7 +106,8 @@ class SC2StrategyDiffusionModel(nn.Module):
                 if isinstance(module, nn.Linear) and module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, RMSNorm):
-                nn.init.ones_(module.weight)
+                if module.weight is not None:
+                    nn.init.ones_(module.weight)
 
 
 def _combine_attention_masks(
@@ -117,7 +123,36 @@ def _combine_attention_masks(
     return torch.cat([input_attention_mask.to(torch.bool), canvas_attention_mask.to(torch.bool)], dim=1)
 
 
-def canvas_self_conditioning_from_logits(canvas_logits: torch.Tensor) -> torch.Tensor:
-    """Convert prior clean-canvas logits to the shared self-conditioning tensor form."""
+def canvas_self_conditioning_from_logits(
+    canvas_logits: torch.Tensor,
+    token_embedding_weight: torch.Tensor,
+    *,
+    probabilities: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Convert a stopped clean-state distribution to expected token embeddings."""
 
-    return torch.softmax(canvas_logits.float(), dim=-1).detach()
+    probs = torch.softmax(canvas_logits.float(), dim=-1) if probabilities is None else probabilities.float()
+    return torch.matmul(probs.detach(), token_embedding_weight.detach().float()).detach()
+
+
+def validate_checkpoint_compatibility(
+    checkpoint: dict,
+    model: nn.Module,
+    checkpoint_path: str,
+) -> None:
+    """Fail closed on retired or cross-process checkpoint metadata."""
+
+    expected_architecture = getattr(model, "architecture_identity", None)
+    observed_architecture = checkpoint.get("architecture_identity")
+    if observed_architecture != expected_architecture:
+        raise ValueError(
+            f"checkpoint {checkpoint_path} architecture identity mismatch: "
+            f"expected {expected_architecture!r}, got {observed_architecture!r}"
+        )
+    expected_process = getattr(model, "diffusion_process", None)
+    observed_process = checkpoint.get("diffusion_process")
+    if observed_process != expected_process:
+        raise ValueError(
+            f"checkpoint {checkpoint_path} diffusion process mismatch: "
+            f"expected {expected_process!r}, got {observed_process!r}"
+        )

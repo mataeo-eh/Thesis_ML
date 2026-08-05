@@ -23,7 +23,7 @@ model:
   heads: 4
   ffn: 1024
   qk_norm: true
-  self_conditioning: false
+  self_conditioning: true
   gradient_checkpointing: false
   rope_theta: 500000.0
   rope_scaling:
@@ -34,16 +34,16 @@ model:
     original_max_position_embeddings: 8192
 
 diffusion:
-  mask_schedule:
+  process: uniform
+  schedule:
     name: linear
     t_distribution: uniform
     min: 0.0
     max: 1.0
-    loss_reweight: inverse_t
     # Fraction of examples per epoch (per-example Bernoulli, in expectation)
     # oversampled to t=1.0 exactly. Applies to both pre-training and
     # fine-tuning pipelines.
-    t_one_fraction: 0.1
+    t_one_fraction: 0.0
 
 storage:
   data_uri: data/processed/quickstart
@@ -107,8 +107,8 @@ train:
   checkpoint_dir: checkpoints
   keep_step_checkpoints: false
   ema_decay: 0.9999
-  confidence_loss_weight: 0.1
-  self_cond_prob: 0.0
+  confidence_loss_weight: 0.0
+  self_cond_prob: 0.5
   precision: bf16
   require_cuda: false
   max_cuda_reserved_gb: 0.0
@@ -119,14 +119,15 @@ train:
   init_from_checkpoint: ""
 
 sampler:
-  max_steps: 48
+  max_steps: 64
   temperature:
     start: 0.8
     end: 0.4
+    exponent: 1.0
   entropy_bound: 0.1
-  confidence_threshold: 0.0
-  min_commit_per_step: 1
-  outcome_last: false
+  adaptive_stop: true
+  entropy_threshold: 0.005
+  stability_steps: 2
 
 eval:
   heldout_split: validation

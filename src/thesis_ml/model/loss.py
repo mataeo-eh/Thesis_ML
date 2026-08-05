@@ -65,13 +65,13 @@ FUTURE_DISTANCE_BUCKETS = {
 }
 
 # t-bucket loss-breakdown names, in the canonical order used for CSV columns.
-# Each training/eval example's sampled masking level t (from the corruption
+# Each training/eval example's sampled noise level t (from the corruption
 # step) lands in EXACTLY ONE of these contiguous, exhaustive buckets over [0, 1]:
 #   t == 1.0            -> "t_eq_1"
 #   0.7 <= t < 1.0      -> "t_0_7_to_1_0"
 #   0.5 <= t < 0.7      -> "t_0_5_to_0_7"
 #   0.3 <= t < 0.5      -> "t_0_3_to_0_5"
-#   0.0 <= t < 0.3      -> "t_0_0_to_0_3"  (MIN_T clamping keeps t > 0, still here)
+#   0.0 <= t < 0.3      -> "t_0_0_to_0_3"
 # Emitted in BOTH pre-training and fine-tuning.
 T_BUCKET_NAMES = (
     "t_eq_1",
@@ -97,7 +97,7 @@ class LossOutput:
     per_class: dict[str, torch.Tensor]
     future_distance: dict[str, torch.Tensor]
     future_distance_counts: dict[str, int]
-    # Masked-CE broken down by the example's sampled t-bucket and by the
+    # Clean-state CE broken down by the example's sampled t-bucket and by the
     # example's player perspective. Both follow the SAME emptiness convention as
     # ``per_class``: a bucket/perspective with zero scored tokens is simply
     # ABSENT from the dict (no key), rather than present-with-a-sentinel.
@@ -140,14 +140,8 @@ class CanvasCrossEntropyLoss(nn.Module):
             class_weights[CLASS_END] = weights.end
             class_weights[CLASS_PAD] = weights.pad
             class_weights[CLASS_WINLOSS] = weights.win_loss
-        else:
-            # Pre-training: fully uniform, published-MDLM-style loss weighting --
-            # 1.0 for every class (already the buffer's fill value) except PAD,
-            # which is zeroed so padding positions never contribute. NOTE: we
-            # deliberately do NOT read config.loss.class_loss_weights here; it is
-            # None for pre-training configs (per-class weights are a
-            # fine-tuning-only concern per config validation).
-            class_weights[CLASS_PAD] = 0.0
+        # Pre-training leaves every class at 1.0, including semantic [PAD].
+        # Batch-shape padding is excluded by the caller's scored mask.
         self.register_buffer("class_weights", class_weights)
 
     def forward(
@@ -197,7 +191,7 @@ class CanvasCrossEntropyLoss(nn.Module):
 
         # t-bucket breakdown (BOTH pipelines). Each example's single sampled t
         # (shape [B]) assigns ALL that example's scored canvas positions to one
-        # bucket; the masked-CE mean is then taken over every scored position in
+        # bucket; the clean-state CE mean is then taken over every scored position in
         # that bucket across the batch. Empty buckets are omitted (per_class
         # convention). See T_BUCKET_NAMES for the exact, exhaustive boundaries.
         t_bucket: dict[str, torch.Tensor] = {}

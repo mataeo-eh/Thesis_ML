@@ -1,10 +1,9 @@
-"""Confidence-based iterative denoising sampler."""
+"""Process-compatible entropy-bounded clean-state sampling."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Sequence
 
 import torch
 from torch import nn
@@ -12,8 +11,11 @@ from torch import nn
 from thesis_ml.config import ProjectConfig
 from thesis_ml.data.collate import DiffusionBatch
 from thesis_ml.model.embedding import InputFeatures
-from thesis_ml.model.model import canvas_self_conditioning_from_logits
-from thesis_ml.train.corruption import corrupt_batch
+from thesis_ml.model.model import (
+    canvas_self_conditioning_from_logits,
+    validate_checkpoint_compatibility,
+)
+from thesis_ml.train.corruption import corrupt_batch, sample_uniform_non_mask
 from thesis_ml.vocab.special_tokens import MASK_ID
 
 
@@ -21,8 +23,15 @@ from thesis_ml.vocab.special_tokens import MASK_ID
 class SamplerStep:
     step: int
     temperature: float
-    committed_this_step: torch.Tensor
-    committed_mask: torch.Tensor
+    accepted_mask: torch.Tensor
+    unaccepted_mask: torch.Tensor
+    renoised_mask: torch.Tensor
+    entropy: torch.Tensor
+    mean_entropy: torch.Tensor
+    argmax_predictions: torch.Tensor
+    argmax_stable: torch.Tensor
+    done_rows: torch.Tensor
+    stop_reasons: tuple[str | None, ...]
     canvas: torch.Tensor
 
 
@@ -31,63 +40,58 @@ class SamplerOutput:
     canvas: torch.Tensor
     input_token_ids: torch.Tensor
     initial_input_token_ids: torch.Tensor
-    committed_mask: torch.Tensor
+    accepted_mask: torch.Tensor
+    done_rows: torch.Tensor
+    stop_reasons: tuple[str, ...]
     steps: int
     trace: list[SamplerStep]
     final_canvas_logits: torch.Tensor | None = None
-    # Per-position provenance of the returned canvas: True where the position was
-    # REVEALED as ground truth (handed to the model, never predicted) and False
-    # where the MODEL predicted it. Under the default `mask_rate=1.0` the whole
-    # canvas is model-predicted, so this is all False. Downstream tooling (e.g.
-    # the diagnostics text dumps) uses it to flag truth-vs-model per token.
     revealed_mask: torch.Tensor | None = None
 
 
-def _partial_mask_canvas(
+def _initial_canvas(
     batch: DiffusionBatch,
     config: ProjectConfig,
     *,
-    mask_rate: float,
+    noise_rate: float,
+    vocab_size: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Seed a canvas masked at ``mask_rate``, revealing the rest as ground truth.
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the selected process's prior/infill state and clamping masks."""
 
-    Reuses the training-time corruption (``train.corruption.corrupt_batch``) at a
-    FIXED masking level ``t = mask_rate``, so the starting canvas is exactly the
-    ``t = mask_rate`` point on the same LLaDA/MDLM absorbing-mask schedule the
-    model was trained on: every canvas position is independently masked with
-    probability ``mask_rate`` and every unmasked position keeps its ground-truth
-    token from ``batch.target_canvas``. The RNG is seeded from
-    ``config.pipeline.seed`` so the reveal pattern is reproducible across runs.
+    if not 0.0 <= noise_rate <= 1.0:
+        raise ValueError("noise_rate must be in [0, 1]")
+    target = batch.target_canvas.to(device)
+    eligible = batch.canvas_loss_mask.to(device=device, dtype=torch.bool)
+    if noise_rate == 1.0:
+        if config.diffusion.process == "uniform":
+            prior = _sample_uniform_at_positions(
+                target,
+                eligible,
+                vocab_size=vocab_size,
+                generator=generator,
+            )
+        else:
+            prior = torch.full_like(target, MASK_ID)
+        canvas = torch.where(eligible, prior, target)
+        revealed = torch.zeros_like(eligible)
+        mutable = eligible
+        return canvas, revealed, mutable
 
-    Parameters:
-        batch: the collated batch; ``target_canvas`` supplies the ground-truth
-            tokens revealed at unmasked positions.
-        config: project config; ``diffusion.mask_schedule`` selects the corruption
-            schedule and ``pipeline.seed`` seeds the mask RNG.
-        mask_rate: masking level ``t`` in ``[0, 1]``; the fraction of positions
-            (in expectation) that are masked and left for the model to predict.
-        device: device to build the canvas / RNG on.
-
-    Returns:
-        ``(start_canvas, masked_positions)``, both shape ``(batch, canvas_len)``,
-        where ``masked_positions`` is True at positions the MODEL must predict and
-        False at positions revealed as ground truth.
-
-    Calls:
-        ``train.corruption.corrupt_batch``.
-    """
-
-    generator = torch.Generator(device=device)
-    generator.manual_seed(config.pipeline.seed)
     corruption = corrupt_batch(
         input_token_ids=batch.input_token_ids.to(device),
-        target_canvas=batch.target_canvas.to(device),
-        schedule=config.diffusion.mask_schedule,
+        target_canvas=target,
+        process=config.diffusion.process,
+        schedule=config.diffusion.schedule,
+        vocab_size=vocab_size,
         generator=generator,
-        t=mask_rate,
+        t=noise_rate,
     )
-    return corruption.noised_canvas, corruption.masked_positions
+    mutable = corruption.corrupted_positions & eligible
+    revealed = eligible & ~corruption.corrupted_positions
+    canvas = torch.where(eligible, corruption.noised_canvas, target)
+    return canvas, revealed, mutable
 
 
 @torch.no_grad()
@@ -98,81 +102,54 @@ def denoise_canvas_once(
     *,
     device: torch.device | str = "cpu",
     return_final_logits: bool = False,
-    mask_rate: float = 1.0,
+    noise_rate: float = 1.0,
 ) -> SamplerOutput:
-    """Predict a partially-masked canvas with exactly one denoising forward pass.
-
-    ``mask_rate`` selects the point on the training corruption schedule to start
-    from:
-
-      * ``mask_rate = 1.0`` (the DEFAULT) is the ``t=1`` endpoint -- an all-[MASK]
-        canvas where the argmax prediction commits every position at once. This
-        is byte-for-byte the original behavior and needs no ``target_canvas``.
-      * ``mask_rate < 1.0`` masks only that fraction of the canvas (reproducing
-        the ``t = mask_rate`` training point via ``_partial_mask_canvas``) and
-        reveals the rest as ground truth. The single forward pass then predicts
-        the masked positions; revealed positions keep their true token.
-
-    Either way there is no confidence gating, iterative refinement, or
-    self-conditioning estimate pass. This is intentionally a diagnostics path
-    rather than a replacement for normal iterative sampling.
-    """
+    """Run exactly one denoiser pass from the selected process's prior."""
 
     active_device = torch.device(device)
     model = model.to(active_device)
     model.eval()
+    generator = _make_generator(active_device, config.pipeline.seed)
     input_token_ids = batch.input_token_ids.to(active_device)
-    input_attention_mask = batch.input_attention_mask.to(active_device)
-    input_features = batch.input_features
-    if input_features is not None:
-        input_features = InputFeatures(
-            continuous_values=input_features.continuous_values.to(active_device),
-            allegiance_values=input_features.allegiance_values.to(active_device),
-            feature_mask=input_features.feature_mask.to(active_device),
-        )
     initial_input = input_token_ids.clone()
-    if mask_rate >= 1.0:
-        # t=1 endpoint: the whole canvas is masked and every position is
-        # predicted by the model in this one pass (the original behavior).
-        canvas = torch.full(
-            (input_token_ids.shape[0], config.data.canvas_budget_tokens),
-            MASK_ID,
-            dtype=torch.long,
-            device=active_device,
-        )
-        masked_positions = torch.ones_like(canvas, dtype=torch.bool)
-    else:
-        # Partial-mask diagnostic: mask only `mask_rate` of the canvas and reveal
-        # the rest as ground truth, reproducing the t=`mask_rate` training point.
-        canvas, masked_positions = _partial_mask_canvas(
-            batch, config, mask_rate=mask_rate, device=active_device
-        )
-    forward_kwargs = {
-        "input_token_ids": input_token_ids,
-        "canvas_token_ids": canvas,
-        "input_attention_mask": input_attention_mask,
-        "canvas_attention_mask": torch.ones_like(canvas, dtype=torch.bool),
-        "input_features": input_features,
-    }
-    if config.model.self_conditioning:
-        forward_kwargs["canvas_self_conditioning"] = None
-    output = model(**forward_kwargs)
+    vocab_size = int(getattr(model, "vocab_size"))
+    canvas, revealed, mutable = _initial_canvas(
+        batch,
+        config,
+        noise_rate=noise_rate,
+        vocab_size=vocab_size,
+        device=active_device,
+        generator=generator,
+    )
+    output = model(
+        input_token_ids=input_token_ids,
+        canvas_token_ids=canvas,
+        input_attention_mask=batch.input_attention_mask.to(active_device),
+        canvas_attention_mask=batch.canvas_attention_mask.to(active_device),
+        input_features=_move_input_features(batch.input_features, active_device),
+        canvas_self_conditioning=None if config.model.self_conditioning else None,
+    )
     canvas_logits = output.logits[:, input_token_ids.shape[1] :, :]
-    predicted = canvas_logits.argmax(dim=-1)
-    # Masked positions take the model's argmax; positions revealed as ground truth
-    # keep their true token (they were handed to the model, not predicted). Under
-    # the default all-mask start every position is model-predicted.
-    final_canvas = torch.where(masked_positions, predicted, canvas)
-    revealed = ~masked_positions
-    # Every position is finalized in this single pass, so the whole canvas is
-    # "committed" whether it was model-predicted or revealed as ground truth.
-    committed = torch.ones_like(predicted, dtype=torch.bool)
+    probs = _allowed_probabilities(canvas_logits)
+    predicted = probs.argmax(dim=-1)
+    final_canvas = torch.where(mutable, predicted, canvas)
+    entropy = _entropy(probs)
+    mean_entropy = _row_mean(entropy, mutable)
+    done_rows = torch.ones(input_token_ids.shape[0], dtype=torch.bool, device=active_device)
+    accepted = mutable
     trace = [
         SamplerStep(
             step=1,
             temperature=1.0,
-            committed_this_step=committed.detach().cpu(),
-            committed_mask=committed.detach().cpu(),
+            accepted_mask=accepted.detach().cpu(),
+            unaccepted_mask=torch.zeros_like(accepted).cpu(),
+            renoised_mask=torch.zeros_like(accepted).cpu(),
+            entropy=entropy.detach().cpu(),
+            mean_entropy=mean_entropy.detach().cpu(),
+            argmax_predictions=predicted.detach().cpu(),
+            argmax_stable=torch.zeros_like(done_rows).cpu(),
+            done_rows=done_rows.cpu(),
+            stop_reasons=tuple("single_pass" for _ in range(input_token_ids.shape[0])),
             canvas=final_canvas.detach().cpu(),
         )
     ]
@@ -180,7 +157,9 @@ def denoise_canvas_once(
         canvas=final_canvas.detach().cpu(),
         input_token_ids=input_token_ids.detach().cpu(),
         initial_input_token_ids=initial_input.detach().cpu(),
-        committed_mask=committed.detach().cpu(),
+        accepted_mask=accepted.detach().cpu(),
+        done_rows=done_rows.cpu(),
+        stop_reasons=tuple("single_pass" for _ in range(input_token_ids.shape[0])),
         steps=1,
         trace=trace,
         final_canvas_logits=canvas_logits.detach().cpu() if return_final_logits else None,
@@ -196,163 +175,200 @@ def sample_canvas(
     *,
     device: torch.device | str = "cpu",
     return_final_logits: bool = False,
-    mask_rate: float = 1.0,
+    noise_rate: float = 1.0,
 ) -> SamplerOutput:
-    """Denoise a (partly) masked canvas by monotonic confidence-based commits.
-
-    Each step runs the model over the current (partly masked) canvas, then commits
-    the most-confident still-masked positions. Committed positions are never
-    remasked, so the canvas fills in monotonically until every position is set.
-
-    ``mask_rate`` selects the initial canvas:
-
-      * ``mask_rate = 1.0`` (the DEFAULT) starts from an all-[MASK] canvas with
-        nothing committed -- byte-for-byte the original sampling behavior.
-      * ``mask_rate < 1.0`` reveals ``(1 - mask_rate)`` of the ground-truth canvas
-        as pre-committed context (an infill diagnostic) and samples only the
-        masked positions. Because the revealed positions start committed they are
-        removed from the commit-candidate set, keep their true token, and are
-        never re-predicted.
-
-    Fine-tune constraint (`config.sampler.outcome_last`): when True, canvas
-    position 0 holds the win/loss outcome token and is forced to denoise LAST. It
-    is excluded from the commit candidates until every other position `[1:]` is
-    committed, then force-committed with the model's prediction (ignoring the
-    confidence/entropy gates so sampling cannot stall). When the flag is False the
-    behavior is byte-for-byte identical to the pre-training sampler.
-    """
+    """Sample with nonmonotonic uniform EB or monotonic absorbing EB."""
 
     active_device = torch.device(device)
     model = model.to(active_device)
     model.eval()
+    generator = _make_generator(active_device, config.pipeline.seed)
     input_token_ids = batch.input_token_ids.to(active_device)
     input_attention_mask = batch.input_attention_mask.to(active_device)
+    canvas_attention_mask = batch.canvas_attention_mask.to(active_device)
+    input_features = _move_input_features(batch.input_features, active_device)
     initial_input = input_token_ids.clone()
-
     batch_size = input_token_ids.shape[0]
-    if mask_rate >= 1.0:
-        # Standard sampling: start from an all-[MASK] canvas with nothing
-        # committed, exactly as before.
-        canvas = torch.full(
-            (batch_size, config.data.canvas_budget_tokens),
-            MASK_ID,
-            dtype=torch.long,
-            device=active_device,
-        )
-        committed = torch.zeros_like(canvas, dtype=torch.bool)
-        revealed = torch.zeros_like(canvas, dtype=torch.bool)
-    else:
-        # Infill diagnostic: reveal (1 - mask_rate) of the ground-truth canvas as
-        # pre-committed context and let the sampler fill only the masked
-        # positions. Pre-committing the revealed positions removes them from the
-        # commit-candidate set (`selectable = ~committed`), so they keep their
-        # true token and are never re-predicted.
-        canvas, masked_positions = _partial_mask_canvas(
-            batch, config, mask_rate=mask_rate, device=active_device
-        )
-        revealed = ~masked_positions
-        committed = revealed.clone()
+    vocab_size = int(getattr(model, "vocab_size"))
+    canvas, revealed, mutable = _initial_canvas(
+        batch,
+        config,
+        noise_rate=noise_rate,
+        vocab_size=vocab_size,
+        device=active_device,
+        generator=generator,
+    )
+
+    done_rows = ~mutable.any(dim=1)
+    stop_reasons: list[str | None] = [
+        "no_eligible" if bool(done_rows[row]) else None for row in range(batch_size)
+    ]
+    previous_argmax: torch.Tensor | None = None
+    stable_counts = torch.zeros(batch_size, dtype=torch.long, device=active_device)
     canvas_self_conditioning: torch.Tensor | None = None
+    accepted = torch.zeros_like(mutable)
     trace: list[SamplerStep] = []
 
     for step_index in range(config.sampler.max_steps):
+        if bool(done_rows.all()):
+            break
+        active_rows = ~done_rows
         temperature = sampler_temperature(config, step_index)
-        forward_kwargs = {
-            "input_token_ids": input_token_ids,
-            "canvas_token_ids": canvas,
-            "input_attention_mask": input_attention_mask,
-            "canvas_attention_mask": torch.ones_like(canvas, dtype=torch.bool),
-            "input_features": batch.input_features,
-        }
-        if config.model.self_conditioning:
-            forward_kwargs["canvas_self_conditioning"] = canvas_self_conditioning
-        output = model(**forward_kwargs)
-        raw_canvas_logits = output.logits[:, input_token_ids.shape[1] :, :]
-        canvas_logits = raw_canvas_logits / temperature
-        probs = torch.softmax(canvas_logits, dim=-1)
-        if config.model.self_conditioning:
-            canvas_self_conditioning = canvas_self_conditioning_from_logits(raw_canvas_logits)
-        confidence, predicted = probs.max(dim=-1)
-        entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
-
-        # Candidate set for this step: every position that is still masked.
-        # `selectable` is what we allow `_select_commits` to consider. When the
-        # fine-tune constraint `config.sampler.outcome_last` is OFF this is
-        # exactly `~committed`, so the pre-training sampling path is unchanged.
-        selectable = ~committed
-        if config.sampler.outcome_last:
-            # Outcome-last constraint (Worker 2): canvas position 0 holds the
-            # [WIN]/[LOSS] outcome token and must denoise LAST. Remove position 0
-            # from the candidate set for any row whose remaining positions `[1:]`
-            # are not yet fully committed. `rest_all_committed` is computed from
-            # `committed` BEFORE this step's commits, so on the step that finishes
-            # `[1:]`, position 0 is still not selectable here (it is force-committed
-            # below on that same step instead).
-            rest_all_committed = committed[:, 1:].all(dim=1)  # shape (batch,)
-            selectable = selectable.clone()
-            selectable[:, 0] = selectable[:, 0] & rest_all_committed
-
-        commit_mask = _select_commits(
-            entropy=entropy,
-            confidence=confidence,
-            masked=selectable,
-            entropy_bound=config.sampler.entropy_bound,
-            confidence_threshold=config.sampler.confidence_threshold,
-            min_commit_per_step=config.sampler.min_commit_per_step,
+        output = model(
+            input_token_ids=input_token_ids,
+            canvas_token_ids=canvas,
+            input_attention_mask=input_attention_mask,
+            canvas_attention_mask=canvas_attention_mask,
+            input_features=input_features,
+            canvas_self_conditioning=canvas_self_conditioning
+            if config.model.self_conditioning
+            else None,
         )
+        raw_canvas_logits = output.logits[:, input_token_ids.shape[1] :, :]
+        probs = _allowed_probabilities(raw_canvas_logits / temperature)
+        entropy = _entropy(probs)
+        argmax_predictions = probs.argmax(dim=-1)
 
-        if config.sampler.outcome_last:
-            # Guarantee the outcome token commits. Once a row's `[1:]` positions
-            # are ALL committed (looking at this step's commits via
-            # `committed | commit_mask`), force-commit position 0 using the
-            # model's own prediction, bypassing the confidence/entropy gates in
-            # `_select_commits` so sampling can never stall on the final token.
-            # Because `_select_commits` above never selects position 0 (it was
-            # cleared from `selectable`), this force path is the only way the
-            # outcome token is ever committed under the flag, so it is always the
-            # last position to transition from masked -> committed. This also
-            # covers the max_steps edge case: if `[1:]` finishes on the final
-            # allowed step, the outcome token still commits on that same step.
-            rest_done_after_step = (committed | commit_mask)[:, 1:].all(dim=1)
-            outcome_still_masked = ~(committed | commit_mask)[:, 0]
-            force_outcome = rest_done_after_step & outcome_still_masked  # (batch,)
-            commit_mask[:, 0] = commit_mask[:, 0] | force_outcome
+        same_as_previous = torch.zeros(batch_size, dtype=torch.bool, device=active_device)
+        if previous_argmax is not None:
+            same_as_previous = active_rows & (
+                (argmax_predictions == previous_argmax) | ~mutable
+            ).all(dim=1)
+        stable_counts = torch.where(
+            active_rows,
+            torch.where(
+                same_as_previous,
+                stable_counts + 1,
+                torch.ones_like(stable_counts),
+            ),
+            stable_counts,
+        )
+        argmax_stable = stable_counts >= config.sampler.stability_steps
+        if previous_argmax is None:
+            previous_argmax = argmax_predictions.detach()
+        else:
+            previous_argmax = torch.where(
+                active_rows[:, None],
+                argmax_predictions.detach(),
+                previous_argmax,
+            )
 
-        canvas = torch.where(commit_mask, predicted, canvas)
-        committed = committed | commit_mask
+        if config.diffusion.process == "uniform":
+            selectable = mutable & active_rows[:, None]
+            candidates = _sample_categorical_at_positions(
+                probs,
+                selectable,
+                fallback=canvas,
+                generator=generator,
+            )
+            accepted = _entropy_bounded_acceptance(
+                entropy,
+                selectable,
+                config.sampler.entropy_bound,
+            )
+            unaccepted = selectable & ~accepted
+            fresh_noise = _sample_uniform_at_positions(
+                canvas,
+                selectable,
+                vocab_size=vocab_size,
+                generator=generator,
+            )
+            canvas = torch.where(
+                accepted,
+                candidates,
+                torch.where(unaccepted, fresh_noise, canvas),
+            )
+            renoised = unaccepted
+            mean_entropy = _row_mean(entropy, mutable)
+            if config.sampler.adaptive_stop:
+                newly_done = (
+                    active_rows
+                    & (mean_entropy < config.sampler.entropy_threshold)
+                    & argmax_stable
+                )
+                for row in torch.nonzero(newly_done, as_tuple=False).flatten().tolist():
+                    stop_reasons[row] = "adaptive_entropy_stability"
+                done_rows = done_rows | newly_done
+        else:
+            selectable = mutable & canvas.eq(MASK_ID) & active_rows[:, None]
+            candidates = _sample_categorical_at_positions(
+                probs,
+                selectable,
+                fallback=canvas,
+                generator=generator,
+            )
+            accepted = _entropy_bounded_acceptance(
+                entropy,
+                selectable,
+                config.sampler.entropy_bound,
+            )
+            unaccepted = selectable & ~accepted
+            renoised = torch.zeros_like(unaccepted)
+            canvas = torch.where(accepted, candidates, canvas)
+            mean_entropy = _row_mean(entropy, selectable)
+            newly_done = active_rows & ~(mutable & canvas.eq(MASK_ID)).any(dim=1)
+            for row in torch.nonzero(newly_done, as_tuple=False).flatten().tolist():
+                stop_reasons[row] = "absorbing_complete"
+            done_rows = done_rows | newly_done
+
+        if config.model.self_conditioning:
+            next_self_conditioning = canvas_self_conditioning_from_logits(
+                raw_canvas_logits,
+                model.embedding.token_embedding.weight,
+                probabilities=probs,
+            )
+            if canvas_self_conditioning is None:
+                canvas_self_conditioning = torch.zeros_like(next_self_conditioning)
+            canvas_self_conditioning = torch.where(
+                active_rows[:, None, None],
+                next_self_conditioning,
+                canvas_self_conditioning,
+            )
+
         trace.append(
             SamplerStep(
                 step=step_index + 1,
                 temperature=temperature,
-                committed_this_step=commit_mask.detach().cpu(),
-                committed_mask=committed.detach().cpu(),
+                accepted_mask=accepted.detach().cpu(),
+                unaccepted_mask=unaccepted.detach().cpu(),
+                renoised_mask=renoised.detach().cpu(),
+                entropy=entropy.detach().cpu(),
+                mean_entropy=mean_entropy.detach().cpu(),
+                argmax_predictions=argmax_predictions.detach().cpu(),
+                argmax_stable=argmax_stable.detach().cpu(),
+                done_rows=done_rows.detach().cpu(),
+                stop_reasons=tuple(stop_reasons),
                 canvas=canvas.detach().cpu(),
             )
         )
-        if committed.all():
-            break
+
+    for row, reason in enumerate(stop_reasons):
+        if reason is None:
+            stop_reasons[row] = "max_steps"
+    if trace:
+        trace[-1] = replace(trace[-1], stop_reasons=tuple(stop_reasons))
 
     final_canvas_logits = None
     if return_final_logits:
-        # Diagnostics need logits conditioned on the completed output canvas,
-        # not the pre-commit logits from the sampler's last denoising step.
-        final_forward_kwargs = {
-            "input_token_ids": input_token_ids,
-            "canvas_token_ids": canvas,
-            "input_attention_mask": input_attention_mask,
-            "canvas_attention_mask": torch.ones_like(canvas, dtype=torch.bool),
-            "input_features": batch.input_features,
-        }
-        if config.model.self_conditioning:
-            final_forward_kwargs["canvas_self_conditioning"] = canvas_self_conditioning
-        final_output = model(**final_forward_kwargs)
+        final_output = model(
+            input_token_ids=input_token_ids,
+            canvas_token_ids=canvas,
+            input_attention_mask=input_attention_mask,
+            canvas_attention_mask=canvas_attention_mask,
+            input_features=input_features,
+            canvas_self_conditioning=canvas_self_conditioning
+            if config.model.self_conditioning
+            else None,
+        )
         final_canvas_logits = final_output.logits[:, input_token_ids.shape[1] :, :].detach().cpu()
 
     return SamplerOutput(
         canvas=canvas.detach().cpu(),
         input_token_ids=input_token_ids.detach().cpu(),
         initial_input_token_ids=initial_input.detach().cpu(),
-        committed_mask=committed.detach().cpu(),
+        accepted_mask=accepted.detach().cpu(),
+        done_rows=done_rows.detach().cpu(),
+        stop_reasons=tuple(str(reason) for reason in stop_reasons),
         steps=len(trace),
         trace=trace,
         final_canvas_logits=final_canvas_logits,
@@ -365,52 +381,124 @@ def sampler_temperature(config: ProjectConfig, step_index: int) -> float:
     if max_steps == 1:
         return float(config.sampler.temperature.end)
     progress = min(1.0, step_index / float(max_steps - 1))
+    shaped_progress = progress ** config.sampler.temperature.exponent
     start = config.sampler.temperature.start
     end = config.sampler.temperature.end
-    return float(start + (end - start) * progress)
+    return float(start + (end - start) * shaped_progress)
 
 
-def load_sampling_checkpoint(model: nn.Module, checkpoint_path: str | Path, *, device: torch.device | str = "cpu") -> nn.Module:
-    """Load EMA weights for sampling when present, falling back to raw weights."""
+def load_sampling_checkpoint(
+    model: nn.Module,
+    checkpoint_path: str | Path,
+    *,
+    device: torch.device | str = "cpu",
+) -> nn.Module:
+    """Load compatible EMA weights for sampling."""
 
-    checkpoint = torch.load(Path(checkpoint_path), map_location=device, weights_only=False)
+    path = Path(checkpoint_path)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    validate_checkpoint_compatibility(checkpoint, model, str(path))
     expected = getattr(model, "feature_statistics_identity", None)
     observed = checkpoint.get("feature_statistics_identity")
     if not isinstance(observed, str) or observed != expected:
-        raise ValueError(
-            f"checkpoint {Path(checkpoint_path)} feature statistics are missing or incompatible"
-        )
-    state = checkpoint.get("ema_model", checkpoint["model"])
-    model.load_state_dict(state)
+        raise ValueError(f"checkpoint {path} feature statistics are missing or incompatible")
+    if "ema_model" not in checkpoint:
+        raise ValueError(f"checkpoint {path} has no EMA weights and is incompatible")
+    model.load_state_dict(checkpoint["ema_model"])
     return model
 
 
-def _select_commits(
+def _allowed_probabilities(logits: torch.Tensor) -> torch.Tensor:
+    allowed_logits = logits.float().clone()
+    allowed_logits[..., MASK_ID] = -torch.inf
+    return torch.softmax(allowed_logits, dim=-1)
+
+
+def _sample_categorical_at_positions(
+    probabilities: torch.Tensor,
+    eligible: torch.Tensor,
     *,
-    entropy: torch.Tensor,
-    confidence: torch.Tensor,
-    masked: torch.Tensor,
-    entropy_bound: float,
-    confidence_threshold: float,
-    min_commit_per_step: int,
+    fallback: torch.Tensor,
+    generator: torch.Generator,
 ) -> torch.Tensor:
-    selected = torch.zeros_like(masked, dtype=torch.bool)
-    for row in range(masked.shape[0]):
-        candidates = torch.nonzero(masked[row], as_tuple=False).flatten()
-        if candidates.numel() == 0:
+    """Sample candidates only at mutable positions, preserving all others."""
+
+    sampled = fallback.clone()
+    if bool(eligible.any()):
+        sampled[eligible] = torch.multinomial(
+            probabilities[eligible],
+            num_samples=1,
+            replacement=True,
+            generator=generator,
+        ).squeeze(1)
+    return sampled
+
+
+def _sample_uniform_at_positions(
+    fallback: torch.Tensor,
+    eligible: torch.Tensor,
+    *,
+    vocab_size: int,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Draw uniform non-mask states only at mutable positions."""
+
+    sampled = fallback.clone()
+    count = int(eligible.sum().item())
+    if count:
+        sampled[eligible] = sample_uniform_non_mask(
+            (count,),
+            vocab_size=vocab_size,
+            device=fallback.device,
+            generator=generator,
+        )
+    return sampled
+
+
+def _entropy(probabilities: torch.Tensor) -> torch.Tensor:
+    return -(probabilities * torch.log(probabilities.clamp_min(1e-12))).sum(dim=-1)
+
+
+def _entropy_bounded_acceptance(
+    entropy: torch.Tensor,
+    eligible: torch.Tensor,
+    entropy_bound: float,
+) -> torch.Tensor:
+    """Accept the exact prefix where prior cumulative entropy is within gamma."""
+
+    accepted = torch.zeros_like(eligible, dtype=torch.bool)
+    for row in range(eligible.shape[0]):
+        indices = torch.nonzero(eligible[row], as_tuple=False).flatten()
+        if indices.numel() == 0:
             continue
-        candidates = candidates[torch.argsort(entropy[row, candidates])]
-        cumulative = 0.0
-        committed_count = 0
-        for index in candidates.tolist():
-            if confidence[row, index].item() < confidence_threshold:
-                continue
-            next_entropy = float(entropy[row, index].item())
-            within_budget = cumulative + next_entropy <= entropy_bound
-            need_minimum = committed_count < min_commit_per_step
-            if not within_budget and not need_minimum:
-                break
-            selected[row, index] = True
-            cumulative += next_entropy
-            committed_count += 1
-    return selected
+        order = torch.argsort(entropy[row, indices], stable=True)
+        sorted_indices = indices[order]
+        sorted_entropy = entropy[row, sorted_indices]
+        prefix = torch.cumsum(sorted_entropy, dim=0) - sorted_entropy
+        accepted[row, sorted_indices[prefix <= entropy_bound]] = True
+    return accepted
+
+
+def _row_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    counts = mask.sum(dim=1)
+    totals = (values * mask.to(values.dtype)).sum(dim=1)
+    return torch.where(counts > 0, totals / counts.clamp_min(1), torch.zeros_like(totals))
+
+
+def _move_input_features(
+    features: InputFeatures | None,
+    device: torch.device,
+) -> InputFeatures | None:
+    if features is None:
+        return None
+    return InputFeatures(
+        continuous_values=features.continuous_values.to(device),
+        allegiance_values=features.allegiance_values.to(device),
+        feature_mask=features.feature_mask.to(device),
+    )
+
+
+def _make_generator(device: torch.device, seed: int) -> torch.Generator:
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    return generator

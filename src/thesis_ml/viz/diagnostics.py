@@ -26,13 +26,11 @@ It reuses, and never re-implements, every stage of the pipeline:
     ``sample_canvas`` and can explicitly use one-pass denoising through
     ``--bypass-sampler`` before the shared decode/oracle stages).
 
-The ``--output-mask`` flag controls how masked the output canvas starts: the
-fraction ``t`` of canvas positions the model must predict, with the remaining
-``1 - t`` revealed as ground truth (the same LLaDA/MDLM corruption the training
-pipeline applies at that ``t``). It accepts several rates and runs inference once
-per rate (default ``0.5`` -- the pre-training average; ``1.0`` -- fully masked, the
-previous behavior). It composes with either prediction path: without
-``--bypass-sampler`` the iterative sampler infills the masked positions; with it,
+The ``--output-noise`` flag controls the output canvas noise level ``t``. The
+remaining ``1 - t`` positions are revealed as ground truth through the selected
+uniform or absorbing corruption process. It accepts several rates and runs
+inference once per rate. It composes with either prediction path: without
+``--bypass-sampler`` the iterative sampler infills the noised positions; with it,
 a single forward pass does. The predicted-canvas JSON export flags each
 token as MODEL (predicted) or TRUTH (revealed) for readability.
 
@@ -48,7 +46,7 @@ combined multi-page PDF); ``--csv`` and ``--json`` independently enable a
 side-by-side prediction-vs-truth comparison CSV and final-canvas logit exports,
 and ``--show-input`` dumps model input canvases (self vs enemy tokens marked)
 alongside the other artifacts. Non-image exports consolidate multiple windows
-into one labelled CSV/text/JSON artifact per output-mask directory.
+into one labelled CSV/text/JSON artifact per output-noise directory.
 """
 
 from __future__ import annotations
@@ -82,7 +80,10 @@ from thesis_ml.data.windowing import (  # noqa: E402
 from thesis_ml.eval.buildorder import BuildOrderEvent  # noqa: E402
 from thesis_ml.eval.harness import EvaluationExampleResult, evaluate_example  # noqa: E402
 from thesis_ml.inference.timing import TimedTimestep  # noqa: E402
-from thesis_ml.model.model import SC2StrategyDiffusionModel  # noqa: E402
+from thesis_ml.model.model import (  # noqa: E402
+    SC2StrategyDiffusionModel,
+    validate_checkpoint_compatibility,
+)
 from thesis_ml.vocab.content_vocab import ContentVocabulary, load_content_vocabulary  # noqa: E402
 from thesis_ml.vocab.special_tokens import SPECIAL_TOKENS  # noqa: E402
 
@@ -104,16 +105,16 @@ class RenderedExample:
             sets this module renders.
         label: a short human-readable identifier (replay id / perspective /
             window start) used in figure titles and output filenames.
-        output_mask: the output-canvas mask rate ``t`` this example was rendered
-            at (fraction of the canvas masked / model-predicted; the rest revealed
-            as ground truth). Shown in figure titles so a reader can tell which
-            ``--output-mask`` value produced the figure. ``1.0`` = fully masked.
+        output_noise: the output-canvas noise rate ``t`` this example was rendered
+            at (corruption probability; the complement is revealed as ground
+            truth). Shown in figure titles so a reader can tell which
+            ``--output-noise`` value produced the figure. ``1.0`` = terminal prior.
     """
 
     example: DatasetExample
     result: EvaluationExampleResult
     label: str
-    output_mask: float = 1.0
+    output_noise: float = 1.0
 
 
 def load_diagnostic_model(
@@ -194,6 +195,7 @@ def load_diagnostic_model(
         vocab_size=vocab_size,
         feature_statistics=statistics,
     )
+    validate_checkpoint_compatibility(checkpoint, model, str(Path(checkpoint_path)))
     model.load_state_dict(state)
     model.eval()
     return model, run_config
@@ -325,7 +327,7 @@ def evaluate_selected(
     device: torch.device | str,
     include_canvas_logits: bool = False,
     bypass_sampler: bool = False,
-    mask_rate: float = 1.0,
+    noise_rate: float = 1.0,
 ) -> list[RenderedExample]:
     """Run the existing harness once per example and keep the intermediates.
 
@@ -333,9 +335,9 @@ def evaluate_selected(
     and the single build-order oracle on both sides). No pipeline logic is
     duplicated here.
 
-    ``mask_rate`` is the output-canvas mask level ``t`` passed straight through to
-    the harness/sampler: the fraction of the canvas masked (model-predicted) with
-    the remainder revealed as ground truth. It is stored on each
+    ``noise_rate`` is the output-canvas noise level ``t`` passed straight through to
+    the harness/sampler: the corruption probability, with the remainder revealed
+    as ground truth. It is stored on each
     ``RenderedExample`` so figure titles can show which value produced them.
     """
 
@@ -349,14 +351,14 @@ def evaluate_selected(
             device=device,
             include_canvas_logits=include_canvas_logits,
             bypass_sampler=bypass_sampler,
-            mask_rate=mask_rate,
+            noise_rate=noise_rate,
         )
         rendered.append(
             RenderedExample(
                 example=example,
                 result=result,
                 label=_label(example, index),
-                output_mask=mask_rate,
+                output_noise=noise_rate,
             )
         )
     return rendered
@@ -488,7 +490,7 @@ def plot_count_comparison(rendered: RenderedExample):
     height = min(30.0, max(8.0, 5.0 + len(entity_types) * 0.72))
     figure, axes = plt.subplots(3, 1, figsize=(width, height), sharex=True, sharey=True)
 
-    mask_tag = f"mask t={rendered.output_mask:.2f}"
+    mask_tag = f"noise t={rendered.output_noise:.2f}"
     if not entity_types or not buckets:
         axis = axes[0]
         axis.text(0.5, 0.5, "no decoded timesteps\n(prediction invalid?)", ha="center", va="center")
@@ -604,7 +606,7 @@ def plot_mean_abs_diff_heatmap(rendered: Sequence[RenderedExample]):
     axis.set_yticklabels(ordered_types, fontsize=9)
     axis.set_xlabel("timestep bucket (model resolution)")
     axis.set_ylabel("entity type")
-    mask_tag = f"mask t={rendered[0].output_mask:.2f}" if rendered else "mask t=?"
+    mask_tag = f"noise t={rendered[0].output_noise:.2f}" if rendered else "noise t=?"
     axis.set_title(
         f"mean |predicted - ground-truth| over {len(per_example)} window(s)  ({mask_tag})"
     )
@@ -669,7 +671,7 @@ def plot_first_appearance_timeline(rendered: RenderedExample, *, tolerance_bucke
     width = min(40.0, max(width, 0.28 * (max_bucket + 2 * tolerance_buckets + 2)))
     figure, axis = plt.subplots(figsize=(width, height))
 
-    mask_tag = f"mask t={rendered.output_mask:.2f}"
+    mask_tag = f"noise t={rendered.output_noise:.2f}"
     if not entity_types:
         axis.text(0.5, 0.5, "no build-order events", ha="center", va="center")
         axis.set_axis_off()
@@ -853,14 +855,14 @@ def write_canvas_comparison_csv_files(
       * ``groundtruth`` -- the human-readable name of the ground-truth token at
         that position.
       * ``correct`` -- ``True`` if the model predicted the token correctly,
-        ``False`` if it predicted the wrong token, or ``Unmasked`` if the
-        position was never masked (revealed as ground truth under
-        ``--output-mask`` < 1.0, i.e. handed to the model unchanged and so not
+        ``False`` if it predicted the wrong token, or ``Revealed`` if the
+        position was clamped to ground truth under
+        ``--output-noise`` < 1.0, i.e. handed to the model unchanged and so not
         actually predicted).
 
     The correctness test compares the raw token ids (not the resolved names) so
     it is exact even if two distinct ids ever mapped to the same display name.
-    ``Unmasked`` positions are reported distinctly rather than as ``True`` so a
+    ``Revealed`` positions are reported distinctly rather than as ``True`` so a
     reader never mistakes a revealed token for a genuine model prediction.
 
     Parameters:
@@ -897,16 +899,16 @@ def write_canvas_comparison_csv_files(
         writer = csv.writer(handle)
         writer.writerow(header)
         for item in rendered:
-            # Which positions were revealed as ground truth (unmasked) rather
-            # than predicted by the model. Same provenance the JSON export uses.
+            # Which positions were revealed as ground truth rather than predicted
+            # by the model. Same provenance the JSON export uses.
             revealed = item.result.predicted_canvas_revealed_mask
             for index, (predicted_id, truth_id) in enumerate(
                 zip(item.result.predicted_canvas, item.result.ground_truth_canvas)
             ):
-                # Unmasked positions were never predicted, so they are neither a
+                # Revealed positions were never predicted, so they are neither a
                 # correct nor an incorrect model call -- flag them distinctly.
                 if index < len(revealed) and revealed[index]:
-                    correctness: bool | str = "Unmasked"
+                    correctness: bool | str = "Revealed"
                 else:
                     correctness = predicted_id == truth_id
                 row: list[object] = [
@@ -1038,7 +1040,7 @@ def write_logits_json(
                 {
                     "sequence_index": index,
                     # MODEL = predicted by the model; TRUTH = revealed ground truth
-                    # (an unmasked position under --output-mask < 1.0).
+                    # (a revealed position under --output-noise < 1.0).
                     "source": "TRUTH" if index < len(revealed) and revealed[index] else "MODEL",
                     "predicted_token": _token_name(predicted_id, vocabulary),
                     "predicted_token_id": predicted_id,
@@ -1081,7 +1083,7 @@ def run(
     write_first_appearance: bool = False,
     bypass_sampler: bool = False,
     use_raw: bool = False,
-    output_masks: Sequence[float] = (0.5,),
+    output_noises: Sequence[float] = (0.5,),
 ) -> list[Path]:
     """Full read-only render: ingest -> load weights -> evaluate -> plot -> save.
 
@@ -1089,14 +1091,14 @@ def run(
     condition from config (``config.eval.fog_rate``). ``use_raw`` selects the raw
     model weights instead of the default EMA weights.
 
-    ``output_masks`` is one or more output-canvas mask rates ``t`` in ``[0, 1]``:
-    the fraction of the canvas masked (model-predicted), with the remainder
+    ``output_noises`` is one or more output-canvas noise rates ``t`` in ``[0, 1]``:
+    the corruption probability, with the remainder
     revealed as ground truth. Ingestion and weight loading happen ONCE; the model
-    is then evaluated and rendered once per mask rate. With a single rate the
+    is then evaluated and rendered once per noise rate. With a single rate the
     artifacts are written flat into ``out_dir`` (the original layout); with two or
-    more rates each rate's artifacts go under an ``output_mask_<t>/`` subdirectory
+    more rates each rate's artifacts go under an ``output_noise_<t>/`` subdirectory
     so the sweeps never collide. The default ``(0.5,)`` is the pre-training average
-    mask rate (``t ~ U(0, 1)``). Returns every written path across all rates.
+    noise rate (``t ~ U(0, 1)``). Returns every written path across all rates.
     """
 
     user_config = load_config(config_path)
@@ -1116,7 +1118,7 @@ def run(
     )
     print(f"loaded {'RAW' if use_raw else 'EMA'} weights from {Path(checkpoint)}", flush=True)
 
-    # Ingest the replays ONCE; every mask rate re-uses the same examples so the
+    # Ingest the replays ONCE; every noise rate reuses the same examples so the
     # only per-rate work is the (cheap relative to ingestion) evaluate + render.
     run_config, vocabulary, examples = ingest_examples(
         model_config,
@@ -1128,15 +1130,15 @@ def run(
         manifest_path=manifest_path,
     )
 
-    mask_rates = list(output_masks) if output_masks else [0.5]
+    noise_rates = list(output_noises) if output_noises else [0.5]
     # A single rate stays flat in out_dir (original layout); multiple rates are
     # split into per-rate subdirectories so their figures/text/json never clash.
-    nest_per_rate = len(mask_rates) > 1
+    nest_per_rate = len(noise_rates) > 1
     written: list[Path] = []
-    for mask_rate in mask_rates:
-        target_dir = out_path / f"output_mask_{mask_rate:.2f}" if nest_per_rate else out_path
+    for noise_rate in noise_rates:
+        target_dir = out_path / f"output_noise_{noise_rate:.2f}" if nest_per_rate else out_path
         target_dir.mkdir(parents=True, exist_ok=True)
-        print(f"rendering output-mask t={mask_rate:.2f} -> {target_dir}", flush=True)
+        print(f"rendering output-noise t={noise_rate:.2f} -> {target_dir}", flush=True)
         rendered = evaluate_selected(
             model,
             examples,
@@ -1145,7 +1147,7 @@ def run(
             device=torch_device,
             include_canvas_logits=write_json,
             bypass_sampler=bypass_sampler,
-            mask_rate=mask_rate,
+            noise_rate=noise_rate,
         )
         written.extend(
             render_figures(
@@ -1214,21 +1216,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument(
         "--bypass-sampler",
         action="store_true",
-        help="replace iterative sampling with one denoising forward pass (per --output-mask rate)",
+        help="replace iterative sampling with one denoising forward pass (per --output-noise rate)",
     )
     parser.add_argument(
-        "--output-mask",
+        "--output-noise",
         type=float,
         nargs="+",
         default=[0.5],
         metavar="RATE",
         help=(
-            "output-canvas mask rate(s) t in [0,1]: the fraction of the canvas "
-            "masked (model-predicted); the rest is revealed as ground truth. Pass "
-            "several to run inference once per rate, e.g. --output-mask 0.4 0.9 1.0 "
-            "(each rate's artifacts land in its own output_mask_<t>/ subdir). "
-            "Default 0.5 = the pre-training average mask rate (t~U(0,1)); 1.0 = "
-            "fully masked (the previous behavior)"
+            "output-canvas noise rate(s) t in [0,1]: per-position corruption "
+            "probability; the rest is revealed as ground truth. Pass "
+            "several to run inference once per rate, e.g. --output-noise 0.4 0.9 1.0 "
+            "(each rate's artifacts land in its own output_noise_<t>/ subdir). "
+            "Default 0.5 = the pre-training average noise rate (t~U(0,1)); 1.0 = "
+            "the configured process's terminal prior"
         ),
     )
     parser.add_argument(
@@ -1241,11 +1243,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    # Reject nonsensical mask rates early with a clear message rather than letting
+    # Reject nonsensical noise rates early with a clear message rather than letting
     # them silently degrade inside the corruption schedule.
-    for rate in args.output_mask:
+    for rate in args.output_noise:
         if not 0.0 <= rate <= 1.0:
-            parser.error(f"--output-mask values must be in [0, 1]; got {rate}")
+            parser.error(f"--output-noise values must be in [0, 1]; got {rate}")
 
     written = run(
         checkpoint=args.checkpoint,
@@ -1263,7 +1265,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         write_first_appearance=args.first_appearance,
         bypass_sampler=args.bypass_sampler,
         use_raw=args.raw,
-        output_masks=args.output_mask,
+        output_noises=args.output_noise,
     )
     print(f"wrote {len(written)} file(s) to {args.out_dir}:")
     for path in written:

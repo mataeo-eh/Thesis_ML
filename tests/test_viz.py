@@ -179,11 +179,11 @@ def test_optional_canvas_and_logit_exports_preserve_raw_positions(tmp_path: Path
     assert rows[1]["modelprediction"] == "marine"
     assert rows[1]["groundtruth"] == "barracks"
     assert rows[1]["correct"] == "False"
-    # Position 0 was revealed as ground truth (unmasked), not predicted, so it is
-    # flagged Unmasked rather than True even though the tokens match.
+    # Position 0 was revealed as ground truth, not predicted, so it is
+    # flagged Revealed rather than True even though the tokens match.
     assert rows[0]["sequenceindex"] == "0"
-    assert rows[0]["correct"] == "Unmasked"
-    # Position 2 was masked and predicted correctly (END on both sides) -> True.
+    assert rows[0]["correct"] == "Revealed"
+    # Position 2 was noised and predicted correctly (END on both sides) -> True.
     assert rows[2]["correct"] == "True"
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     position = payload["examples"][0]["positions"][1]
@@ -375,13 +375,13 @@ def _cli_base_args(tmp_path: Path) -> list[str]:
     ]
 
 
-def test_cli_output_mask_defaults_to_pretraining_average(monkeypatch, tmp_path: Path):
-    """Omitting --output-mask yields the single pre-training average rate (0.5)."""
+def test_cli_output_noise_defaults_to_pretraining_average(monkeypatch, tmp_path: Path):
+    """Omitting --output-noise yields the single pretraining average rate."""
 
     captured: dict[str, object] = {}
     monkeypatch.setattr(diagnostics, "run", lambda **kwargs: captured.update(kwargs) or [])
     diagnostics.main(_cli_base_args(tmp_path))
-    assert captured["output_masks"] == [0.5]
+    assert captured["output_noises"] == [0.5]
 
 
 def test_cli_window_count_is_per_replay(monkeypatch, tmp_path: Path):
@@ -395,29 +395,30 @@ def test_cli_window_count_is_per_replay(monkeypatch, tmp_path: Path):
     assert "n" not in captured
 
 
-def test_cli_output_mask_threads_multiple_rates(monkeypatch, tmp_path: Path):
-    """Several --output-mask values thread through as an ordered list of rates."""
+def test_cli_output_noise_threads_multiple_rates(monkeypatch, tmp_path: Path):
+    """Several --output-noise values thread through as an ordered list."""
 
     captured: dict[str, object] = {}
     monkeypatch.setattr(diagnostics, "run", lambda **kwargs: captured.update(kwargs) or [])
-    diagnostics.main(_cli_base_args(tmp_path) + ["--output-mask", "0.9", "1.0", "0.4"])
-    assert captured["output_masks"] == [0.9, 1.0, 0.4]
+    diagnostics.main(_cli_base_args(tmp_path) + ["--output-noise", "0.9", "1.0", "0.4"])
+    assert captured["output_noises"] == [0.9, 1.0, 0.4]
 
 
-def test_cli_output_mask_rejects_out_of_range(monkeypatch, tmp_path: Path):
+def test_cli_output_noise_rejects_out_of_range(monkeypatch, tmp_path: Path):
     """A rate outside [0, 1] is rejected before any work runs."""
 
     monkeypatch.setattr(diagnostics, "run", lambda **kwargs: [])
     with pytest.raises(SystemExit):
-        diagnostics.main(_cli_base_args(tmp_path) + ["--output-mask", "1.5"])
+        diagnostics.main(_cli_base_args(tmp_path) + ["--output-noise", "1.5"])
 
 
-def test_bypass_sampler_uses_exactly_one_all_mask_forward():
+def test_bypass_sampler_uses_exactly_one_uniform_prior_forward():
     class CountingModel(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.calls = 0
             self.seen_canvas = None
+            self.vocab_size = 128
 
         def forward(self, *, input_token_ids, canvas_token_ids, **kwargs):
             self.calls += 1
@@ -433,10 +434,15 @@ def test_bypass_sampler_uses_exactly_one_all_mask_forward():
         input_token_ids=torch.tensor([[100, 101]]),
         input_attention_mask=torch.ones(1, 2, dtype=torch.bool),
         input_features=None,
+        target_canvas=torch.tensor([[10, 11, 12]]),
+        canvas_attention_mask=torch.ones(1, 3, dtype=torch.bool),
+        canvas_loss_mask=torch.ones(1, 3, dtype=torch.bool),
     )
     config = SimpleNamespace(
         data=SimpleNamespace(canvas_budget_tokens=3),
         model=SimpleNamespace(self_conditioning=True),
+        pipeline=SimpleNamespace(seed=0),
+        diffusion=SimpleNamespace(process="uniform"),
     )
 
     output = denoise_canvas_once(
@@ -448,20 +454,24 @@ def test_bypass_sampler_uses_exactly_one_all_mask_forward():
     )
 
     assert model.calls == 1
-    assert torch.all(model.seen_canvas == MASK_ID)
+    assert torch.all(model.seen_canvas != MASK_ID)
     assert output.steps == 1
-    assert output.committed_mask.all()
+    assert output.accepted_mask.all()
     assert output.final_canvas_logits is not None
     assert output.final_canvas_logits.shape == (1, 3, 128)
-    # Default mask_rate=1.0: nothing is revealed, so the whole canvas is model output.
+    # Default noise_rate=1.0: nothing is revealed, so the whole canvas is model output.
     assert output.revealed_mask is not None
     assert not output.revealed_mask.any()
 
 
-def test_denoise_partial_mask_reveals_ground_truth():
-    """--output-mask < 1.0 masks only part of the canvas; the rest is revealed GT."""
+def test_denoise_partial_noise_reveals_ground_truth():
+    """--output-noise < 1.0 reveals the complementary ground-truth positions."""
 
     class ConstantModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.vocab_size = 128
+
         def forward(self, *, input_token_ids, canvas_token_ids, **kwargs):
             batch_size, canvas_len = canvas_token_ids.shape
             input_len = input_token_ids.shape[1]
@@ -476,28 +486,31 @@ def test_denoise_partial_mask_reveals_ground_truth():
         input_attention_mask=torch.ones(1, 2, dtype=torch.bool),
         input_features=None,
         target_canvas=target,
+        canvas_attention_mask=torch.ones_like(target, dtype=torch.bool),
+        canvas_loss_mask=torch.ones_like(target, dtype=torch.bool),
     )
     config = SimpleNamespace(
         data=SimpleNamespace(canvas_budget_tokens=8),
         model=SimpleNamespace(self_conditioning=False),
         pipeline=SimpleNamespace(seed=0),
         diffusion=SimpleNamespace(
-            mask_schedule=SimpleNamespace(
+            process="uniform",
+            schedule=SimpleNamespace(
                 name="linear",
                 t_distribution="uniform",
                 min=0.0,
                 max=1.0,
-                loss_reweight="inverse_t",
+                t_one_fraction=0.0,
             )
         ),
     )
 
-    output = denoise_canvas_once(model, batch, config, device="cpu", mask_rate=0.5)
+    output = denoise_canvas_once(model, batch, config, device="cpu", noise_rate=0.5)
 
     assert output.revealed_mask is not None
     revealed = output.revealed_mask[0]
     canvas = output.canvas[0]
-    # Invariant: revealed positions keep ground truth, masked positions become the
+    # Invariant: revealed positions keep ground truth, noised positions become the
     # model's prediction (token id 7). Holds for whatever reveal pattern the seed
     # produces.
     for position in range(8):
@@ -506,7 +519,7 @@ def test_denoise_partial_mask_reveals_ground_truth():
         else:
             assert canvas[position] == 7
     # The reveal pattern is deterministic (seeded from config.pipeline.seed).
-    repeat = denoise_canvas_once(model, batch, config, device="cpu", mask_rate=0.5)
+    repeat = denoise_canvas_once(model, batch, config, device="cpu", noise_rate=0.5)
     assert torch.equal(output.revealed_mask, repeat.revealed_mask)
 
 
@@ -681,8 +694,8 @@ def test_end_to_end_render_writes_comparison_and_opt_in_timeline(tmp_path: Path,
 
 
 @pytest.mark.slow
-def test_output_mask_sweep_writes_per_rate_subdirs(tmp_path: Path):
-    """Multiple --output-mask rates each get their own output_mask_<t>/ subdir."""
+def test_output_noise_sweep_writes_per_rate_subdirs(tmp_path: Path):
+    """Multiple --output-noise rates each get their own subdirectory."""
 
     torch.manual_seed(0)
     replay_dir = _build_replay_dir(tmp_path)
@@ -701,12 +714,12 @@ def test_output_mask_sweep_writes_per_rate_subdirs(tmp_path: Path):
         fog_rate=None,
         dpi=80,
         device="cpu",
-        output_masks=[0.4, 1.0],
+        output_noises=[0.4, 1.0],
     )
 
     # Each rate produced its own subdirectory with a full figure set + combined PDF.
     for rate in (0.4, 1.0):
-        rate_dir = out_dir / f"output_mask_{rate:.2f}"
+        rate_dir = out_dir / f"output_noise_{rate:.2f}"
         assert rate_dir.is_dir(), f"missing subdir for rate {rate}"
         assert (rate_dir / "diagnostics.pdf").exists()
         assert list(rate_dir.glob("prediction_vs_truth_*.png")), f"no comparison for rate {rate}"
@@ -715,8 +728,8 @@ def test_output_mask_sweep_writes_per_rate_subdirs(tmp_path: Path):
     assert not list(out_dir.glob("*.png"))
     # Every returned path lives under one of the rate subdirs.
     for path in written:
-        assert (out_dir / "output_mask_0.40") in Path(path).parents or (
-            out_dir / "output_mask_1.00"
+        assert (out_dir / "output_noise_0.40") in Path(path).parents or (
+            out_dir / "output_noise_1.00"
         ) in Path(path).parents
 
 
@@ -746,6 +759,8 @@ def _write_distinct_weight_checkpoint(
         "config": config,
         "global_step": 0,
         "feature_statistics_identity": model.feature_statistics_identity,
+        "architecture_identity": model.architecture_identity,
+        "diffusion_process": model.diffusion_process,
     }
     if not drop_ema:
         payload["ema_model"] = ema_state

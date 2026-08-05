@@ -1,3 +1,20 @@
+---
+prompt_number: "008"
+status: completed
+completed_at: "2026-08-05T15:42:16-05:00"
+execution_strategy: single-delegated
+verification:
+  integration_tests: "4 passed"
+  focused_tests: "74 passed"
+  downstream_tests: "60 passed"
+  full_suite: "176 passed"
+  diff_check: "passed"
+checkpoint_cleanup:
+  removed_files: 10
+  removed_bytes: 1377100161
+  directory_preserved: true
+---
+
 <objective>
 Migrate the complete `Thesis_ML` model, training, and inference stack from
 absorbing `[MASK]` diffusion to uniform-state multinomial diffusion, and make

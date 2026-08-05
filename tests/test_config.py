@@ -26,7 +26,7 @@ def test_valid_config_loads() -> None:
     assert config.model.heads == 4
     assert config.model.ffn == 1024
     assert config.model.qk_norm is True
-    assert config.model.self_conditioning is False
+    assert config.model.self_conditioning is True
     assert config.model.gradient_checkpointing is False
     assert config.model.rope_theta == 500000.0
     assert config.model.rope_scaling.rope_type == "llama3"
@@ -34,15 +34,12 @@ def test_valid_config_loads() -> None:
     assert config.model.rope_scaling.low_freq_factor == 1.0
     assert config.model.rope_scaling.high_freq_factor == 4.0
     assert config.model.rope_scaling.original_max_position_embeddings == 8192
-    assert config.diffusion.mask_schedule.name == "linear"
-    assert config.diffusion.mask_schedule.t_distribution == "uniform"
-    assert config.diffusion.mask_schedule.min == 0.0
-    assert config.diffusion.mask_schedule.max == 1.0
-    assert config.diffusion.mask_schedule.loss_reweight == "inverse_t"
-    # Fraction of examples per epoch oversampled to t=1.0 exactly (Worker 2);
-    # every configs/*.yaml now states this explicitly rather than relying on
-    # silent inheritance.
-    assert config.diffusion.mask_schedule.t_one_fraction == 0.1
+    assert config.diffusion.process == "uniform"
+    assert config.diffusion.schedule.name == "linear"
+    assert config.diffusion.schedule.t_distribution == "uniform"
+    assert config.diffusion.schedule.min == 0.0
+    assert config.diffusion.schedule.max == 1.0
+    assert config.diffusion.schedule.t_one_fraction == 0.0
     assert config.storage.data_uri == "data/processed/quickstart"
     assert config.storage.raw_uri == "data/raw/replays"
     assert config.storage.checkpoint_uri == "checkpoints"
@@ -83,17 +80,22 @@ def test_valid_config_loads() -> None:
     assert config.train.checkpoint_interval == 1000
     assert config.train.checkpoint_dir == "checkpoints"
     assert config.train.ema_decay == 0.9999
-    assert config.train.confidence_loss_weight == 0.1
-    assert config.train.self_cond_prob == 0.0
+    assert config.train.confidence_loss_weight == 0.0
+    assert config.train.self_cond_prob == 0.5
     assert config.train.precision == "bf16"
     assert config.train.require_cuda is False
     assert config.train.max_cuda_reserved_gb == 0.0
-    assert config.sampler.max_steps == 48
+    assert config.sampler.max_steps == 64
     assert config.sampler.temperature.start == 0.8
     assert config.sampler.temperature.end == 0.4
+    assert config.sampler.temperature.exponent == 1.0
     assert config.sampler.entropy_bound == 0.1
-    assert config.sampler.confidence_threshold == 0.0
-    assert config.sampler.min_commit_per_step == 1
+    assert config.sampler.adaptive_stop is True
+    assert config.sampler.entropy_threshold == 0.005
+    assert config.sampler.stability_steps == 2
+    assert not hasattr(config.sampler, "confidence_threshold")
+    assert not hasattr(config.sampler, "min_commit_per_step")
+    assert not hasattr(config.sampler, "outcome_last")
     assert config.eval.heldout_split == "validation"
     assert config.eval.timing_tolerance_buckets == 1
     assert config.eval.fog_rate == 0.0
@@ -147,8 +149,7 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert full.pipeline.prefetch_factor == 4
     assert full.pipeline.persistent_workers is True
     # local_full is the PRE-TRAINING profile: debut_mode is False (full roll-out
-    # target). The outcome token is still present at canvas position 0 and
-    # denoised last (sampler.outcome_last True, asserted below).
+    # target). The outcome token remains at canvas position 0 in ground truth.
     assert full.data.debut_mode is False
     assert full.model.self_conditioning is True
     assert full.model.gradient_checkpointing is True
@@ -156,12 +157,14 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert full.train.early_stopping_patience_epochs == 0
     assert full.train.max_cuda_reserved_gb == 7.5
     assert full.train.empty_cuda_cache_after_epoch is True
-    assert full.sampler.outcome_last is True
     assert full.eval.heldout_split == "test"
     assert full.eval.debut_max_examples == 0
-    for config in (overfit, overfit_v2):
-        assert config.model.self_conditioning is False
-        assert config.train.self_cond_prob == 0.0
+    for config in (overfit, overfit_v2, full):
+        assert config.diffusion.process == "uniform"
+        assert config.diffusion.schedule.t_one_fraction == 0.0
+        assert config.model.self_conditioning is True
+        assert config.train.self_cond_prob == 0.5
+        assert config.train.confidence_loss_weight == 0.0
 
     # local_overfit_v2_finetune.yaml is the FINE-TUNING profile
     # (data.debut_mode=true): the opposite requirement applies -- `fog` and
@@ -178,8 +181,8 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert finetune.loss.class_loss_weights is not None
     assert finetune.loss.class_loss_weights.pad == 0.2
     assert finetune.loss.class_loss_weights.win_loss == 1.0
-    assert finetune.diffusion.mask_schedule.t_one_fraction == 0.1
-    assert finetune.sampler.outcome_last is True
+    assert finetune.diffusion.process == "uniform"
+    assert finetune.diffusion.schedule.t_one_fraction == 0.0
 
 
 def test_fog_is_required_in_both_modes_and_pretraining_rejects_class_weights(
@@ -240,18 +243,36 @@ def test_fog_is_required_in_both_modes_and_pretraining_rejects_class_weights(
 
 
 def test_t_one_fraction_out_of_range_is_rejected(tmp_path: Path) -> None:
-    """`diffusion.mask_schedule.t_one_fraction` must be a probability in [0, 1]."""
+    """`diffusion.schedule.t_one_fraction` must be a probability in [0, 1]."""
 
     for bad_value in (-0.1, 1.5):
         raw = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
-        raw["diffusion"]["mask_schedule"]["t_one_fraction"] = bad_value
+        raw["diffusion"]["schedule"]["t_one_fraction"] = bad_value
         config_path = tmp_path / f"bad_fraction_{bad_value}.yaml"
         config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
         with pytest.raises(
             ConfigError,
-            match=r"diffusion\.mask_schedule\.t_one_fraction must be in \[0, 1\]",
+            match=r"diffusion\.schedule\.t_one_fraction must be in \[0, 1\]",
         ):
             load_config(config_path)
+
+
+@pytest.mark.parametrize("process", ["uniform", "absorbing"])
+def test_supported_diffusion_processes_load(tmp_path: Path, process: str) -> None:
+    raw = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    raw["diffusion"]["process"] = process
+    config_path = tmp_path / f"{process}.yaml"
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    assert load_config(config_path).diffusion.process == process
+
+
+def test_unknown_diffusion_process_is_rejected(tmp_path: Path) -> None:
+    raw = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    raw["diffusion"]["process"] = "masked"
+    config_path = tmp_path / "bad_process.yaml"
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="uniform.*absorbing"):
+        load_config(config_path)
 
 
 def test_unknown_key_is_rejected(tmp_path: Path) -> None:

@@ -371,57 +371,6 @@ def _absolute_timing_diffs(
 
 
 # ---------------------------------------------------------------------------
-# Structural checks driven by the sampler trace
-# ---------------------------------------------------------------------------
-
-
-def _first_commit_steps(trace: Sequence[object], row: int = 0) -> dict[int, int]:
-    """Map each canvas position to the 1-based sampler step it was first committed.
-
-    The sampler records, per step, a boolean tensor of positions committed that
-    step. We scan steps in order and record the earliest step for each position.
-
-    Parameters:
-        trace: The sampler's ``trace`` (a sequence of ``SamplerStep``).
-        row: Batch row to inspect (single-example batches use row 0).
-
-    Returns:
-        A dict position -> first-commit step number.
-    """
-
-    steps: dict[int, int] = {}
-    for step in trace:
-        committed = step.committed_this_step[row]  # bool tensor over canvas positions
-        for position in torch.nonzero(committed, as_tuple=False).flatten().tolist():
-            steps.setdefault(int(position), int(step.step))
-    return steps
-
-
-def _denoise_last_ok(trace: Sequence[object], row: int = 0) -> bool:
-    """Return True when the position-0 outcome token was committed LAST.
-
-    "Last" means position 0's first-commit step is greater than or equal to
-    every other position's first-commit step -- i.e. no canvas position was
-    committed after the outcome token. This reflects the intended behaviour of
-    the W2 sampler constraint ``sampler.outcome_last``; when that constraint is
-    off, this check will honestly report False.
-
-    Parameters:
-        trace: The sampler ``trace``.
-        row: Batch row to inspect.
-
-    Returns:
-        True if the outcome position denoised last, else False.
-    """
-
-    steps = _first_commit_steps(trace, row)
-    if 0 not in steps:
-        return False
-    outcome_step = steps[0]
-    return outcome_step >= max(steps.values())
-
-
-# ---------------------------------------------------------------------------
 # Per-example evaluation bundle
 # ---------------------------------------------------------------------------
 
@@ -438,7 +387,6 @@ class _ExampleEvaluation:
     fog_rate: float
     input_reach_minutes: float
     position0_ok: bool
-    denoise_last_ok: bool
     # Per-example overall build-order metrics (predicted vs. all ground truth).
     aggregate_metrics: BuildOrderMetrics
 
@@ -453,8 +401,7 @@ def _evaluate_example(
 ) -> _ExampleEvaluation:
     """Generate a canvas for one example and compute all its per-example signals.
 
-    Runs the confidence-based sampler once (retaining its trace for the
-    denoise-last structural check), decodes the debut events, and gathers the
+    Runs the configured sampler once, decodes the debut events, and gathers the
     fog rate, input reach, outcome tokens, and overall build-order metrics.
 
     Parameters:
@@ -512,7 +459,6 @@ def _evaluate_example(
         fog_rate=_example_fog_rate(example),
         input_reach_minutes=_input_reach_minutes(example, config),
         position0_ok=position0_ok,
-        denoise_last_ok=_denoise_last_ok(sampled.trace),
         aggregate_metrics=per_example_metrics,
     )
 
@@ -665,7 +611,6 @@ def build_debut_report(
 
     # --- Structural booleans ----------------------------------------------
     position0_ok = all(ev.position0_ok for ev in evaluations) if evaluations else False
-    denoise_last_ok = all(ev.denoise_last_ok for ev in evaluations) if evaluations else False
 
     return {
         "label": label,
@@ -683,7 +628,6 @@ def build_debut_report(
         "win_loss_minute_buckets": win_loss_minute_buckets,
         "win_loss_structural": {
             "position0_ok": position0_ok,
-            "denoise_last_ok": denoise_last_ok,
         },
     }
 

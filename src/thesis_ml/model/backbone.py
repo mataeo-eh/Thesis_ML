@@ -13,13 +13,14 @@ from torch.utils.checkpoint import checkpoint
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+    def __init__(self, d_model: int, eps: float = 1e-6, *, scale: bool = True) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(d_model))
+        self.weight = nn.Parameter(torch.ones(d_model)) if scale else None
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
+        normalized = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return normalized if self.weight is None else normalized * self.weight
 
 
 class RotaryEmbedding(nn.Module):
@@ -163,7 +164,7 @@ class MultiHeadSelfAttention(nn.Module):
         return self.out(attended)
 
 
-class SwiGLU(nn.Module):
+class GeGLU(nn.Module):
     def __init__(self, d_model: int, ffn_dim: int) -> None:
         super().__init__()
         self.gate = nn.Linear(d_model, ffn_dim, bias=False)
@@ -171,7 +172,7 @@ class SwiGLU(nn.Module):
         self.down = nn.Linear(ffn_dim, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+        return self.down(F.gelu(self.gate(x), approximate="tanh") * self.up(x))
 
 
 class TransformerBlock(nn.Module):
@@ -190,7 +191,7 @@ class TransformerBlock(nn.Module):
         rope_original_context: int = 8192,
     ) -> None:
         super().__init__()
-        self.attn_norm = RMSNorm(d_model)
+        self.pre_attn_norm = RMSNorm(d_model)
         self.attn = MultiHeadSelfAttention(
             d_model,
             heads,
@@ -202,12 +203,16 @@ class TransformerBlock(nn.Module):
             rope_high_freq_factor=rope_high_freq_factor,
             rope_original_context=rope_original_context,
         )
-        self.ffn_norm = RMSNorm(d_model)
-        self.ffn = SwiGLU(d_model, ffn_dim)
+        self.post_attn_norm = RMSNorm(d_model)
+        self.pre_ffn_norm = RMSNorm(d_model)
+        self.ffn = GeGLU(d_model, ffn_dim)
+        self.post_ffn_norm = RMSNorm(d_model)
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), attention_mask=attention_mask)
-        x = x + self.ffn(self.ffn_norm(x))
+        attention_branch = self.attn(self.pre_attn_norm(x), attention_mask=attention_mask)
+        x = x + self.post_attn_norm(attention_branch)
+        ffn_branch = self.ffn(self.pre_ffn_norm(x))
+        x = x + self.post_ffn_norm(ffn_branch)
         return x
 
 

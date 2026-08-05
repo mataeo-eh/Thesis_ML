@@ -1,1 +1,1 @@
-"""Model components for the masked-diffusion transformer."""
+"""Model components for the clean-state diffusion transformer."""

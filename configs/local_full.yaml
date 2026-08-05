@@ -45,11 +45,9 @@ model:
   gradient_checkpointing: true
 
 diffusion:
-  mask_schedule:
-    # Explicit here (not just inherited from config/default.yaml) per the
-    # refactor owner's instruction: every configs/ YAML states this knob
-    # explicitly so the oversampling rate is never a silent inheritance.
-    t_one_fraction: 0.1
+  process: uniform
+  schedule:
+    t_one_fraction: 0.0
 
 train:
   # Learning-rate schedule for FROM-SCRATCH pre-training. Declared explicitly
@@ -80,9 +78,6 @@ train:
   require_cuda: true
   max_cuda_reserved_gb: 7.5
   empty_cuda_cache_after_epoch: true
-
-sampler:
-  outcome_last: true
 
 eval:
   heldout_split: test

@@ -24,9 +24,9 @@ from thesis_ml.data.dataset import (
 )
 from thesis_ml.model.loss import CanvasCrossEntropyLoss
 from thesis_ml.model import backbone as backbone_module
-from thesis_ml.model.backbone import MultiHeadSelfAttention, RotaryEmbedding
+from thesis_ml.model.backbone import GeGLU, MultiHeadSelfAttention, RotaryEmbedding, TransformerBlock
 from thesis_ml.model.embedding import InputFeatures, build_input_features
-from thesis_ml.model.model import SC2StrategyDiffusionModel
+from thesis_ml.model.model import SC2StrategyDiffusionModel, canvas_self_conditioning_from_logits
 from thesis_ml.serialize import TokenRecord
 
 
@@ -138,7 +138,7 @@ def test_forward_shapes() -> None:
 
 
 def test_contextual_encodings_are_input_only() -> None:
-    config = _small_config(layers=1)
+    config = _small_config(layers=1, self_conditioning=False)
     model = SC2StrategyDiffusionModel(config, vocab_size=128)
     input_ids = torch.tensor([[6, 7, 8]])
     canvas_ids = torch.tensor([[9, 10, 11]])
@@ -194,7 +194,9 @@ def test_absolute_game_time_cannot_enter_model_features() -> None:
 
 def test_joint_static_embedding_zero_init_staged_gradients_and_locality() -> None:
     torch.manual_seed(31)
-    model = SC2StrategyDiffusionModel(_small_config(layers=1), vocab_size=128)
+    model = SC2StrategyDiffusionModel(
+        _small_config(layers=1, self_conditioning=False), vocab_size=128
+    )
     embedding = model.embedding
     input_ids = torch.tensor([[6, 7, 8]])
     features = _features(_records(1, 3), 3)
@@ -242,8 +244,7 @@ def test_self_conditioning_adds_to_canvas_only_and_null_is_equivalent() -> None:
     canvas_ids = torch.tensor([[9, 10, 11]])
     records = _records(1, 3)
     features = _features(records, input_ids.shape[1])
-    conditioning = torch.zeros(1, 3, 128)
-    conditioning[0, :, 12] = 1.0
+    conditioning = torch.randn(1, 3, config.model.d_model)
 
     base = model.embedding(input_ids, canvas_ids, input_features=features)
     zero = model.embedding(
@@ -263,6 +264,46 @@ def test_self_conditioning_adds_to_canvas_only_and_null_is_equivalent() -> None:
     assert torch.allclose(base, zero)
     assert torch.allclose(base[:, :input_len], conditioned[:, :input_len])
     assert not torch.allclose(base[:, input_len:], conditioned[:, input_len:])
+
+
+def test_self_conditioning_expected_embedding_uses_shared_token_table() -> None:
+    model = SC2StrategyDiffusionModel(_small_config(layers=1), vocab_size=8)
+    logits = torch.full((1, 2, 8), -100.0)
+    logits[0, 0, 3] = 100.0
+    logits[0, 1, 5] = 100.0
+
+    expected = canvas_self_conditioning_from_logits(
+        logits,
+        model.embedding.token_embedding.weight,
+    )
+
+    assert torch.allclose(expected[0, 0], model.embedding.token_embedding.weight[3].float())
+    assert torch.allclose(expected[0, 1], model.embedding.token_embedding.weight[5].float())
+    assert not hasattr(model.embedding, "self_cond_projection")
+
+
+def test_geglu_uses_tanh_approximate_gelu(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+    original = F.gelu
+
+    def capture(input: torch.Tensor, approximate: str = "none") -> torch.Tensor:
+        seen.append(approximate)
+        return original(input, approximate=approximate)
+
+    monkeypatch.setattr(backbone_module.F, "gelu", capture)
+    layer = GeGLU(8, 16)
+    assert layer(torch.randn(2, 3, 8)).shape == (2, 3, 8)
+    assert seen == ["tanh"]
+
+
+def test_transformer_block_has_sandwich_norms_on_both_residual_branches() -> None:
+    block = TransformerBlock(d_model=16, heads=4, ffn_dim=32)
+    assert hasattr(block, "pre_attn_norm")
+    assert hasattr(block, "post_attn_norm")
+    assert hasattr(block, "pre_ffn_norm")
+    assert hasattr(block, "post_ffn_norm")
+    assert isinstance(block.ffn, GeGLU)
+    assert block(torch.randn(2, 5, 16)).shape == (2, 5, 16)
 
 
 def test_qk_norm_is_gated_and_applied_before_rope(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -526,12 +567,12 @@ def test_t_bucket_edges_are_contiguous_exhaustive_and_perspectives_emit_both_key
     assert set(result.t_bucket) == {"t_0_3_to_0_5", "t_0_7_to_1_0"}
 
 
-def test_pretraining_loss_weights_are_uniform_with_zero_pad_and_never_read_class_weight_config() -> None:
+def test_pretraining_loss_weights_are_uniform_including_semantic_pad() -> None:
     """Pre-training loss weighting is fully uniform (published MDLM style).
 
     The weight buffer must be length 7 (max class id 6 + 1, even though the
     pre-training map is sparse with 5 entries), hold exactly 1.0 for every
-    class except `[PAD]` (zeroed so padding never contributes), and be built
+    class including semantic `[PAD]`, and be built
     WITHOUT reading `config.loss.class_loss_weights` -- which is None for a
     pre-training config, so any read would crash.
     """
@@ -545,7 +586,7 @@ def test_pretraining_loss_weights_are_uniform_with_zero_pad_and_never_read_class
     weights = loss_fn.class_weights
 
     assert weights.shape == (7,)
-    assert weights[CLASS_PAD].item() == 0.0
+    assert weights[CLASS_PAD].item() == 1.0
     for class_id in (CLASS_CONTENT, CLASS_DELIMITER, CLASS_END, CLASS_WINLOSS):
         assert weights[class_id].item() == 1.0
     # The unused ids 1/2 keep the uniform fill too (they are never emitted in
@@ -612,4 +653,11 @@ def test_model_uses_explicit_depth_scaled_initialization() -> None:
 
     assert model.embedding.token_embedding.weight.std().item() == pytest.approx(0.02, rel=0.25)
     assert model.backbone.layers[0].attn.out.weight.std().item() == pytest.approx(residual_std, rel=0.3)
-    assert torch.allclose(model.backbone.layers[0].attn_norm.weight, torch.ones_like(model.backbone.layers[0].attn_norm.weight))
+    assert torch.allclose(
+        model.backbone.layers[0].pre_attn_norm.weight,
+        torch.ones_like(model.backbone.layers[0].pre_attn_norm.weight),
+    )
+    assert torch.allclose(
+        model.backbone.layers[0].post_attn_norm.weight,
+        torch.ones_like(model.backbone.layers[0].post_attn_norm.weight),
+    )

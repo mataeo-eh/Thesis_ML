@@ -13,8 +13,7 @@
 #   - a much smaller learning rate (fine-tuning, not training from scratch)
 #   - a fresh 150-epoch fine-tune budget
 #   - the warm-start source checkpoint (weights only, see TrainingLoop.load_model_weights)
-#   - debut_mode / outcome_last so the dataset builds the 7-class debut target
-#     and the sampler denoises the [WIN]/[LOSS] outcome token LAST
+#   - debut_mode so the dataset builds the 7-class debut target
 #   - a SEPARATE checkpoint directory so fine-tune checkpoints never overwrite
 #     the pre-trained checkpoints at checkpoints/local-overfitV2
 extends: local_overfit_v2.yaml
@@ -38,11 +37,9 @@ fog:
     max: 0.8
 
 diffusion:
-  mask_schedule:
-    # Explicit here (not just inherited from config/default.yaml) per the
-    # refactor owner's instruction: every configs/ YAML states this knob
-    # explicitly so the oversampling rate is never a silent inheritance.
-    t_one_fraction: 0.1
+  process: uniform
+  schedule:
+    t_one_fraction: 0.0
 
 loss:
   class_loss_weights:
@@ -53,9 +50,6 @@ loss:
     end: 1.0
     pad: 0.2
     win_loss: 1.0
-
-sampler:
-  outcome_last: true
 
 eval:
   # The 25 memorized + 3 dev replays expand into well over a thousand overlapping

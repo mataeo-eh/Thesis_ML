@@ -1,1 +1,1 @@
-"""Training utilities for masked-diffusion pretraining."""
+"""Training utilities for clean-state diffusion pretraining."""

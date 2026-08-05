@@ -18,7 +18,7 @@
 - A valid canvas starts with perspective-relative `[WIN]`/`[LOSS]`, followed by `(timestep-tokens [DELIMITER])+`, then either `[END] [PAD]*` or `[PAD]*`. Reject partial final timesteps; debut mode also permits empty timestep groups represented by a bare delimiter.
 - The model never emits time. Absolute timing is recovered externally by arithmetic (last input-frame clock + `sampling_interval_s × timestep index`) and stays metadata only.
 - The uniform EB rule sorts eligible entropies ascending and accepts positions where `cumsum(sorted_entropy) - sorted_entropy <= entropy_bound`. Candidate tokens are categorical samples from temperature-shaped logits; every nonaccepted position is fully renoised from the uniform non-`[MASK]` state distribution.
-- Uniform defaults are `max_steps=64`, linear temperature `0.8 -> 0.4`, and `entropy_bound=0.1`. There is no minimum step count, confidence threshold, minimum-commit floor, persistent committed mask, `outcome_last`, or position-dependent token restriction.
+- Uniform defaults are `max_steps=64`, linear temperature `0.8 -> 0.4`, and `entropy_bound=0.1`. There is no minimum step count, commit-gating path, persistent acceptance mask, or position-dependent token restriction.
 - Adaptive stopping requires both mean entropy below `0.005` over eligible positions and unchanged argmax predictions across two consecutive passes. Done rows freeze; unfinished rows continue to the hard ceiling.
 - The absorbing ablation initializes `[MASK]`, applies the same correct EB prefix among still-masked positions, leaves nonaccepted positions masked, never remasks accepted positions, and stops only when eligible positions are filled.
 - Uniform sampling excludes `[MASK]` but otherwise permits every state at every position. Ground-truth grammar and the position-zero outcome convention are learned; validation remains the downstream contract boundary.
@@ -32,7 +32,7 @@
 
 ## Verification
 
-- Sampler changes require `tests/test_sampler.py`; obsolete outcome-last tests are deleted or replaced with position-unconstrained and nonmonotonic-renoising coverage. Grammar validity remains required by `SPEC.md` §16.
+- Sampler changes require `tests/test_sampler.py`; position-unconstrained and nonmonotonic-renoising coverage replaces the retired positional sequencing tests. Grammar validity remains required by `SPEC.md` §16.
 
 ## Child DOX Index
 

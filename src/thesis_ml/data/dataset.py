@@ -1,4 +1,4 @@
-"""Dataset construction for masked-diffusion training examples (both modes).
+"""Dataset construction for clean-state diffusion training examples (both modes).
 
 Two training modes are served from the same manifest-backed dataset class:
 
@@ -357,8 +357,7 @@ def _build_artifact_target(
 
     Layout of the returned canvas:
         position 0: the ``outcome_id`` token (``WIN_ID`` or ``LOSS_ID``) labeled
-            ``CLASS_WINLOSS``. It is denoised LAST at inference via the
-            ``sampler.outcome_last`` constraint, mirroring the debut target.
+            ``CLASS_WINLOSS``. Sampling treats it like every other position.
         then, walking enemy timesteps from ``window.start_timestep`` to game end:
             the full enemy reconstruction (observed + fogged past/present) plus
             the enemy future continuation, each timestep followed by one
@@ -385,9 +384,8 @@ def _build_artifact_target(
     class_labels: list[int] = []
     metadata: list[dict[str, Any]] = []
 
-    # Canvas position 0 is always the single win/loss outcome token (identical
-    # placement to _build_debut_target so the sampler's outcome_last constraint
-    # and the CLASS_WINLOSS loss weighting apply uniformly across both modes).
+    # Canvas position 0 is always the single win/loss outcome token, matching
+    # _build_debut_target and the shared CLASS_WINLOSS loss taxonomy.
     token_ids.append(outcome_id)
     class_labels.append(CLASS_WINLOSS)
     metadata.append({"token_kind": "outcome", "timestep_index": None, "token_name": "[WIN/LOSS]"})

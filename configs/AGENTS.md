@@ -22,7 +22,7 @@
 - Profiles keep experiments traceable to exact settings — version-control every profile that produced a reported run.
 - CUDA-required profiles must fail before preprocessing when CUDA is unavailable.
 - `local_full.yaml` assigns exactly 870 replays to train, 50 to dev, and every remainder to test; it uses batch size 9, ten persistent workers with four-batch prefetch, gradient checkpointing, 50% training self-conditioning, and a 7.5 GiB reserved-memory ceiling. Unused CUDA cache is released after each of its eight epochs.
-- All production profiles select uniform diffusion explicitly or inherit the uniform default, use zero terminal oversampling and zero confidence sharpening initially, and never enable `outcome_last`. A dedicated absorbing profile may be added for the scientific ablation, with isolated checkpoint/output namespaces.
+- All production profiles select uniform diffusion explicitly or inherit the uniform default, use zero terminal oversampling and zero confidence sharpening initially, and add no position-dependent sampler override. A dedicated absorbing profile may be added for the scientific ablation, with isolated checkpoint/output namespaces.
 
 ## Work Guidance
 

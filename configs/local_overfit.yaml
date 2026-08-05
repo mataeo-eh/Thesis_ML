@@ -30,15 +30,13 @@ model:
   layers: 10
   heads: 4
   ffn: 1024
-  self_conditioning: false
+  self_conditioning: true
   gradient_checkpointing: true
 
 diffusion:
-  mask_schedule:
-    # Explicit here (not just inherited from config/default.yaml) per the
-    # refactor owner's instruction: every configs/ YAML states this knob
-    # explicitly so the oversampling rate is never a silent inheritance.
-    t_one_fraction: 0.1
+  process: uniform
+  schedule:
+    t_one_fraction: 0.0
 
 train:
   epochs: 200
@@ -49,7 +47,8 @@ train:
   target_effective_batch_tokens: 0
   checkpoint_interval: 100
   val_interval: 0
-  self_cond_prob: 0.0
+  confidence_loss_weight: 0.0
+  self_cond_prob: 0.5
   precision: bf16
   require_cuda: true
   max_cuda_reserved_gb: 7.5

@@ -205,6 +205,12 @@ def export_finished_model(
     feature_statistics_identity = getattr(model, "feature_statistics_identity", None)
     if not isinstance(feature_statistics_identity, str):
         raise ValueError("finished model has no feature statistics identity")
+    architecture_identity = getattr(model, "architecture_identity", None)
+    diffusion_process = getattr(model, "diffusion_process", None)
+    if not isinstance(architecture_identity, str):
+        raise ValueError("finished model has no architecture identity")
+    if diffusion_process not in {"uniform", "absorbing"}:
+        raise ValueError("finished model has no valid diffusion process identity")
 
     # safetensors metadata values must all be strings. These stamp each weight
     # file with which set it is plus enough provenance to identify the run.
@@ -214,6 +220,8 @@ def export_finished_model(
         "completed_epochs": str(completed_epochs),
         "stop_reason": stop_reason,
         "feature_statistics_identity": feature_statistics_identity,
+        "architecture_identity": architecture_identity,
+        "diffusion_process": diffusion_process,
     }
     raw_path = finished_dir / RAW_WEIGHTS_FILENAME
     ema_path = finished_dir / EMA_WEIGHTS_FILENAME
@@ -233,6 +241,8 @@ def export_finished_model(
             "completed_epochs": completed_epochs,
             "stop_reason": stop_reason,
             "feature_statistics_identity": feature_statistics_identity,
+            "architecture_identity": architecture_identity,
+            "diffusion_process": diffusion_process,
         },
         bundle_path,
     )
@@ -256,6 +266,8 @@ def export_finished_model(
         "stop_reason": stop_reason,
         "self_conditioning": config.model.self_conditioning,
         "feature_statistics_identity": feature_statistics_identity,
+        "architecture_identity": architecture_identity,
+        "diffusion_process": diffusion_process,
         "weights": {"raw": RAW_WEIGHTS_FILENAME, "ema": EMA_WEIGHTS_FILENAME},
         "torch_bundle": TORCH_BUNDLE_FILENAME,
         "config_file": CONFIG_FILENAME,

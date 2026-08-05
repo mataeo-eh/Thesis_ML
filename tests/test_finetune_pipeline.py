@@ -135,7 +135,7 @@ def test_finetune_config_extends_overfit_v2_with_warm_start_and_debut_settings()
 
     # Fine-tune-specific overrides.
     assert config.data.debut_mode is True
-    assert config.sampler.outcome_last is True
+    assert config.diffusion.process == "uniform"
     assert config.train.init_from_checkpoint == "checkpoints/local-overfitV2/last.pt"
     assert config.storage.checkpoint_uri == "checkpoints/local-overfitV2-finetune"
     assert config.train.lr == 1.0e-6
@@ -154,13 +154,13 @@ def test_finetune_config_extends_overfit_v2_with_warm_start_and_debut_settings()
     assert config.data.within_type_tiebreak == "unit_id"
 
     # Pre-training's own config must remain completely untouched by this
-    # profile's existence: debut_mode/outcome_last default False, and
+    # profile's existence: debut_mode defaults false, and
     # init_from_checkpoint defaults to "" (disabled).
     pretraining_config = load_config(REPO_ROOT / "configs" / "local_overfit_v2.yaml")
     assert config.data.window_manifest_path == "data/processed/local/finetune_window_manifest.jsonl"
     assert config.data.window_manifest_path != pretraining_config.data.window_manifest_path
     assert pretraining_config.data.debut_mode is False
-    assert pretraining_config.sampler.outcome_last is False
+    assert pretraining_config.diffusion.process == "uniform"
     assert pretraining_config.train.init_from_checkpoint == ""
 
 
