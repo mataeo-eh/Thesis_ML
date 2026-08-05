@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from thesis_ml.config import ProjectConfig
+from thesis_ml.data.feature_stats import FeatureStatistics
 from thesis_ml.model.backbone import BidirectionalTransformer, RMSNorm
 from thesis_ml.model.embedding import InputContextEmbedding, InputFeatures
 
@@ -18,7 +19,14 @@ class ModelOutput:
 
 
 class SC2StrategyDiffusionModel(nn.Module):
-    def __init__(self, config: ProjectConfig, *, vocab_size: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        config: ProjectConfig,
+        *,
+        vocab_size: int,
+        feature_statistics: FeatureStatistics | None = None,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         model_config = config.model
         if model_config.rope_scaling.rope_type != "llama3":
@@ -27,10 +35,13 @@ class SC2StrategyDiffusionModel(nn.Module):
                 f"got {model_config.rope_scaling.rope_type!r}"
             )
         self.self_conditioning = model_config.self_conditioning
+        statistics = feature_statistics or FeatureStatistics.identity_for_tests()
+        self.feature_statistics_identity = statistics.identity
         # Enabling QK-norm or self-conditioning changes the architecture; pre-009 checkpoints need retraining.
         self.embedding = InputContextEmbedding(
             vocab_size,
             model_config.d_model,
+            feature_statistics=statistics,
             self_conditioning=model_config.self_conditioning,
         )
         self.backbone = BidirectionalTransformer(
@@ -49,6 +60,9 @@ class SC2StrategyDiffusionModel(nn.Module):
         )
         self.output_head = nn.Linear(model_config.d_model, vocab_size, bias=False)
         self._init_weights(model_config.layers)
+        # The general initializer above intentionally initializes every Linear;
+        # restore the exact zero-output joint residual after it completes.
+        self.embedding.reset_joint_output()
 
     def forward(
         self,

@@ -14,7 +14,7 @@
 
 - Run scripts through `.venv\Scripts\python.exe` from the submodule root.
 - `estimate_context_window.py` derives the default parquet location from the repository layout and must not embed or emit a machine-specific path; prefer repository-relative `--input-dir`/`--pattern`/`--output` overrides.
-- Token accounting stays consistent with the model contract: input counts self + zero-fog enemy content plus one delimiter per player per timestep; output counts enemy content plus per-timestep delimiter and one terminal `[END]`; padding excluded.
+- Token accounting stays consistent with the model contract in both modes: input counts self + zero-fog enemy content plus one delimiter per timestep; output counts enemy content plus per-timestep delimiter and one terminal `[END]`; padding excluded.
 - `gpu_smoke_test.py` requires a visible CUDA device; never infer VRAM from a CPU run. Pass `--vocab-size` matching the real vocabulary for an accurate parameter count.
 
 ## Work Guidance

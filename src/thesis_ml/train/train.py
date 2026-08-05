@@ -17,6 +17,9 @@ from thesis_ml.data.dataset import (
     CLASS_CONTENT,
     CLASS_DELIMITER,
     CLASS_END,
+    CLASS_ENEMY_FOGGED,
+    CLASS_ENEMY_FUTURE,
+    CLASS_ENEMY_OBSERVED,
     CLASS_PAD,
     CLASS_WINLOSS,
     DatasetExample,
@@ -46,9 +49,7 @@ def run_smoke_train(
         examples,
         batch_size=2,
         shuffle=False,
-        # Smoke train uses the pre-training (debut_mode=False) synthetic
-        # fixtures, so collate in pre-training mode (absent input, no future
-        # telemetry).
+        # Smoke train uses the pre-training synthetic fixtures.
         collate_fn=partial(collate_diffusion_examples, debut_mode=False),
     )
     model = SC2StrategyDiffusionModel(config, vocab_size=SMOKE_VOCAB_SIZE)
@@ -57,23 +58,13 @@ def run_smoke_train(
 
 
 def make_synthetic_examples(config: ProjectConfig, *, count: int) -> list[DatasetExample]:
-    """Build tiny pre-training-shaped synthetic examples for the smoke path.
-
-    These fixtures follow the PRE-TRAINING contract (the smoke config runs with
-    ``debut_mode=False``):
-      - Input is LITERALLY ABSENT: ``input_records`` is empty and
-        ``input_token_ids`` is a zero-length tensor, so the collated batch has a
-        ``[B, 0]`` input segment and the model sequence is exactly the canvas.
-      - The class taxonomy is COLLAPSED: every enemy content token is
-        ``CLASS_CONTENT`` (there is no observed/fogged/future split in
-        pre-training); only content / delimiter / end / pad / win-loss labels
-        appear.
+    """Build tiny clamped-input pretraining examples for the smoke path.
 
     Parameters:
         config: the (smoke) project config; unused fields are ignored here.
         count: how many identical-canvas examples to produce.
     Returns:
-        A list of ``DatasetExample`` with absent input and collapsed labels.
+        A list of ``DatasetExample`` with fogged input and full-rollout labels.
     Calls: none (self-contained fixture builder).
     """
 
@@ -85,33 +76,30 @@ def make_synthetic_examples(config: ProjectConfig, *, count: int) -> list[Datase
         [WIN_ID, 100, 101, DELIMITER_ID, 102, 103, DELIMITER_ID, 104, 105, DELIMITER_ID, END_ID, PAD_ID],
         dtype=torch.long,
     )
-    # Collapsed pre-training labels: all six content tokens are CLASS_CONTENT
-    # (no fogged/future ids ever emitted in pre-training).
     class_labels = torch.tensor(
         [
             CLASS_WINLOSS,
-            CLASS_CONTENT,
-            CLASS_CONTENT,
+            CLASS_ENEMY_OBSERVED,
+            CLASS_ENEMY_FOGGED,
             CLASS_DELIMITER,
-            CLASS_CONTENT,
-            CLASS_CONTENT,
+            CLASS_ENEMY_FUTURE,
+            CLASS_ENEMY_FUTURE,
             CLASS_DELIMITER,
-            CLASS_CONTENT,
-            CLASS_CONTENT,
+            CLASS_ENEMY_FUTURE,
+            CLASS_ENEMY_FUTURE,
             CLASS_DELIMITER,
             CLASS_END,
             CLASS_PAD,
         ],
         dtype=torch.long,
     )
-    empty_input = torch.zeros((0,), dtype=torch.long)
     for example_index in range(count):
+        perspective = "p1" if example_index % 2 == 0 else "p2"
+        input_records, clean_records = _synthetic_input_pair(example_index, perspective)
         examples.append(
             DatasetExample(
-                # Pre-training input is absent -- no input records, zero-length
-                # input token tensor.
-                input_records=[],
-                input_token_ids=empty_input.clone(),
+                input_records=input_records,
+                input_token_ids=torch.tensor([record.token_id for record in input_records]),
                 target_canvas=base_canvas.clone(),
                 class_labels=class_labels.clone(),
                 terminated=True,
@@ -120,11 +108,12 @@ def make_synthetic_examples(config: ProjectConfig, *, count: int) -> list[Datase
                     {"token_id": int(token_id), "timestep_index": index // 3}
                     for index, token_id in enumerate(base_canvas.tolist())
                 ],
-                fogged_counts={},
-                observed_counts={},
+                fogged_counts={(0, "synthetic_enemy_hidden"): 1},
+                observed_counts={(0, "synthetic_enemy_visible"): 1},
                 window_start=example_index,
-                perspective_player="p1" if example_index % 2 == 0 else "p2",
-                clean_input_token_ids=empty_input.clone(),
+                perspective_player=perspective,
+                clean_input_token_ids=torch.tensor([record.token_id for record in clean_records]),
+                window_end=example_index + 2,
             )
         )
     return examples
@@ -176,30 +165,55 @@ def _smoke_config(*, max_steps: int, checkpoint_dir: str | Path | None) -> Proje
     )
 
 
-def _synthetic_input_records(example_index: int) -> list[TokenRecord]:
-    records: list[TokenRecord] = []
-    owners = ("p1", "p1", "p2", "p2", "p1", "p2", "p1", "p2")
-    for index, owner in enumerate(owners):
-        records.append(
-            TokenRecord(
-                token_id=100 + (index % 6),
-                token_name=f"synthetic_{index % 6}",
-                token_kind="entity" if index % 3 else "upgrade",
-                owner=owner,
-                allegiance="self" if owner == "p1" else "enemy",
-                game_loop=index,
-                timestamp_seconds=float(index * 5),
-                entity_type=f"synthetic_{index % 6}",
-                instance_id=f"{example_index}{index:03d}",
-                raw_position=f"({float(index + 1)}, {float(example_index + index + 2)}, 0.0)",
-                raw_attributes={
-                    "health": "45.0/45.0",
-                    "is_flying": "False",
-                    "build_progress": "1.0",
-                },
-            )
+def _synthetic_input_pair(
+    example_index: int,
+    perspective: str,
+) -> tuple[list[TokenRecord], list[TokenRecord]]:
+    enemy = "p2" if perspective == "p1" else "p1"
+    clean: list[TokenRecord] = []
+    fogged: list[TokenRecord] = []
+    for index, (owner, name) in enumerate(
+        (
+            (perspective, "synthetic_self"),
+            (enemy, "synthetic_enemy_visible"),
+            (enemy, "synthetic_enemy_hidden"),
         )
-    return records
+    ):
+        record = TokenRecord(
+            token_id=100 + index,
+            token_name=name,
+            token_kind="entity",
+            owner=owner,
+            allegiance="self" if owner == perspective else "enemy",
+            game_loop=example_index,
+            timestamp_seconds=float(example_index),
+            entity_type=name,
+            instance_id=f"{example_index}{index:03d}",
+            raw_position=f"({float(index + 1)}, {float(example_index + index + 2)}, 0.0)",
+            raw_attributes={"health": "45.0/45.0", "build_progress": "1.0"},
+        )
+        clean.append(record)
+        if name != "synthetic_enemy_hidden":
+            fogged.append(record)
+    delimiter = TokenRecord(
+        token_id=DELIMITER_ID,
+        token_name="[DELIMITER]",
+        token_kind="delimiter",
+        owner=None,
+        allegiance=None,
+        game_loop=example_index,
+        timestamp_seconds=float(example_index),
+    )
+    clean.append(delimiter)
+    fogged.append(delimiter)
+    return fogged, clean
+
+
+def _synthetic_input_records(example_index: int) -> list[TokenRecord]:
+    """Compatibility helper returning a clean p1-perspective synthetic input."""
+
+    _fogged, clean = _synthetic_input_pair(example_index, "p1")
+    return clean
 
 
 if __name__ == "__main__":

@@ -17,10 +17,10 @@ def test_valid_config_loads() -> None:
     assert config.data.canvas_budget_tokens == 4096
     assert config.data.canvas_recon_fraction == 0.5
     assert config.data.within_type_tiebreak == "unit_id"
-    # config/default.yaml is a PRE-TRAINING config (data.debut_mode=false), so
-    # `fog` (the fine-tuning-only fog paradigm) must be absent -- it is
-    # validated to None by `_validate_debut_mode_sections`, not populated.
-    assert config.fog is None
+    assert config.data.feature_statistics_path == "data/processed/feature_statistics.v1.json"
+    assert config.fog.rate_distribution.name == "uniform"
+    assert config.fog.rate_distribution.min == 0.0
+    assert config.fog.rate_distribution.max == 0.8
     assert config.model.d_model == 256
     assert config.model.layers == 10
     assert config.model.heads == 4
@@ -63,6 +63,7 @@ def test_valid_config_loads() -> None:
     assert config.pipeline.replay_glob == "*.parquet"
     assert config.pipeline.token_dictionary_uri == "data/Token_Dictionary.json"
     assert config.pipeline.perspectives == "p1,p2"
+    assert config.pipeline.prepare_feature_statistics is False
     assert config.train.lr == 0.0003
     assert config.train.beta1 == 0.9
     assert config.train.beta2 == 0.95
@@ -128,13 +129,13 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     # inherited from config/default.yaml): class_loss_weights is a
     # fine-tuning-only section and must be None here, not populated.
     assert overfit.loss.class_loss_weights is None
-    assert overfit.fog is None
+    assert overfit.fog is not None
     assert overfit.train.max_cuda_reserved_gb == 7.5
     assert overfit.model.gradient_checkpointing is True
     assert overfit_v2.train.epochs == 200
     assert overfit_v2.train.early_stopping_patience_epochs == 0
     assert overfit_v2.loss.class_loss_weights is None
-    assert overfit_v2.fog is None
+    assert overfit_v2.fog is not None
     assert overfit_v2.storage.checkpoint_uri == "checkpoints/local-overfitV2"
     assert overfit_v2.storage.log_uri == "tests/output/overfitV2"
     assert overfit_v2.storage.local_cache_dir == ".pipeline_cache/local-overfitV2"
@@ -181,27 +182,19 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert finetune.sampler.outcome_last is True
 
 
-def test_pretraining_config_rejects_fog_and_class_loss_weights_sections(tmp_path: Path) -> None:
-    """A pre-training config carrying fine-tuning-only knobs must be REJECTED.
-
-    `fog` and `loss.class_loss_weights` are fine-tuning-only sections: a
-    debut_mode=false config that carries either is refused by `load_config`
-    (no dead knobs sitting in a config nothing reads), with the exact
-    validation messages from `_validate_debut_mode_sections`. Conversely a
-    debut_mode=true config REQUIRES both sections.
-    """
+def test_fog_is_required_in_both_modes_and_pretraining_rejects_class_weights(
+    tmp_path: Path,
+) -> None:
+    """Fog is shared; only configurable class weighting stays fine-tune-only."""
 
     base = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
     assert base["data"]["debut_mode"] is False
 
-    # Pre-training config carrying `fog` -> rejected.
-    with_fog = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
-    with_fog["fog"] = {"rate_distribution": {"name": "uniform", "min": 0.0, "max": 0.8}}
-    fog_path = tmp_path / "pretrain_with_fog.yaml"
-    fog_path.write_text(yaml.safe_dump(with_fog), encoding="utf-8")
-    with pytest.raises(
-        ConfigError, match=r"config\.fog must not be set when data\.debut_mode=false"
-    ):
+    missing_fog = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    missing_fog.pop("fog")
+    fog_path = tmp_path / "pretrain_missing_fog.yaml"
+    fog_path.write_text(yaml.safe_dump(missing_fog), encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"config\.fog is required"):
         load_config(fog_path)
 
     # Pre-training config carrying `loss.class_loss_weights` -> rejected.
@@ -223,12 +216,13 @@ def test_pretraining_config_rejects_fog_and_class_loss_weights_sections(tmp_path
     ):
         load_config(weights_path)
 
-    # The mirror-image requirement: debut_mode=true REQUIRES both sections.
+    # Debut mode also requires fog plus its class weights.
     debut_missing_both = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
     debut_missing_both["data"]["debut_mode"] = True
+    debut_missing_both.pop("fog")
     debut_path = tmp_path / "debut_missing_fog.yaml"
     debut_path.write_text(yaml.safe_dump(debut_missing_both), encoding="utf-8")
-    with pytest.raises(ConfigError, match=r"config\.fog is required when data\.debut_mode=true"):
+    with pytest.raises(ConfigError, match=r"config\.fog is required"):
         load_config(debut_path)
 
     debut_missing_weights = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))

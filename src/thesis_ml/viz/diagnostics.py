@@ -73,6 +73,7 @@ import torch  # noqa: E402
 
 from thesis_ml.config import ProjectConfig, load_config  # noqa: E402
 from thesis_ml.data.dataset import DatasetExample, SC2DiffusionDataset  # noqa: E402
+from thesis_ml.data.feature_stats import load_feature_statistics  # noqa: E402
 from thesis_ml.data.windowing import (  # noqa: E402
     WindowManifestEntry,
     load_window_manifest,
@@ -181,7 +182,18 @@ def load_diagnostic_model(
     # Infer vocab size from the selected output head (shape [vocab_size, d_model]).
     vocab_size = int(state["output_head.weight"].shape[0])
 
-    model = SC2StrategyDiffusionModel(run_config, vocab_size=vocab_size)
+    statistics_identity = checkpoint.get("feature_statistics_identity")
+    if not isinstance(statistics_identity, str):
+        raise ValueError("checkpoint is missing feature_statistics_identity and is incompatible")
+    statistics = load_feature_statistics(
+        run_config.data.feature_statistics_path,
+        expected_identity=statistics_identity,
+    )
+    model = SC2StrategyDiffusionModel(
+        run_config,
+        vocab_size=vocab_size,
+        feature_statistics=statistics,
+    )
     model.load_state_dict(state)
     model.eval()
     return model, run_config
@@ -977,10 +989,7 @@ def write_input_canvas_text_files(
         if aggregate:
             lines.extend(["", f"# window: {item.label}"])
         if not item.example.input_records:
-            # Pre-training: input is literally absent, so there are no input
-            # records to dump. Emit an explicit marker rather than a silently
-            # empty section so a reader knows the absence is intentional.
-            lines.append("# (no input -- pre-training example has absent input)")
+            lines.append("# (empty input records)")
             continue
         for index, record in enumerate(item.example.input_records):
             marker = _allegiance_marker(record.allegiance)

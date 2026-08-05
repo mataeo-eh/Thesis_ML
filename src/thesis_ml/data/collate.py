@@ -7,7 +7,8 @@ from dataclasses import dataclass, replace
 import torch
 
 from thesis_ml.data.dataset import CLASS_ENEMY_FUTURE, CLASS_PAD, DatasetExample
-from thesis_ml.model.embedding import STAT_KEYS, InputFeatures, build_input_features
+from thesis_ml.data.feature_stats import CONTINUOUS_FEATURE_NAMES
+from thesis_ml.model.embedding import InputFeatures, build_input_features
 from thesis_ml.vocab.special_tokens import PAD_ID
 
 # Integer encoding of DatasetExample.perspective_player carried on the batch so
@@ -76,9 +77,9 @@ class DiffusionBatch:
             perspective_ids=self.perspective_ids.pin_memory(),
             canvas_prediction_distances=self.canvas_prediction_distances.pin_memory(),
             input_features=InputFeatures(
-                map_values=features.map_values.pin_memory(),
-                stat_values=features.stat_values.pin_memory(),
-                team_ids=features.team_ids.pin_memory(),
+                continuous_values=features.continuous_values.pin_memory(),
+                allegiance_values=features.allegiance_values.pin_memory(),
+                feature_mask=features.feature_mask.pin_memory(),
             ),
         )
 
@@ -94,19 +95,14 @@ def collate_diffusion_examples(
     Parameters:
         examples: the per-example dataset outputs to batch.
         debut_mode: whether this is a fine-tuning (debut) run. This is passed
-            EXPLICITLY by every call site rather than inferred from tensor
-            shapes. It scopes the "future" telemetry
-            (``enemy_future_timestep_counts`` and ``canvas_prediction_distances``)
-            to fine-tuning only: pre-training collapses the future class away, so
-            those fields are left at their empty/sentinel defaults (zeros / -1)
-            in pre-training.
+            explicitly by every call site rather than inferred from tensor
+            shapes; both modes now emit input/future telemetry.
         retain_metadata: keep the per-example Python object graphs (input
             records + canvas metadata) on the batch. Training drops them for
             faster worker-to-main serialization; eval keeps them.
     Returns:
         A ``DiffusionBatch`` with all model-facing tensors and telemetry.
-    Calls: build_input_features, _perspective_id, and (fine-tuning only) the
-        _enemy_future_* helpers.
+    Calls: build_input_features, _perspective_id, and the _enemy_future_* helpers.
     """
 
     if not examples:
@@ -136,37 +132,27 @@ def collate_diffusion_examples(
         target_canvas[row, :length] = example.target_canvas
         class_labels[row, :length] = example.class_labels
         canvas_attention_mask[row, :length] = True
-        # Future-prediction distances are a fine-tuning-only concept (pre-training
-        # has no future class). In pre-training we leave the row at its -1 fill.
-        if debut_mode:
-            canvas_prediction_distances[row, :length] = torch.tensor(
-                _enemy_future_prediction_distances(example),
-                dtype=torch.long,
-            )
+        canvas_prediction_distances[row, :length] = torch.tensor(
+            _enemy_future_prediction_distances(example),
+            dtype=torch.long,
+        )
     canvas_loss_mask = canvas_attention_mask.clone()
 
     input_records = [example.input_records for example in examples]
     if max_input_len == 0:
-        # Pre-training: input is literally absent. Skip build_input_features
-        # entirely and hand the model correctly-shaped zero-length feature
-        # tensors, so no per-record parsing runs and the input segment
-        # contributes zero sequence positions.
         input_features = InputFeatures(
-            map_values=torch.zeros((len(examples), 0, 2), dtype=torch.float32),
-            stat_values=torch.zeros((len(examples), 0, len(STAT_KEYS)), dtype=torch.float32),
-            team_ids=torch.zeros((len(examples), 0), dtype=torch.long),
+            continuous_values=torch.zeros(
+                (len(examples), 0, len(CONTINUOUS_FEATURE_NAMES)), dtype=torch.float32
+            ),
+            allegiance_values=torch.zeros((len(examples), 0, 1), dtype=torch.float32),
+            feature_mask=torch.zeros((len(examples), 0), dtype=torch.bool),
         )
     else:
         input_features = build_input_features(input_records, max_input_len, left_pad=True)
 
-    # Fine-tuning-only future telemetry: zeros in pre-training (no future class).
-    enemy_future_timestep_counts = (
-        torch.tensor(
-            [_enemy_future_timestep_count(example) for example in examples],
-            dtype=torch.long,
-        )
-        if debut_mode
-        else torch.zeros((len(examples),), dtype=torch.long)
+    enemy_future_timestep_counts = torch.tensor(
+        [_enemy_future_timestep_count(example) for example in examples],
+        dtype=torch.long,
     )
 
     return DiffusionBatch(

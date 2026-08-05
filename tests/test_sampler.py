@@ -1,6 +1,7 @@
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -183,12 +184,38 @@ def test_sampling_checkpoint_prefers_ema_weights(tmp_path) -> None:
     raw = FixedCanvasModel(torch.tensor([100, END_ID, PAD_ID]), vocab_size=128)
     ema = FixedCanvasModel(torch.tensor([101, END_ID, PAD_ID]), vocab_size=128)
     checkpoint = tmp_path / "checkpoint.pt"
-    torch.save({"model": raw.state_dict(), "ema_model": ema.state_dict()}, checkpoint)
+    raw.feature_statistics_identity = "test-statistics"
+    ema.feature_statistics_identity = "test-statistics"
+    torch.save(
+        {
+            "model": raw.state_dict(),
+            "ema_model": ema.state_dict(),
+            "feature_statistics_identity": "test-statistics",
+        },
+        checkpoint,
+    )
 
     loaded = FixedCanvasModel(torch.tensor([100, END_ID, PAD_ID]), vocab_size=128)
+    loaded.feature_statistics_identity = "test-statistics"
     load_sampling_checkpoint(loaded, checkpoint)
 
     assert torch.equal(loaded.target_canvas, ema.target_canvas)
+
+
+def test_sampling_checkpoint_rejects_incompatible_feature_statistics(tmp_path) -> None:
+    model = FixedCanvasModel(torch.tensor([100, END_ID, PAD_ID]), vocab_size=128)
+    model.feature_statistics_identity = "configured-statistics"
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "feature_statistics_identity": "different-statistics",
+        },
+        checkpoint,
+    )
+
+    with pytest.raises(ValueError, match="missing or incompatible"):
+        load_sampling_checkpoint(model, checkpoint)
 
 
 class FixedCanvasModel(nn.Module):
@@ -244,8 +271,7 @@ def _small_config(
 
 
 def _batch(config: ProjectConfig):
-    # make_synthetic_examples builds PRE-TRAINING fixtures (absent input,
-    # collapsed labels), so collate in pre-training mode.
+    # make_synthetic_examples builds restored pretraining fixtures.
     examples = make_synthetic_examples(config, count=1)
     return collate_diffusion_examples(examples, debut_mode=False)
 

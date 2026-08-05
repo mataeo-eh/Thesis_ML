@@ -27,19 +27,17 @@ Data extraction is complete and lives in a separate repository (`SC2-gamestate-e
 
 ## 3. Training objective — SETTLED
 
-One unified SSL denoising task family. The two stages differ in whether a clamped input region exists at all.
+One unified SSL denoising task family. Both stages use the same clamped-input corruption task; they differ in the canvas body semantics and fine-tuning loss weighting.
 
-**Pre-training input: NONE.** Pre-training is the published-MDLM-style pure reconstruction objective: the model sequence is 100% output canvas. There is no clamped input region, no self sequence, no fogged enemy sequence, and NO fog paradigm of any kind in pre-training. The `config.fog` section must be ABSENT from a pre-training config (`data.debut_mode=false`) — config validation rejects its presence rather than tolerating a dead knob.
-
-**Fine-tuning input (clamped; debut fine-tuning only, §8):**
+**Input (clamped; both modes):**
 - Interleaved per timestep: each timestep contributes `[self records][enemy records][ONE DELIMITER]` (exact grammar in §6).
 - Fog mechanism: **entity omission**. Fogged tokens are removed from the input entirely. No placeholder tokens, no mask tokens, no count signal of any kind for omitted tokens. Fog applies uniformly to enemy content tokens of EVERY token kind — entities AND cumulative upgrades (no entity-only special case).
-- Fog rate: a parameter of the corruption distribution, sampled per example from the config distribution (`config.fog`, REQUIRED when `data.debut_mode=true`). Zero fog degenerates to clean-past-predict-future. Fog applies to the enemy sequence only.
+- Fog rate: a parameter of the corruption distribution, sampled once per example from the required `config.fog` distribution. Zero fog degenerates to clean-past-predict-future. Fog applies to the enemy sequence only.
 
 **Target canvas (noised, receives loss):**
 - Leading outcome token: the canvas begins at position 0 with the `[WIN]`/`[LOSS]` outcome token for the perspective player, denoised LAST (see §9's `outcome_last` constraint). This token is part of pre-training itself — folded in so the model's frozen embedding prior includes it, rather than being introduced only at fine-tune time when the reduced learning rate makes a brand-new token hard to learn. Outcome/debut fine-tuning (§8) reuses the same leading-outcome-token layout.
 - The enemy sequence only: full reconstruction of the enemy past/present (both observed and fogged portions) plus the enemy future continuation, regenerated jointly, following the outcome token.
-- Canvas corruption during training: uniform i.i.d. masking with `[MASK]` at a sampled global corruption level *t* (MDLM-style). Per-timestep-varying corruption is an input-side data property (fog, fine-tuning only) and is never applied to the output canvas.
+- Canvas corruption during training: uniform i.i.d. masking with `[MASK]` at a sampled global corruption level *t* (MDLM-style). Input-side fog is independent and is never applied to the output canvas.
 - **t=1.0 oversampling (`diffusion.mask_schedule.t_one_fraction`, default 0.1):** when *t* is sampled (the real training path, not explicit-*t* eval/validation calls), each example independently draws a Bernoulli(`t_one_fraction`) coin; winners get *t* forced to EXACTLY 1.0 (fully masked canvas — the inference condition), while the rest keep the uniform draw over the schedule range. This is an expected per-epoch fraction (per-example Bernoulli), not an exact per-batch quota. Applies to both training modes.
 - **Per-epoch generator reseeding:** the training loop reseeds its corruption/self-conditioning generator to `base_seed + epoch_index` at every epoch boundary. Each epoch's masking stream is therefore a deterministic function of (seed, epoch), which keeps a resumed run's corruption draws aligned with the stream an uninterrupted run would have produced.
 - Canvas position 0 (the `[WIN]`/`[LOSS]` outcome token) receives NO training exemption: it is masked i.i.d. at rate *t* and weighted in the loss like any other canvas position. `outcome_last` (§9) is a sampler-only inference constraint.
@@ -48,12 +46,12 @@ One unified SSL denoising task family. The two stages differ in whether a clampe
 
 **Loss:**
 - Position-wise cross-entropy against canonically ordered targets (§5), canvas positions only.
-- Per-token-class loss logging is mandatory from the first training run. The class taxonomy is now MODE-DEPENDENT:
-  - **Pre-training (collapsed, 5 classes — `PRETRAIN_CLASS_ID_TO_NAME`):** content (every enemy content token — with no input and no fog there is no observed/fogged/future split to make), `[DELIMITER]`, `[END]`, `[PAD]`, and win-loss (the leading `[WIN]`/`[LOSS]` outcome token). Class ids 1 and 2 (the old fogged/future ids) are UNUSED in this mode and are NEVER renumbered — the map is sparse (ids 0/3/4/5/6), so id-indexed buffers must be sized `max(id) + 1`, not `len(map)`.
+- Per-token-class loss logging is mandatory from the first training run. Both modes retain stable dense ids 0–6 with mode-specific names:
+  - **Pre-training (7 classes — `PRETRAIN_CLASS_ID_TO_NAME`):** enemy-observed, enemy-fogged, enemy-future, delimiter, end, pad, win-loss.
   - **Debut fine-tuning (7 classes — `DEBUT_CLASS_ID_TO_NAME`):** visible-debut, fogged-debut, future-debut, delimiter, end, pad, win-loss.
 - **Pre-training loss weighting is fully uniform (published MDLM style):** every class weight is 1.0 except `[PAD]`, which is 0.0 so padding positions never contribute. Pre-training NEVER reads `config.loss.class_loss_weights` — that section must be ABSENT from a pre-training config (validation rejects it).
 - **Fine-tuning per-class loss weights** remain a config knob (`loss.class_loss_weights`, REQUIRED when `data.debut_mode=true`), default 1.0 (PROVISIONAL).
-- **Loss-breakdown metrics:** BOTH modes additionally log masked-CE broken down by the example's sampled *t*-bucket (`t_eq_1`, `[0.7,1.0)`, `[0.5,0.7)`, `[0.3,0.5)`, `[0.0,0.3)` — contiguous and exhaustive over [0,1]) and by player perspective (`p1`/`p2`). The future-distance decomposition (loss bucketed by prediction distance) is FINE-TUNING-ONLY: pre-training has no future class and must emit no future-distance keys or columns at all.
+- **Loss-breakdown metrics:** BOTH modes additionally log masked-CE broken down by the example's sampled *t*-bucket (`t_eq_1`, `[0.7,1.0)`, `[0.5,0.7)`, `[0.3,0.5)`, `[0.0,0.3)` — contiguous and exhaustive over [0,1]) and by player perspective (`p1`/`p2`). Both modes also emit input/future timestep telemetry and future-distance loss buckets.
 - **Auxiliary confidence loss (config-weighted):** an auxiliary term that sharpens per-position predictive confidence so confidence-based unmasking commits reliably and aggressively (fewer denoising steps → faster inference). Purpose per LLaDA2.0 (arXiv:2512.15745); implement by verifying that source's formulation, preferring a logits-derived form over a separate head. Config weight `confidence_loss_weight` (default small; 0.0 disables). Distinct from the §14-banned outcome classification head.
 - **EMA (SOTA diffusion practice):** maintain an exponential-moving-average copy of the weights during training (decay ~0.9999); use EMA weights for validation, the final checkpoint, sampling, and evaluation. EMA is standard for diffusion training and one of the practices distinguishing it from AR pretraining.
 - **Self-conditioning (config-gated, default on):** each denoising step may condition on the model's own previous clean-state canvas prediction (the prior step's softmax distribution), projected and added to canvas embeddings (canvas-only; input untouched). Training uses a two-pass procedure (prob `self_cond_prob`, default 0.5: a no-grad estimate pass, then a conditioned grad pass on which the loss is computed; null tensor otherwise). Inference reuses the previous step's prediction and adds NO extra forward passes. Train and inference interfaces must be identical. Per SCMDM (arXiv:2604.26985). This is prediction REUSE, not committed-token revision (remasking is deferred, §12).
@@ -64,7 +62,7 @@ There is no copy mechanism of any kind. Input-to-output copying is a learned beh
 
 - Raw atomic entity-level tokens only. One token per entity instance per timestep snapshot — unit counts emerge from token repetition. No BPE, no merges, no compound tokens, no learned tokenizer.
 - Single shared vocabulary for input and output. Content tokens are **raw entity-type tokens — entirely location-agnostic**. The token identity carries NO spatial information of any kind. Position is input-only and lives entirely in the contextual encodings (§6): the exact (X,Y) coordinate from the extractor parquet is added to the input token's embedding. The output canvas is location-agnostic — it predicts entity-type presence, timing, and counts (by repetition), never position.
-- Special tokens: `[MASK]` (absorbing noise state), `[PAD]`, `[END]`, `[DELIMITER]`, and reserved outcome tokens `[WIN]` / `[LOSS]` (used only in outcome fine-tuning, §8, but reserved in the vocabulary from day one so embeddings exist).
+- Special tokens: `[MASK]` (absorbing noise state), `[PAD]`, `[END]`, `[DELIMITER]`, and outcome tokens `[WIN]` / `[LOSS]` (used in both modes).
 - Outputs never contain raw coordinates, frame numbers, or absolute times. The vocabulary contains no tokens for them.
 - Concrete vocabulary contents are derived from the extractor schema (§13).
 
@@ -78,29 +76,25 @@ There is no copy mechanism of any kind. Input-to-output copying is a learned beh
 
 Two distinct kinds of "position" exist in this system and must never be conflated:
 - **Sequence position** — a token's index in the flat sequence. Encoded only with **Llama 3.1-style frequency-scaled RoPE**, applied to queries/keys in attention. Chosen specifically so that entity-counts-per-timestep and timestep-counts not seen during training do not break the model at inference. This is the only numerical sequence-position encoding the model receives: no learned absolute position table, absolute game clock, frame number, `game_loop`, or timestamp-derived feature.
-- **Map position** — where a unit sits on the game map: the exact (X,Y) coordinate from the extractor parquet. A *feature* of the entity, encoded as an additive **input-only** contextual encoding (below), never part of any token identity. Unrelated to RoPE.
+- **Map position** — where a unit sits on the game map: the exact (X,Y) coordinate from the extractor parquet. A standardized *feature* of the entity, encoded through the joint **input-only** conditioning path below, never part of token identity. Unrelated to RoPE.
 
-**Pre-training has NO input region.** The model sequence is exactly the output canvas: the backbone runs over canvas embeddings alone, the attention mask has zero input columns, there is no separator/BOS/segment token, and RoPE position 0 is the FIRST CANVAS TOKEN. Everything below about input token embedding applies to fine-tuning only.
+**Input grammar — interleaved per timestep in both modes.** Walking the window's timesteps in order, each timestep contributes `[self records][enemy records][ONE DELIMITER]`: all self records first, then the fog-filtered enemy records, closed by exactly ONE `[DELIMITER]`. The total input delimiter count therefore equals the window's timestep count.
 
-**Fine-tuning input grammar — interleaved per timestep.** Walking the window's timesteps in order, each timestep contributes `[self records][enemy records][ONE DELIMITER]`: all self records first, then the (fog-filtered) enemy records, closed by exactly ONE `[DELIMITER]`. The total input delimiter count therefore equals the window's timestep count. (This replaces the earlier `[all self timesteps][all enemy timesteps]` layout with one delimiter per player per timestep.)
-
-Input embedding pipeline — lives in the MODEL, not the tokenizer (these are learned parameters trained by backprop), applied to input tokens (fine-tuning only):
+Input embedding pipeline — lives in the MODEL, not the tokenizer (these are learned parameters trained by backprop), applied to input tokens in both modes:
 1. Token embedding lookup (learned).
-2. Additive contextual encodings, **input-only**: exact (X,Y) map position and unit stats. Canvas tokens never receive these. Map position uses extrapolation-friendly Fourier/sinusoidal features rather than a learned lookup over fixed bins. Absolute game time, frame number, `game_loop`, and timestamp-derived values are prohibited from this feature path.
-3. Team flag: a learned embedding component distinguishing self tokens from enemy tokens.
-4. RoPE applied in attention for sequence position (see above; in pre-training RoPE runs over the canvas-only sequence).
+2. Build the allowlisted static feature vector from standardized `(map_x, map_y, unit stats)` and numeric allegiance (`+1` self, `-1` enemy, `0` structural/missing). The statistics artifact is computed from the selected training split only with float64 population moments; zero-variance features use unit scale. Absolute game time, frame number, `game_loop`, token type, and timestamp-derived values are prohibited from this path.
+3. Project static features with `Linear(F,32) -> ReLU -> Linear(32,32) -> ReLU`, concatenate the result with the token embedding, and apply `Linear(d_model+32,d_model) -> GELU -> Linear(d_model,d_model)`. Add the residual only where static features exist. The final projection is exactly zero-initialized after generic model initialization, making the initial forward identical to token lookup while allowing the residual path to unlock through optimization.
+4. RoPE applied in attention for sequence position over the combined input-plus-canvas sequence.
 5. Timestep boundaries: `[DELIMITER]` tokens, present in both input and canvas.
 
-The tokenizer (§4–5) emits one sequence of token records carrying token identity and source metadata. A model-facing allowlisted feature structure carries only map position, unit stats, and allegiance into the embedding stack. Absolute clock metadata may remain available outside the model for dataset ordering and post-sampling evaluation, but must never be copied into model inputs, embeddings, attention inputs, or targets. The tokenizer never computes embeddings or positional encodings.
+The tokenizer (§4–5) emits one sequence of token records carrying token identity and source metadata. A model-facing allowlisted feature structure carries only map position, unit stats, and allegiance into the embedding stack. Feature-statistics artifacts carry a deterministic identity and source-split metadata; production training, resume, warm start, diagnostics, sampling, and exports must reject missing or mismatched identities. Absolute clock metadata may remain available outside the model for dataset ordering and post-sampling evaluation, but must never be copied into model inputs, embeddings, attention inputs, or targets. The tokenizer never computes embeddings or positional encodings.
 
 Windows may begin mid-game; the model must infer game phase from observed game state and sequence structure rather than an absolute clock.
 
 Pretraining windows are greedy contiguous runs of whole timesteps from one replay.
 A timestep is added only while the zero-fog serialized input remains within its
 budget and the full in-window enemy reconstruction remains within
-`canvas_recon_fraction × canvas_budget_tokens`. (The input budget still governs
-pre-training window TILING even though no input region is served in
-pre-training; the served sequence is canvas-only per the paragraph above.)
+`canvas_recon_fraction × canvas_budget_tokens`.
 Successive default windows tile each replay without overlap. One window is one
 batch sequence; sequence packing and cross-document masks are not used.
 
@@ -113,12 +107,12 @@ v1 uses delimiters only for timestep structure; a separate timestep-membership e
 - Absolute timing of canvas timesteps is recovered externally by arithmetic: clock of last input frame + fixed sampling interval × timestep index. The model never emits time.
 - **Target truncation rule — whole timesteps only:** reconstruction contains exactly the window timesteps and future continuation admits a timestep only when all enemy tokens plus its `[DELIMITER]` fit. No partial timestep is ever emitted. If the game ends within budget, append `[END]` then `[PAD]` to budget. Otherwise stop at the last complete boundary and append `[PAD]` directly to budget.
 - Grammar invariant (enforced in tests): a valid canvas is a leading `[WIN]`/`[LOSS]` outcome token, then `(timestep-tokens [DELIMITER])+`, followed by either `[END] [PAD]*` or `[PAD]*`. (The leading outcome token is present in both pre-training and debut fine-tuning; see §3 and §8.)
-- In pre-training the canvas is the ENTIRE model sequence (§6: no input region), and its class labeling is collapsed: every content token is the single "content" class — the observed/fogged/future split exists only in debut fine-tuning (§3).
+- In pre-training the canvas follows the clamped input and retains the observed/fogged/future content-class split (§3).
 
 ## 8. Outcome/debut training — SETTLED mechanism
 
-- Superseded framing (was: "the outcome token exists only in fine-tuning"). The `[WIN]`/`[LOSS]` outcome token is now emitted in BOTH pre-training (§3) and debut fine-tuning, at the same leading canvas position. `debut_mode` selects the canvas BODY that follows the outcome token — full enemy reconstruction + future roll-out (pre-training) vs sparse first-appearance debut events (fine-tuning) — AND whether an input region exists at all: pre-training serves no input (§3, §6), while debut fine-tuning serves the interleaved fogged input.
-- `debut_mode` also gates the fine-tuning-only config sections and metrics: `config.fog` and `config.loss.class_loss_weights` are REQUIRED when `debut_mode=true` and REJECTED when false (§3, §11), and the future-distance loss decomposition plus input-timestep/fog telemetry exist only in this mode.
+- The `[WIN]`/`[LOSS]` outcome token is emitted in BOTH pre-training (§3) and debut fine-tuning at the same leading canvas position. `debut_mode` selects only the canvas body and loss-weighting contract: full enemy reconstruction plus future roll-out in pre-training versus sparse first-appearance debut events in fine-tuning. Both modes serve the same interleaved fogged input grammar.
+- `debut_mode` gates `config.loss.class_loss_weights`; `config.fog`, future-distance loss decomposition, and input/future telemetry apply to both modes.
 - Debut detection is UNIFIED across token kinds: an event debuts when its per-timestep count exceeds the running maximum seen so far in the window's scan (count increase). For cumulative upgrade tokens — whose per-timestep count is always 0 or 1 — this fires exactly once, at first appearance, reproducing the previous upgrade special case, which is deleted.
 - Task: game outcome prediction. No classification head exists anywhere in this project.
 - Mechanism: the outcome token (`[WIN]`/`[LOSS]`) occupies the leading canvas position; the model denoises the outcome token and the normal continuation jointly in one pass. Pre-training uses the identical outcome-token placement and `outcome_last` denoising order.
@@ -159,7 +153,9 @@ All of the following are config fields in one YAML file, validated by a dataclas
 | `input_budget_tokens` | 4096 | Hard per-window input bound. Windows grow only at whole-timestep boundaries. |
 | `canvas_budget_tokens` | 4096 | Output canvas length for reconstruction plus future continuation. |
 | `canvas_recon_fraction` | 0.5 | Maximum canvas fraction consumed by in-window enemy reconstruction; reserves the remainder for future prediction. |
-| `fog_rate_distribution` | uniform(0.0, 0.8) | Sampled per example. FINE-TUNING-ONLY: the `fog` section is required when `data.debut_mode=true` and rejected when false (§3) |
+| `fog_rate_distribution` | uniform(0.0, 0.8) | Sampled once per example in both modes; the `fog` section is always required (§3). |
+| `data.feature_statistics_path` | `data/processed/feature_statistics.json` | Deterministic train-split normalization artifact; required by production model construction and checked against checkpoints. |
+| `pipeline.prepare_feature_statistics` | false | Explicit permission to compute or replace the statistics artifact from the selected training replay artifacts only. |
 | `within_type_tiebreak` | unit ID | §5 |
 | `class_loss_weights` | all 1.0 | Keyed by §3's debut classes. FINE-TUNING-ONLY: required when `data.debut_mode=true`, rejected when false; pre-training uses fixed uniform weighting with `[PAD]`=0 (§3) |
 | `diffusion.mask_schedule.t_one_fraction` | 0.1 | Expected per-epoch fraction of examples oversampled to exactly t=1.0 (per-example Bernoulli); 0.0 disables (§3). Stated explicitly in every profile YAML |

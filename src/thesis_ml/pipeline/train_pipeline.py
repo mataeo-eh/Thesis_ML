@@ -16,6 +16,12 @@ from torch.utils.data import DataLoader
 from thesis_ml.config import ProjectConfig, load_config
 from thesis_ml.data.collate import collate_diffusion_examples
 from thesis_ml.data.dataset import SC2DiffusionDataset
+from thesis_ml.data.feature_stats import (
+    FeatureStatistics,
+    compute_feature_statistics,
+    load_feature_statistics,
+    write_feature_statistics,
+)
 from thesis_ml.data.resumable_sampler import ResumableBatchSampler
 from thesis_ml.data.split import split_replays
 from thesis_ml.data.windowing import (
@@ -131,11 +137,14 @@ def _run_smoke_pipeline(config: ProjectConfig, resolver: StorageResolver) -> Tra
         examples,
         batch_size=smoke_config.pipeline.batch_size,
         shuffle=False,
-        # Smoke fixtures are pre-training-shaped (absent input, collapsed
-        # taxonomy), so collate in pre-training mode.
+        # Smoke fixtures exercise the restored pretraining input and taxonomy.
         collate_fn=partial(collate_diffusion_examples, debut_mode=False),
     )
-    model = SC2StrategyDiffusionModel(smoke_config, vocab_size=SMOKE_VOCAB_SIZE)
+    model = SC2StrategyDiffusionModel(
+        smoke_config,
+        vocab_size=SMOKE_VOCAB_SIZE,
+        feature_statistics=FeatureStatistics.identity_for_tests(),
+    )
     loop = TrainingLoop(model=model, config=smoke_config, seed=smoke_config.pipeline.seed)
     resumed = _try_resume(loop, checkpoint_dir)
     loop.fit(dataloader, max_steps=smoke_config.pipeline.smoke_steps, fixed_t=1.0)
@@ -202,6 +211,18 @@ def _run_real_pipeline(
         config=config,
         replay_paths=test_replays,
     )
+    replay_ids = [Path(path).name for path in train_replays]
+    if config.pipeline.prepare_feature_statistics:
+        feature_statistics = compute_feature_statistics(
+            {window.artifact_path for window in train_windows},
+            source_replay_ids=replay_ids,
+        )
+        write_feature_statistics(feature_statistics, config.data.feature_statistics_path)
+    feature_statistics = load_feature_statistics(
+        config.data.feature_statistics_path,
+        expected_source_replay_ids=replay_ids,
+    )
+
     train_dataset = SC2DiffusionDataset(
         train_windows,
         config,
@@ -248,7 +269,11 @@ def _run_real_pipeline(
     )
     if lr_override is not None:
         print(f"lr_override: train.lr set to {effective_lr:.3e} via --lr", flush=True)
-    model = SC2StrategyDiffusionModel(training_config, vocab_size=vocabulary.vocab_size)
+    model = SC2StrategyDiffusionModel(
+        training_config,
+        vocab_size=vocabulary.vocab_size,
+        feature_statistics=feature_statistics,
+    )
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     metrics_dir = _local_metrics_dir(config, resolver)
     metrics_path = metrics_dir / "step_metrics.jsonl"
@@ -459,9 +484,8 @@ def _make_dataloader(
         # InputFeatures are built in the worker before raw TokenRecord metadata
         # is dropped. Training does not consume those Python object graphs, so
         # excluding them avoids expensive worker-to-main-process serialization.
-        # debut_mode threads the pipeline mode EXPLICITLY into collate so the
-        # future telemetry is scoped correctly (fine-tuning-only). Both the
-        # pre-training and fine-tuning pipelines share this builder.
+        # debut_mode threads the pipeline mode explicitly into collate for
+        # mode-specific class naming. Both pipelines share the telemetry path.
         "collate_fn": partial(
             collate_diffusion_examples,
             retain_metadata=False,

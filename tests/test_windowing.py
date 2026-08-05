@@ -1,4 +1,5 @@
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 
@@ -6,9 +7,6 @@ import pytest
 import torch
 
 from thesis_ml.config import (
-    ClassLossWeightsConfig,
-    FogConfig,
-    UniformDistributionConfig,
     load_config,
 )
 from thesis_ml.data.collate import collate_diffusion_examples
@@ -17,6 +15,13 @@ from thesis_ml.data.dataset import (
     PRETRAIN_CLASS_ID_TO_NAME,
     SC2DiffusionDataset,
     _build_debut_target,
+)
+from thesis_ml.data.feature_stats import (
+    CONTINUOUS_FEATURE_NAMES,
+    FeatureStatisticsError,
+    compute_feature_statistics,
+    load_feature_statistics,
+    write_feature_statistics,
 )
 from thesis_ml.data.windowing import (
     MANIFEST_VERSION,
@@ -59,39 +64,47 @@ def _prepared(tmp_path: Path, *, debut_mode: bool = False):
     return config, vocabulary, entries
 
 
-def _as_debut_config(config):
-    """Flip a pre-training config into a valid fine-tuning (debut_mode) config.
-
-    Fog sampling, fogged/observed input variants, and CLASS_ENEMY_FUTURE labels
-    now exist ONLY in fine-tuning, so tests of those behaviors must serve
-    examples through a debut_mode=True config. A loaded debut config is
-    required (by `_validate_debut_mode_sections`) to carry `fog` and
-    `loss.class_loss_weights`, so both are populated here with plain defaults
-    -- the exact values are not under test. The window ENTRIES stay whatever
-    manifest they came from; `SC2DiffusionDataset` does not re-validate the
-    manifest stamp, so pre-training windows can be served in debut mode for
-    test purposes.
-    """
-
-    return replace(
-        config,
-        data=replace(config.data, debut_mode=True),
-        fog=FogConfig(
-            rate_distribution=UniformDistributionConfig(name="uniform", min=0.0, max=0.8)
-        ),
-        loss=replace(
-            config.loss,
-            class_loss_weights=ClassLossWeightsConfig(
-                enemy_observed_reconstruction=1.0,
-                enemy_fogged_reconstruction=1.0,
-                enemy_future_prediction=1.0,
-                delimiter=1.0,
-                end=1.0,
-                pad=1.0,
-                win_loss=1.0,
-            ),
-        ),
+def test_feature_statistics_are_deterministic_frozen_and_strict(tmp_path: Path) -> None:
+    config, _vocabulary, entries = _prepared(tmp_path)
+    artifact_paths = {entry.artifact_path for entry in entries}
+    statistics = compute_feature_statistics(
+        artifact_paths,
+        source_replay_ids=[FIXTURE.name],
     )
+    assert statistics.feature_names == CONTINUOUS_FEATURE_NAMES
+    assert all(count > 0 for count in statistics.counts)
+    assert all(std > 0 for std in statistics.stds)
+    for feature_name in statistics.zero_variance_features:
+        assert statistics.stds[statistics.feature_names.index(feature_name)] == 1.0
+
+    path = Path(config.data.feature_statistics_path)
+    path = tmp_path / path.name
+    write_feature_statistics(statistics, path)
+    first_bytes = path.read_bytes()
+    write_feature_statistics(statistics, path)
+    assert path.read_bytes() == first_bytes
+    loaded = load_feature_statistics(
+        path,
+        expected_identity=statistics.identity,
+        expected_source_replay_ids=[FIXTURE.name],
+    )
+    assert loaded == statistics
+
+    with pytest.raises(FeatureStatisticsError, match="training split"):
+        load_feature_statistics(path, expected_source_replay_ids=["heldout.parquet"])
+    with pytest.raises(FeatureStatisticsError, match="missing"):
+        load_feature_statistics(tmp_path / "absent.json")
+
+    malformed = json.loads(path.read_text(encoding="utf-8"))
+    malformed["feature_names"] = "not-an-array"
+    payload = {key: value for key, value in malformed.items() if key != "identity"}
+    malformed["identity"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+    malformed_path = tmp_path / "malformed-statistics.json"
+    malformed_path.write_text(json.dumps(malformed), encoding="utf-8")
+    with pytest.raises(FeatureStatisticsError, match="malformed"):
+        load_feature_statistics(malformed_path)
 
 
 def test_debut_windows_tile_inputs_by_input_budget_and_allow_overlapping_targets(
@@ -171,26 +184,15 @@ def test_manifest_obeys_budgets_and_tiles_single_replays_on_boundaries(
     metadata = json.loads(Path(config.data.window_manifest_path).read_text(encoding="utf-8").splitlines()[0])
     assert metadata["perspectives"] == ["p1", "p2"]
     assert {entry.perspective_player for entry in entries} == {"p1", "p2"}
-    # Input records only exist in FINE-TUNING (pre-training serves a literally
-    # absent input), so the owner/allegiance assertions below go through a
-    # debut-mode dataset built over the same windows. Pre-training examples are
-    # separately asserted to have an EMPTY input.
-    pretrain_dataset = SC2DiffusionDataset(
+    dataset = SC2DiffusionDataset(
         entries,
         config,
         vocabulary,
         seed=0,
         fog_rate_override=0.0,
     )
-    assert pretrain_dataset[0].input_records == []
-    assert pretrain_dataset[0].input_token_ids.numel() == 0
-    dataset = SC2DiffusionDataset(
-        entries,
-        _as_debut_config(config),
-        vocabulary,
-        seed=0,
-        fog_rate_override=0.0,
-    )
+    assert dataset[0].input_records
+    assert dataset[0].input_token_ids.numel() > 0
     for perspective in ("p1", "p2"):
         index = next(
             index
@@ -221,12 +223,6 @@ def test_manifest_obeys_budgets_and_tiles_single_replays_on_boundaries(
 def test_every_nonterminal_window_has_future_headroom_and_future_labels(tmp_path: Path) -> None:
     config, vocabulary, entries = _prepared(tmp_path)
     dataset = SC2DiffusionDataset(entries, config, vocabulary, seed=29, fog_rate_override=0.5)
-    # CLASS_ENEMY_FUTURE is a FINE-TUNING-ONLY label now (pre-training collapses
-    # every content token to CLASS_CONTENT), so the future-label half of this
-    # test is asserted through a debut-mode dataset over the same windows.
-    debut_dataset = SC2DiffusionDataset(
-        entries, _as_debut_config(config), vocabulary, seed=29, fog_rate_override=0.5
-    )
     minimum_headroom = int((1.0 - config.data.canvas_recon_fraction) * config.data.canvas_budget_tokens)
 
     nonterminal_future_label_counts: list[int] = []
@@ -240,17 +236,10 @@ def test_every_nonterminal_window_has_future_headroom_and_future_labels(tmp_path
             and int(item["timestep_index"]) < entry.timestep_count
         ]
         assert len(reconstruction_metadata) == entry.enemy_reconstruction_token_count
-        # Pre-training labels never include the future class at all.
-        assert int((example.class_labels == CLASS_ENEMY_FUTURE).sum()) == 0
         if not entry.reaches_replay_end:
-            debut_example = debut_dataset[index]
             nonterminal_future_label_counts.append(
-                int((debut_example.class_labels == CLASS_ENEMY_FUTURE).sum())
+                int((example.class_labels == CLASS_ENEMY_FUTURE).sum())
             )
-    # Debut canvases contain a future-debut token only when something genuinely
-    # NEW appears beyond the input window (late-game windows may see nothing
-    # new), so the future-labels claim is aggregated: non-terminal windows
-    # exist and future-debut labels appear among them.
     assert nonterminal_future_label_counts
     assert any(count > 0 for count in nonterminal_future_label_counts)
 
@@ -314,51 +303,28 @@ def test_stale_manifest_version_and_config_stamp_are_refused(tmp_path: Path) -> 
         load_window_manifest(manifest, config=config)
 
 
-def test_short_smoke_logs_all_five_pretraining_classes_from_first_step(tmp_path: Path) -> None:
-    # The smoke train runs in PRE-TRAINING mode, whose class taxonomy is now
-    # COLLAPSED to 5 names (content / [DELIMITER] / [END] / [PAD] / win-loss):
-    # there is no observed/fogged/future split without an input or fog, so the
-    # per-class log must carry exactly PRETRAIN_CLASS_ID_TO_NAME's names from
-    # the very first step (ids 1 and 2 are never emitted in this mode).
+def test_short_smoke_logs_all_pretraining_classes_from_first_step(tmp_path: Path) -> None:
     first = run_smoke_train(max_steps=1, seed=41, checkpoint_dir=tmp_path / "smoke")[0]
     assert set(first.per_class) == set(PRETRAIN_CLASS_ID_TO_NAME.values())
 
 
 def test_fog_is_resampled_per_serving_while_clean_tokens_stay_fixed(tmp_path: Path) -> None:
-    # Fog now exists ONLY in fine-tuning (pre-training's input is literally
-    # absent, so there is nothing to fog or resample), so this test serves the
-    # same windows through a debut-mode dataset. The invariant is unchanged:
-    # the clean input variant is a fixed function of the window, while the
-    # fogged input is resampled on every serving (here: across epochs).
     config, vocabulary, entries = _prepared(tmp_path)
-    dataset = SC2DiffusionDataset(entries, _as_debut_config(config), vocabulary, seed=91)
+    dataset = SC2DiffusionDataset(entries, config, vocabulary, seed=91)
     first = dataset[0]
     dataset.set_epoch(1)
     second = dataset[0]
     assert torch.equal(first.clean_input_token_ids, second.clean_input_token_ids)
     assert not torch.equal(first.input_token_ids, second.input_token_ids)
 
-    # And the pre-training dataset over the same windows has NO input at all --
-    # nothing fogged, nothing observed, zero-length input tensors.
-    pretrain_dataset = SC2DiffusionDataset(entries, config, vocabulary, seed=91)
-    pretrain_example = pretrain_dataset[0]
-    assert pretrain_example.input_token_ids.numel() == 0
-    assert pretrain_example.fogged_counts == {}
-    assert pretrain_example.observed_counts == {}
-
-
 def test_dynamic_padding_masks_loss_and_preserves_real_position_outputs(tmp_path: Path) -> None:
-    # Variable-length INPUT only exists in fine-tuning now (pre-training input
-    # is uniformly zero-length, so there would be nothing to left-pad), so this
-    # padding-equivalence test runs against a debut-mode dataset.
     config, vocabulary, entries = _prepared(tmp_path)
-    config = _as_debut_config(config)
     dataset = SC2DiffusionDataset(entries, config, vocabulary, seed=17, fog_rate_override=0.5)
     examples = [dataset[0], dataset[-1]]
     short_index = min(range(2), key=lambda index: examples[index].input_token_ids.numel())
     short = examples[short_index]
-    batch = collate_diffusion_examples(examples, debut_mode=True)
-    alone = collate_diffusion_examples([short], debut_mode=True)
+    batch = collate_diffusion_examples(examples, debut_mode=False)
+    alone = collate_diffusion_examples([short], debut_mode=False)
 
     assert batch.input_token_ids.shape[1] == max(example.input_token_ids.numel() for example in examples)
     assert batch.target_canvas.shape[1] == max(example.target_canvas.numel() for example in examples)

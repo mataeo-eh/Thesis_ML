@@ -60,8 +60,9 @@ def test_real_manifest_pipeline_uses_workers_and_resumes(tmp_path: Path) -> None
         {
             "input_budget_tokens": 512,
             "canvas_budget_tokens": 256,
-            "tokenized_replay_dir": str(tmp_path / "tokenized"),
-            "window_manifest_path": str(tmp_path / "manifest.jsonl"),
+                "tokenized_replay_dir": str(tmp_path / "tokenized"),
+                "window_manifest_path": str(tmp_path / "manifest.jsonl"),
+                "feature_statistics_path": str(tmp_path / "feature_statistics.json"),
         }
     )
     raw["pipeline"].update(
@@ -73,7 +74,8 @@ def test_real_manifest_pipeline_uses_workers_and_resumes(tmp_path: Path) -> None
             "num_workers": 2,
             "prefetch_factor": 1,
             "test_fraction": 0.0,
-            "dev_fraction": 0.0,
+                "dev_fraction": 0.0,
+                "prepare_feature_statistics": True,
         }
     )
     raw["data_source"]["workers"] = 1
@@ -133,8 +135,9 @@ def test_proper_finish_writes_durable_finished_model(tmp_path: Path) -> None:
         {
             "input_budget_tokens": 512,
             "canvas_budget_tokens": 256,
-            "tokenized_replay_dir": str(tmp_path / "tokenized"),
-            "window_manifest_path": str(tmp_path / "manifest.jsonl"),
+                "tokenized_replay_dir": str(tmp_path / "tokenized"),
+                "window_manifest_path": str(tmp_path / "manifest.jsonl"),
+                "feature_statistics_path": str(tmp_path / "feature_statistics.json"),
         }
     )
     raw["pipeline"].update(
@@ -145,7 +148,8 @@ def test_proper_finish_writes_durable_finished_model(tmp_path: Path) -> None:
             "token_dictionary_uri": str(root / "data" / "Token_Dictionary.json"),
             "num_workers": 0,
             "test_fraction": 0.0,
-            "dev_fraction": 0.0,
+                "dev_fraction": 0.0,
+                "prepare_feature_statistics": True,
         }
     )
     raw["data_source"]["workers"] = 1

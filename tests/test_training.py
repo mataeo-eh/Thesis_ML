@@ -35,9 +35,8 @@ from thesis_ml.train.train import _synthetic_input_records, make_synthetic_examp
 from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID, WIN_ID
 
 # All fixtures in this file (except `_make_debut_synthetic_examples`, used only
-# by the one debut-mode test below) are PRE-TRAINING-shaped (see
-# `make_synthetic_examples`'s docstring in train/train.py): absent input, the
-# collapsed CLASS_CONTENT taxonomy. `collate_diffusion_examples` requires an
+# by the one debut-mode test below) use the restored pretraining input and
+# seven-class taxonomy. `collate_diffusion_examples` requires an
 # explicit `debut_mode` at every call site (Worker 3), so these two bound
 # partials are the "which grammar is this batch built from" answer for the
 # two fixture families in this file.
@@ -52,9 +51,8 @@ def test_smoke_train_loss_decreases_and_first_step_per_class_logs(tmp_path: Path
     last = logs[-1]
     assert last.loss < first.loss
 
-    # The smoke train is a PRE-TRAINING run, so its per-class log uses the
-    # collapsed 5-name pre-training taxonomy (PRETRAIN_CLASS_ID_TO_NAME); the
-    # synthetic fixtures carry one label of each of those ids.
+    # The smoke train is a pretraining run whose synthetic fixture carries one
+    # label for every stable pretraining class id.
     examples = make_synthetic_examples(_small_config(tmp_path), count=1)
     expected_classes = {
         PRETRAIN_CLASS_ID_TO_NAME[int(label)] for label in examples[0].class_labels.unique()
@@ -425,15 +423,12 @@ def test_epoch_metrics_csv_contains_train_dev_classes_and_throughput(tmp_path: P
     assert all(float(row["wall_clock_elapsed_seconds"]) > 0 for row in rows)
     assert all(float(row["average_cuda_device_memory_used_bytes"]) == 0 for row in rows)
     assert all(float(row["average_cuda_device_memory_gap_bytes"]) == 0 for row in rows)
-    # Pre-training has NO input, NO fog, and NO future class, so the epoch CSV
-    # must carry NONE of the input-timestep / future-distance columns at all
-    # (they are fine-tuning-only, not merely empty).
-    assert "average_input_timesteps" not in fieldnames
-    assert "average_enemy_future_timesteps" not in fieldnames
-    assert "input_timestep_p50" not in fieldnames
-    assert "enemy_future_timestep_p50" not in fieldnames
-    assert "train_enemy_future_loss_distance_1" not in fieldnames
-    assert "dev_enemy_future_loss_distance_1" not in fieldnames
+    assert "average_input_timesteps" in fieldnames
+    assert "average_enemy_future_timesteps" in fieldnames
+    assert "input_timestep_p50" in fieldnames
+    assert "enemy_future_timestep_p50" in fieldnames
+    assert "train_enemy_future_loss_distance_1" in fieldnames
+    assert "dev_enemy_future_loss_distance_1" in fieldnames
     # t-bucket / perspective breakdown columns (Worker 3): with fixed_t=1.0
     # every example lands in the exact-t==1 bucket; the other four bucket
     # columns exist but are written as "" (the empty-bucket convention).
@@ -447,19 +442,15 @@ def test_epoch_metrics_csv_contains_train_dev_classes_and_throughput(tmp_path: P
     assert all(float(row["train_perspective_loss_p2"]) > 0 for row in rows)
     assert all(float(row["dev_perspective_loss_p1"]) > 0 for row in rows)
     assert all(float(row["dev_perspective_loss_p2"]) > 0 for row in rows)
-    # 24 tokens per epoch, canvas only: pre-training input is literally absent
-    # (zero input tokens), leaving 2 examples x 12 canvas tokens per epoch.
-    assert [int(row["total_tokens_ingested"]) for row in rows] == [24, 48]
-    # 10 unique ids, all from the canvas: [WIN], six content ids (100..105),
-    # [DELIMITER], [END], [PAD]. No input tokens exist to add more.
+    # Two examples x (3 fogged input + 12 canvas) tokens per epoch.
+    assert [int(row["total_tokens_ingested"]) for row in rows] == [30, 60]
+    # Input and canvas reuse these same 10 unique ids.
     assert [int(row["total_unique_tokens_seen"]) for row in rows] == [10, 10]
-    # Per-class columns use the collapsed pre-training taxonomy: "content"
-    # replaces the old observed/fogged/future trio.
-    assert "train_content_loss" in fieldnames
+    # Pretraining retains observed/fogged/future reconstruction classes.
+    assert "train_enemy_observed_loss" in fieldnames
     assert "dev_pad_loss" in fieldnames
-    assert "train_enemy_observed_loss" not in fieldnames
-    assert "train_enemy_fogged_loss" not in fieldnames
-    assert "train_enemy_future_loss" not in fieldnames
+    assert "train_enemy_fogged_loss" in fieldnames
+    assert "train_enemy_future_loss" in fieldnames
 
 
 def test_epoch_metrics_migrates_an_existing_narrower_schema(tmp_path: Path) -> None:
@@ -479,22 +470,12 @@ def test_epoch_metrics_migrates_an_existing_narrower_schema(tmp_path: Path) -> N
     assert rows[0]["epoch"] == "0"
     # The migrated legacy row has no value for the newer t-bucket column; the
     # freshly-written epoch (run with fixed_t=1.0) populates the exact-t==1
-    # bucket. (average_input_timesteps is no longer a pre-training column, so
-    # a pre-training-schema migration is asserted via the t-bucket column.)
+    # bucket; the migration is asserted through this newer column.
     assert rows[0]["train_t_bucket_loss_t_eq_1"] == ""
     assert float(rows[1]["train_t_bucket_loss_t_eq_1"]) > 0
 
 
-def test_pretraining_epoch_metrics_has_all_five_collapsed_classes_including_winloss(tmp_path: Path) -> None:
-    """Pre-training's epoch CSV carries exactly the 5 collapsed class columns.
-
-    With debut_mode False (pre-training), the class taxonomy is COLLAPSED: the
-    old observed/fogged/future trio becomes a single "content" class (there is
-    no input and no fog to distinguish them), leaving content, delimiter, end,
-    pad, and win_loss (the canvas still leads with the [WIN]/[LOSS] token at
-    position 0). The CSV must contain exactly those 5 class columns per split
-    -- the observed/fogged/future columns must NOT exist at all.
-    """
+def test_pretraining_epoch_metrics_has_all_seven_classes_including_winloss(tmp_path: Path) -> None:
 
     config = _small_config(tmp_path)
     assert config.data.debut_mode is False
@@ -513,7 +494,15 @@ def test_pretraining_epoch_metrics_has_all_five_collapsed_classes_including_winl
     expected_class_columns = {
         f"{split}_{name}_loss"
         for split in ("train", "dev")
-        for name in ("content", "delimiter", "end", "pad", "win_loss")
+        for name in (
+            "enemy_observed",
+            "enemy_fogged",
+            "enemy_future",
+            "delimiter",
+            "end",
+            "pad",
+            "win_loss",
+        )
     }
     present_class_columns = {name for name in fieldnames if name.endswith("_loss") and name not in {"train_loss", "dev_loss"}}
     # Exclude the t-bucket / perspective breakdown columns, which also end in a
@@ -526,10 +515,9 @@ def test_pretraining_epoch_metrics_has_all_five_collapsed_classes_including_winl
     }
     assert present_class_columns == expected_class_columns
     assert "train_win_loss_loss" in fieldnames
-    # The pre-fine-tuning-only class names must be absent entirely.
-    assert "train_enemy_observed_loss" not in fieldnames
-    assert "train_enemy_fogged_loss" not in fieldnames
-    assert "train_enemy_future_loss" not in fieldnames
+    assert "train_enemy_observed_loss" in fieldnames
+    assert "train_enemy_fogged_loss" in fieldnames
+    assert "train_enemy_future_loss" in fieldnames
     assert all(float(rows[0][column]) >= 0 for column in expected_class_columns if rows[0][column] != "")
 
 

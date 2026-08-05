@@ -154,6 +154,15 @@ def test_contextual_encodings_are_input_only() -> None:
     changed_features = _features(changed_records, input_ids.shape[1])
     base_input = model.embedding.embed_input(input_ids, input_features=base_features)
     changed_input = model.embedding.embed_input(input_ids, input_features=changed_features)
+    # Exact zero final projection means the joint branch initially outputs
+    # zero, so both are exactly the unobstructed type embedding.
+    assert torch.equal(base_input, model.embedding.token_embedding(input_ids))
+    assert torch.equal(base_input, changed_input)
+
+    with torch.no_grad():
+        model.embedding.joint_mixer[-1].weight.fill_(0.01)
+    changed_input = model.embedding.embed_input(input_ids, input_features=changed_features)
+    base_input = model.embedding.embed_input(input_ids, input_features=base_features)
     assert not torch.allclose(base_input[:, 0], changed_input[:, 0])
 
     base_full = model.embedding(input_ids, canvas_ids, input_features=base_features)
@@ -174,13 +183,56 @@ def test_absolute_game_time_cannot_enter_model_features() -> None:
     assert not hasattr(base_features, "clock_values")
     assert not hasattr(model.embedding, "clock_projection")
     assert not hasattr(model.embedding, "clock_fourier")
-    assert torch.equal(base_features.map_values, changed_features.map_values)
-    assert torch.equal(base_features.stat_values, changed_features.stat_values)
-    assert torch.equal(base_features.team_ids, changed_features.team_ids)
+    assert torch.equal(base_features.continuous_values, changed_features.continuous_values)
+    assert torch.equal(base_features.allegiance_values, changed_features.allegiance_values)
+    assert torch.equal(base_features.feature_mask, changed_features.feature_mask)
     assert torch.equal(
         model.embedding.embed_input(input_ids, input_features=base_features),
         model.embedding.embed_input(input_ids, input_features=changed_features),
     )
+
+
+def test_joint_static_embedding_zero_init_staged_gradients_and_locality() -> None:
+    torch.manual_seed(31)
+    model = SC2StrategyDiffusionModel(_small_config(layers=1), vocab_size=128)
+    embedding = model.embedding
+    input_ids = torch.tensor([[6, 7, 8]])
+    features = _features(_records(1, 3), 3)
+
+    initial = embedding.embed_input(input_ids, input_features=features)
+    assert torch.equal(initial, embedding.token_embedding(input_ids))
+    assert torch.count_nonzero(embedding.joint_mixer[-1].weight) == 0
+    assert torch.count_nonzero(embedding.joint_mixer[-1].bias) == 0
+
+    optimizer = torch.optim.SGD(embedding.parameters(), lr=0.1)
+    initial.square().sum().backward()
+    assert embedding.token_embedding.weight.grad is not None
+    assert embedding.token_embedding.weight.grad.abs().sum() > 0
+    assert embedding.joint_mixer[-1].weight.grad is not None
+    assert embedding.joint_mixer[-1].weight.grad.abs().sum() > 0
+    assert embedding.joint_mixer[0].weight.grad is not None
+    assert embedding.joint_mixer[0].weight.grad.abs().sum() == 0
+    assert embedding.feature_mlp[0].weight.grad is not None
+    assert embedding.feature_mlp[0].weight.grad.abs().sum() == 0
+    optimizer.step()
+    optimizer.zero_grad()
+
+    embedding.embed_input(input_ids, input_features=features).square().sum().backward()
+    assert embedding.joint_mixer[0].weight.grad.abs().sum() > 0
+    assert embedding.feature_mlp[0].weight.grad.abs().sum() > 0
+
+    changed_continuous = features.continuous_values.clone()
+    changed_continuous[0, 1, 0] += 10.0
+    changed = InputFeatures(
+        continuous_values=changed_continuous,
+        allegiance_values=features.allegiance_values,
+        feature_mask=features.feature_mask,
+    )
+    base_output = embedding.embed_input(input_ids, input_features=features)
+    changed_output = embedding.embed_input(input_ids, input_features=changed)
+    assert not torch.allclose(base_output[:, 1], changed_output[:, 1])
+    assert torch.equal(base_output[:, 0], changed_output[:, 0])
+    assert torch.equal(base_output[:, 2], changed_output[:, 2])
 
 
 def test_self_conditioning_adds_to_canvas_only_and_null_is_equivalent() -> None:
@@ -345,7 +397,7 @@ def test_loss_is_canvas_only() -> None:
     changed_full_logits = full_logits.clone()
     changed_full_logits[:, :input_len, :] = 100.0
     target = torch.tensor([[1, 2, 3, 4]])
-    # Pre-training labels: content tokens collapse to the single CLASS_CONTENT
+    # Pretraining labels preserve the observed/fogged/future partition.
     # class (ids 1/2 are never emitted in this mode).
     labels = torch.tensor([[CLASS_CONTENT, CLASS_CONTENT, CLASS_DELIMITER, CLASS_PAD]])
 
@@ -356,9 +408,7 @@ def test_loss_is_canvas_only() -> None:
 
 
 def test_per_class_logging_populated_and_consistent() -> None:
-    # Pre-training config -> the per-class decomposition uses the COLLAPSED
-    # 5-name taxonomy (PRETRAIN_CLASS_ID_TO_NAME): every content token is
-    # "content"; the old enemy-observed/-fogged/-future names must not appear.
+    # Pre-training uses reconstruction/fog/future names with stable ids.
     config = _small_config()
     loss_fn = CanvasCrossEntropyLoss(config)
     logits = torch.zeros(1, 4, 8)
@@ -367,17 +417,17 @@ def test_per_class_logging_populated_and_consistent() -> None:
 
     result = loss_fn(logits, target, labels)
 
-    assert set(result.per_class) == {"content", "[DELIMITER]", "[PAD]"}
+    assert set(result.per_class) == {"enemy-observed", "[DELIMITER]", "[PAD]"}
     assert set(result.per_class) <= set(PRETRAIN_CLASS_ID_TO_NAME.values())
-    assert "enemy-observed" not in result.per_class
+    assert "enemy-observed" in result.per_class
     assert "enemy-fogged" not in result.per_class
     expected = torch.stack(list(result.per_class.values())).mean()
     assert torch.allclose(result.loss, expected)
 
 
 def test_future_loss_is_bucketed_by_prediction_distance() -> None:
-    # Future-distance decomposition is FINE-TUNING-ONLY now (pre-training has
-    # no future class at all), so the loss must be built from a debut config.
+    # A debut-config loss keeps this test focused on the fine-tuning class names;
+    # the same distance decomposition is also active in pre-training.
     loss_fn = CanvasCrossEntropyLoss(_small_debut_config())
     logits = torch.zeros(1, 6, 8)
     target = torch.tensor([[1, 2, 3, 4, 5, 6]])
@@ -401,21 +451,20 @@ def test_future_loss_is_bucketed_by_prediction_distance() -> None:
     )
 
 
-def test_pretraining_loss_never_emits_future_distance_even_with_distances() -> None:
-    """The pre-training loss emits NO future-distance keys, even when the
-    collate path hands it a distances tensor -- the decomposition is gated on
-    debut_mode, not merely on the label never appearing."""
+def test_pretraining_loss_emits_future_distance() -> None:
 
     loss_fn = CanvasCrossEntropyLoss(_small_config())
     logits = torch.zeros(1, 4, 8)
     target = torch.tensor([[1, 2, 3, 4]])
-    labels = torch.tensor([[CLASS_CONTENT, CLASS_CONTENT, CLASS_DELIMITER, CLASS_PAD]])
-    distances = torch.tensor([[1, 2, 3, 4]])
+    labels = torch.tensor(
+        [[CLASS_ENEMY_FUTURE, CLASS_ENEMY_FUTURE, CLASS_DELIMITER, CLASS_PAD]]
+    )
+    distances = torch.tensor([[1, 2, -1, -1]])
 
     result = loss_fn(logits, target, labels, prediction_distances=distances)
 
-    assert result.future_distance == {}
-    assert result.future_distance_counts == {}
+    assert set(result.future_distance) == {"1", "2_5"}
+    assert result.future_distance_counts == {"1": 1, "2_5": 1}
 
 
 def test_t_bucket_edges_are_contiguous_exhaustive_and_perspectives_emit_both_keys() -> None:

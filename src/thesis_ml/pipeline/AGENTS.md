@@ -22,6 +22,8 @@
 - Model scale, token budgets, paths, subset selection, epochs, and checkpoint intervals stay config-owned.
 - Debut-mode full training evaluates the EMA model with the fine-tune report schema against the true test split; uncapped evaluation remains lazy instead of materializing every window in host RAM.
 - Both real pipelines require `pipeline.perspectives` to contain exactly `p1,p2`, canonicalize that order, and reject stale manifests that do not record both perspectives.
+- `pipeline.prepare_feature_statistics` explicitly controls artifact generation. Training computes statistics from the selected train replay artifacts only, then all production train/fine-tune/diagnostic paths strictly load `data.feature_statistics_path` and require its source split and identity to match.
+- Resume, warm-start, and sampler checkpoint loads fail when feature-statistics identity is absent or mismatched. Finished exports carry the same identity in model metadata and bundles.
 
 ## Work Guidance
 

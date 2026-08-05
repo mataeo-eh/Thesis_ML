@@ -15,7 +15,8 @@
 
 - `SPEC.md` is the architecture source of truth and wins on any conflict. Do not implement §14 (banned list) or §12 (open questions) in any form.
 - Every tunable is a config field validated in `config.py`; changing a parameter must be a YAML edit only, never a code change.
-- Tokens are location-agnostic entity-type tokens. Map position and unit stats are input-only additive features (owned by `model/embedding.py`); they never enter token identity or the output vocabulary.
+- Tokens are location-agnostic entity-type tokens. Standardized map position and unit stats plus numeric allegiance are input-only joint-conditioning features (owned by `model/embedding.py`); they never enter token identity or the output vocabulary.
+- Production model construction must load the configured train-split feature-statistics artifact and preserve its identity through checkpoints and exports. Synthetic/direct unit tests may opt into the explicit identity statistics fixture.
 - Never place absolute game time, frame number, `game_loop`, or timestamp-derived values into model inputs, embeddings, attention inputs, or targets. Keep time as non-model metadata only.
 - Preserve the canonical serialization order (primary: entity type ID; tiebreak: config `within_type_tiebreak`) across input serialization and target construction.
 

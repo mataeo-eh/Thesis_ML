@@ -2,12 +2,10 @@
 
 Two training modes are served from the same manifest-backed dataset class:
 
-- PRE-TRAINING (``config.data.debut_mode`` False): the input is LITERALLY
-  ABSENT -- no fog, no self/enemy input blocks, zero-length input tensors.
-  The model sequence is 100% output canvas (the published MDLM/LLaDA pure
-  reconstruction objective): the leading [WIN]/[LOSS] outcome token, then the
-  full enemy reconstruction + future roll-out. Every content token is labeled
-  with the single collapsed CLASS_CONTENT class.
+- PRE-TRAINING (``config.data.debut_mode`` False): a clamped input interleaves
+  every self record with an omission-corrupted enemy block per timestep. The
+  canvas remains the leading outcome token plus full enemy reconstruction and
+  future roll-out.
 
 - DEBUT FINE-TUNING (``debut_mode`` True): a clamped, fog-filtered input is
   served alongside a sparse debut-event canvas. The input interleaves
@@ -63,14 +61,7 @@ CLASS_PAD = 5
 # existing ids are NOT renumbered so pretraining canvases keep the same labels.
 CLASS_WINLOSS = 6
 
-# Pre-training-only alias. In pre-training there is no input and no fog, so
-# the observed/fogged/future three-way split that fine-tuning uses does not
-# apply: every enemy content token collapses into this single class. Reuses
-# CLASS_ENEMY_OBSERVED's value (0) rather than allocating a new id -- the two
-# names are interchangeable, they just describe the same id in two different
-# training modes. CLASS_ENEMY_FOGGED (1) and CLASS_ENEMY_FUTURE (2) are left
-# defined above, unused, and un-renumbered, because fine-tuning still needs
-# them.
+# Compatibility alias for the observed reconstruction class.
 CLASS_CONTENT = CLASS_ENEMY_OBSERVED
 
 CLASS_LABELS: dict[str, int] = {
@@ -97,17 +88,12 @@ DEBUT_CLASS_ID_TO_NAME: dict[int, str] = {
     CLASS_WINLOSS: "win-loss",
 }
 
-# Pre-training-only class-id -> human-readable-name map (mirrors
-# DEBUT_CLASS_ID_TO_NAME's role, but for the pre-training canvas). Pre-training
-# never emits ids 1 or 2 (CLASS_ENEMY_FOGGED / CLASS_ENEMY_FUTURE): there is no
-# fog and no input/future split in this mode, since the canvas IS the entire
-# reconstruction target, so every content token is CLASS_CONTENT. Those two
-# ids are intentionally ABSENT here -- this map is sparse (5 entries, ids
-# 0/3/4/5/6), not a dense 0..N range. Any consumer that builds an id-indexed
-# buffer (e.g. per-class loss weights) MUST size it by max(id) + 1, not
-# len(map), or it will under-allocate.
+# Pre-training uses reconstruction/fog/future names rather than debut names,
+# but retains the same stable numeric ids.
 PRETRAIN_CLASS_ID_TO_NAME: dict[int, str] = {
-    CLASS_CONTENT: "content",
+    CLASS_ENEMY_OBSERVED: "enemy-observed",
+    CLASS_ENEMY_FOGGED: "enemy-fogged",
+    CLASS_ENEMY_FUTURE: "enemy-future",
     CLASS_DELIMITER: "[DELIMITER]",
     CLASS_END: "[END]",
     CLASS_PAD: "[PAD]",
@@ -153,12 +139,8 @@ class DatasetExample:
 class SC2DiffusionDataset(Dataset[DatasetExample]):
     """Lazy manifest-backed training examples for both training modes.
 
-    Pre-training (``config.data.debut_mode`` False) serves CANVAS-ONLY
-    examples: ``input_token_ids`` / ``clean_input_token_ids`` are zero-length,
-    ``input_records`` is empty, and no fog is ever sampled (``config.fog`` is
-    None for pre-training configs and is never read here). Debut fine-tuning
-    (True) serves the clamped, per-serving fog-filtered interleaved input plus
-    the sparse debut canvas. See the module docstring for the two grammars.
+    Both modes serve the same clamped, per-serving fog-filtered interleaved
+    input. ``debut_mode`` changes only the canvas body/taxonomy.
     """
 
     def __init__(
@@ -191,29 +173,16 @@ class SC2DiffusionDataset(Dataset[DatasetExample]):
         enemy_player = _enemy_player(window.perspective_player)
         rng = self._rng_for_index(index)
 
-        if self.config.data.debut_mode:
-            # Fine-tuning: sample one fog rate for this served example and use
-            # it both to build the fogged input and (via fogged_counts) to
-            # drive the debut target's fog/future class split below.
-            fog_rate = self._sample_fog_rate(rng)
-            input_records, clean_records, fogged_counts, observed_counts = _build_artifact_input(
-                replay,
-                window,
-                self.vocabulary,
-                fog_rate=fog_rate,
-                rng=rng,
-            )
-        else:
-            # Pre-training: the input is LITERALLY ABSENT -- the model
-            # sequence becomes 100% output canvas (no fog paradigm at all).
-            # No fog rate is sampled and `config.fog` is never read here,
-            # since it may be None/missing for pre-training configs. The
-            # empty lists below produce zero-length input tensors below,
-            # which contribute zero sequence positions downstream.
-            input_records = []
-            clean_records = []
-            fogged_counts = {}
-            observed_counts = {}
+        # One omission rate is sampled per served example in BOTH modes. Fog is
+        # a transient view over clean tokenized replay artifacts.
+        fog_rate = self._sample_fog_rate(rng)
+        input_records, clean_records, fogged_counts, observed_counts = _build_artifact_input(
+            replay,
+            window,
+            self.vocabulary,
+            fog_rate=fog_rate,
+            rng=rng,
+        )
 
         # Both training modes now begin the canvas with the win/loss outcome
         # token (leading position 0, denoised last), so resolve it up front for
@@ -296,11 +265,7 @@ def _build_artifact_input(
     fog_rate: float,
     rng: np.random.Generator,
 ) -> tuple[list[TokenRecord], list[TokenRecord], dict[tuple[int, str], int], dict[tuple[int, str], int]]:
-    """Build the fine-tuning input: per-timestep interleaved self+enemy blocks.
-
-    This grammar is fine-tuning (debut_mode) ONLY -- pre-training has no input
-    at all, so callers must not invoke this function when
-    ``config.data.debut_mode`` is False.
+    """Build the shared per-timestep interleaved self+enemy input.
 
     Layout, walking timesteps from ``window.start_timestep`` to
     ``window.end_timestep``:
@@ -841,8 +806,7 @@ def build_input_records(
     rng: np.random.Generator,
 ) -> tuple[list[TokenRecord], dict[tuple[int, str], int], dict[tuple[int, str], int]]:
     enemy_player = _enemy_player(perspective_player)
-    self_block: list[TokenRecord] = []
-    enemy_block: list[TokenRecord] = []
+    input_records: list[TokenRecord] = []
     fogged_counts: dict[tuple[int, str], int] = {}
     observed_counts: dict[tuple[int, str], int] = {}
 
@@ -856,8 +820,7 @@ def build_input_records(
         enemy_records = _records_for_owner(records, enemy_player)
         delimiter = _delimiter(records)
 
-        self_block.extend(self_records)
-        self_block.append(delimiter)
+        input_records.extend(self_records)
 
         # Fog every enemy content token regardless of kind (entity or
         # upgrade) -- mirrors the same guard removal in _build_artifact_input,
@@ -868,10 +831,10 @@ def build_input_records(
                 _increment(fogged_counts, (timestep_index, record.token_name))
                 continue
             _increment(observed_counts, (timestep_index, record.token_name))
-            enemy_block.append(record)
-        enemy_block.append(delimiter)
+            input_records.append(record)
+        input_records.append(delimiter)
 
-    return self_block + enemy_block, fogged_counts, observed_counts
+    return input_records, fogged_counts, observed_counts
 
 
 def build_target_canvas(
@@ -944,30 +907,17 @@ def _canvas_label(
             consulted when ``debut_mode`` is True, to tell whether this
             record's timestep lies beyond the input window (the "future").
         fogged_counts: Mutable per-(timestep, token name) remaining-fogged
-            counts; one count is consumed each time a fogged token is
-            labeled. Only consulted when ``debut_mode`` is True -- pre-training
-            has no fog at all.
-        debut_mode: True for fine-tuning canvases, which keep the 3-way
-            visible/fogged/future split (part of the 7-class debut
-            taxonomy). False for pre-training canvases, where every content
-            token collapses to the single ``CLASS_CONTENT`` class, because
-            pre-training has no input and no fog (the published MDLM/LLaDA
-            pure-reconstruction objective: the whole canvas is one
-            undifferentiated reconstruction target).
+            counts; one count is consumed each time a fogged token is labeled.
+        debut_mode: Retained for call-site clarity; both modes use the same
+            observed/fogged/future numeric partition, with mode-specific names.
 
     Returns:
-        ``CLASS_DELIMITER`` for delimiter tokens; otherwise ``CLASS_CONTENT``
-        when ``debut_mode`` is False, or one of ``CLASS_ENEMY_OBSERVED`` /
-        ``CLASS_ENEMY_FOGGED`` / ``CLASS_ENEMY_FUTURE`` when ``debut_mode`` is
-        True.
+        ``CLASS_DELIMITER`` for delimiter tokens; otherwise one of the three
+        observed/fogged/future content classes.
     """
 
     if record.token_id == DELIMITER_ID:
         return CLASS_DELIMITER
-    if not debut_mode:
-        # Pre-training: no fog, no input/future split -- every content token
-        # collapses to CLASS_CONTENT (alias of CLASS_ENEMY_OBSERVED).
-        return CLASS_CONTENT
     if timestep_index >= input_timestep_count:
         return CLASS_ENEMY_FUTURE
     key = (timestep_index, record.token_name)

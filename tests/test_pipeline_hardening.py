@@ -139,13 +139,11 @@ def test_training_loop_writes_metrics_jsonl_and_publishes(tmp_path: Path) -> Non
     assert len(lines) == 2
     first = json.loads(lines[0])
     assert "loss" in first and "per_class" in first and first["step"] == 1
-    # Pre-training JSONL carries the t-bucket / perspective breakdowns but must
-    # be grep-clean of the fine-tuning-only "future_distance" key: the writer
-    # strips it from the serialized record entirely (not even an empty {}).
+    # Both modes carry t/perspective/future-distance breakdowns.
     assert "t_bucket_loss" in first
     assert "perspective_loss" in first
-    assert "future_distance" not in lines[0]
-    assert "future_distance" not in lines[1]
+    assert first["future_distance"]
+    assert json.loads(lines[1])["future_distance"]
     assert first["step_wall_seconds"] > 0
     assert first["tokens_per_second"] > 0
     assert first["cuda_max_memory_allocated_bytes"] == 0

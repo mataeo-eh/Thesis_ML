@@ -14,6 +14,7 @@
 
 - The canvas initializes as all `[MASK]`. Each step commits the highest-confidence positions and never re-masks committed tokens; remasking-style revision is out of scope (`SPEC.md` §12).
 - Load EMA weights for sampling and evaluation.
+- Sampling validates the checkpoint's feature-statistics identity against the model before loading EMA weights; missing or mismatched identities are incompatible rather than silently accepted.
 - A valid canvas starts with perspective-relative `[WIN]`/`[LOSS]`, followed by `(timestep-tokens [DELIMITER])+`, then either `[END] [PAD]*` or `[PAD]*`. Reject partial final timesteps; debut mode also permits empty timestep groups represented by a bare delimiter.
 - The model never emits time. Absolute timing is recovered externally by arithmetic (last input-frame clock + `sampling_interval_s × timestep index`) and stays metadata only.
 - Normal inference starts from an all-`[MASK]` canvas regardless of the training `t` distribution. Sampler hyperparameters (`max_steps`, falling `temperature`, `entropy_bound`, confidence threshold, minimum commits, and outcome-last behavior) are config-owned and provisional.

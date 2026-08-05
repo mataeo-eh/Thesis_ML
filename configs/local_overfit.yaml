@@ -13,6 +13,7 @@ data:
   canvas_recon_fraction: 0.5
   tokenized_replay_dir: data/processed/local/tokenized_replays
   window_manifest_path: data/processed/local/window_manifest.jsonl
+  feature_statistics_path: data/processed/local/overfit_feature_statistics.v1.json
 
 pipeline:
   seed: 1729

@@ -17,10 +17,12 @@
 - With the default 0.0-1.0 schedule, training spans nearly clean through nearly/all-masked canvases in expectation. Exact endpoints have measure zero under continuous sampling; finite canvases can still become completely unmasked or completely masked through the independent Bernoulli draws.
 - Per-timestep-varying corruption does not exist on the canvas. Input-side fog is a separate per-example enemy-token omission process owned by `data/dataset.py`.
 - Per-class loss logging is populated from the first run. Auxiliary confidence loss is config-weighted (`confidence_loss_weight`, `0.0` disables) and derived from logits, not a separate head (`SPEC.md` §3).
+- Both modes use the stable seven-id observed/fogged/future/structural/outcome taxonomy (with mode-specific names) and emit input/future telemetry plus future-distance loss buckets.
 - Maintain an EMA weight copy (decay `ema_decay`); use EMA weights for validation, the final checkpoint, sampling, and evaluation.
 - Self-conditioning training uses the two-pass procedure at `self_cond_prob` and shares the inference interface.
 - Epoch patience compares noisy resampled train loss against the best using the configured relative minimum improvement; a single flat epoch never stops a run.
 - Optimizer/schedule fields (`lr`, `betas`, `weight_decay`, `warmup`, `lr_floor`, `grad_clip`, `accum`, `precision`, `epochs`, `early_stopping_*`) are config-owned.
+- Checkpoints persist `feature_statistics_identity`; resume and warm-start must reject missing or mismatched identities before loading weights.
 - Production pipelines stream step metrics to disk without retaining returned log objects; validation aggregates scalar metrics on CPU. CUDA runs report current/peak allocation, reservation, inactive split bytes, device-wide used memory from `cudaMemGetInfo`, and the device-minus-reserved gap. Epoch CSVs average the latter two across optimizer steps. Profiles may trim unused cache at completed epoch boundaries via config.
 
 ## Work Guidance

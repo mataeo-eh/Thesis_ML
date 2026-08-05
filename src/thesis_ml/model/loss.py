@@ -34,12 +34,8 @@ def active_class_id_to_name(config: ProjectConfig) -> dict[int, str]:
 
     The two maps are:
       - Pre-training (``config.data.debut_mode`` False):
-        ``PRETRAIN_CLASS_ID_TO_NAME`` -- a SPARSE 5-entry map (ids 0/3/4/5/6).
-        Pre-training collapses the observed/fogged/future split into a single
-        "content" class (id 0) and never emits ids 1 or 2, so those two ids are
-        intentionally absent from the map. CRITICAL: because the map is sparse,
-        any id-indexed buffer (e.g. the class-weight buffer below) must be sized
-        ``max(map) + 1`` (= 7), NOT ``len(map)`` (= 5).
+        ``PRETRAIN_CLASS_ID_TO_NAME`` -- observed/fogged/future reconstruction
+        names plus structural and outcome classes.
       - Fine-tuning (``config.data.debut_mode`` True): ``DEBUT_CLASS_ID_TO_NAME``
         -- the dense 7-entry debut taxonomy (visible/fogged/future-debut, the
         structural tokens, and the win/loss outcome token).
@@ -58,10 +54,8 @@ def active_class_id_to_name(config: ProjectConfig) -> dict[int, str]:
     return PRETRAIN_CLASS_ID_TO_NAME
 
 
-# Future-distance decomposition buckets. FINE-TUNING ONLY: pre-training collapses
-# the future class into "content" and never labels a token CLASS_ENEMY_FUTURE, so
-# these buckets are computed only when ``config.data.debut_mode`` is True (see
-# CanvasCrossEntropyLoss.forward, which gates on ``self.debut_mode``).
+# Future-distance decomposition buckets shared by full-rollout pretraining and
+# debut fine-tuning.
 FUTURE_DISTANCE_BUCKETS = {
     "1": (1, 1),
     "2_5": (2, 5),
@@ -126,16 +120,13 @@ class CanvasCrossEntropyLoss(nn.Module):
         # per-class decomposition in forward() derives its keys from this single
         # map, so pre-training and debut mode can never disagree with each other
         # or with the CSV columns train/loop.py writes (which call the same
-        # helper). ``debut_mode`` is cached because it also gates the
-        # future-distance decomposition (fine-tuning-only) in forward().
+        # helper). ``debut_mode`` is cached because it gates configured class
+        # weighting, while distance decomposition remains shared.
         self.class_id_to_name = active_class_id_to_name(config)
         self.debut_mode = config.data.debut_mode
 
         # The weight buffer is indexed by raw class-id, so it MUST be sized by
-        # max(id) + 1, NOT len(map). Pre-training's map is SPARSE (ids 0/3/4/5/6,
-        # so len == 5) but ids still range up to 6 -- sizing by len would
-        # under-allocate and crash when indexing class-id 6. max(id)+1 == 7 in
-        # both taxonomies today.
+        # max(id) + 1, NOT len(map), so stable raw ids remain safe.
         buffer_size = max(self.class_id_to_name) + 1
         class_weights = torch.ones(buffer_size, dtype=torch.float32)
         if self.debut_mode:
@@ -154,7 +145,7 @@ class CanvasCrossEntropyLoss(nn.Module):
             # 1.0 for every class (already the buffer's fill value) except PAD,
             # which is zeroed so padding positions never contribute. NOTE: we
             # deliberately do NOT read config.loss.class_loss_weights here; it is
-            # None for pre-training configs (fog / per-class weights are a
+            # None for pre-training configs (per-class weights are a
             # fine-tuning-only concern per config validation).
             class_weights[CLASS_PAD] = 0.0
         self.register_buffer("class_weights", class_weights)
@@ -192,12 +183,7 @@ class CanvasCrossEntropyLoss(nn.Module):
 
         future_distance: dict[str, torch.Tensor] = {}
         future_distance_counts: dict[str, int] = {}
-        # Future-distance decomposition is FINE-TUNING ONLY. Pre-training never
-        # labels a token CLASS_ENEMY_FUTURE (the future class is collapsed into
-        # "content"), so we gate explicitly on the mode rather than relying on
-        # the label simply never appearing -- pre-training must emit no
-        # future-distance keys at all.
-        if self.debut_mode and prediction_distances is not None:
+        if prediction_distances is not None:
             distances = prediction_distances.to(ce.device)
             future_mask = active & (class_labels == CLASS_ENEMY_FUTURE)
             for name, (minimum, maximum) in FUTURE_DISTANCE_BUCKETS.items():

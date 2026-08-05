@@ -789,6 +789,9 @@ class TrainingLoop:
                 "total_tokens_ingested": self.total_tokens_ingested,
                 "unique_token_ids_seen": sorted(self.unique_token_ids_seen),
                 "config": self.config,
+                "feature_statistics_identity": getattr(
+                    self.model, "feature_statistics_identity", None
+                ),
             },
             checkpoint_path,
         )
@@ -801,6 +804,7 @@ class TrainingLoop:
 
     def load_checkpoint(self, path: str | Path) -> None:
         checkpoint = torch.load(Path(path), map_location=self.device, weights_only=False)
+        self._validate_feature_statistics_identity(checkpoint, path)
         self.model.load_state_dict(checkpoint["model"])
         self.ema_model.load_state_dict(checkpoint.get("ema_model", checkpoint["model"]))
         self.optimizer.load_state_dict(checkpoint["optimizer"])
@@ -859,6 +863,7 @@ class TrainingLoop:
         """
 
         checkpoint = torch.load(Path(path), map_location=self.device, weights_only=False)
+        self._validate_feature_statistics_identity(checkpoint, path)
         # Copy the plain model's weights.
         self.model.load_state_dict(checkpoint["model"])
         # The EMA (shadow) model tracks a smoothed copy of the weights used at
@@ -872,6 +877,20 @@ class TrainingLoop:
         # total_tokens_ingested, and unique_token_ids_seen are intentionally
         # left untouched here -- that is what makes this a "warm start"
         # rather than a "resume".
+
+    def _validate_feature_statistics_identity(self, checkpoint: dict, path: str | Path) -> None:
+        expected = getattr(self.model, "feature_statistics_identity", None)
+        observed = checkpoint.get("feature_statistics_identity")
+        if not isinstance(observed, str):
+            raise ValueError(
+                f"checkpoint {Path(path)} has no feature_statistics_identity; "
+                "it predates the joint static-feature contract and is incompatible"
+            )
+        if observed != expected:
+            raise ValueError(
+                f"checkpoint {Path(path)} feature statistics mismatch: "
+                f"expected {expected}, got {observed}"
+            )
 
     def _lr_multiplier(self, step_index: int) -> float:
         warmup = max(1, self.config.train.warmup)
@@ -972,24 +991,13 @@ class TrainingLoop:
         per-class losses, lr, masked fraction, and any validation log so the
         run can be tracked and aborted early from the JSONL alone.
 
-        In PRE-TRAINING (``debut_mode`` False) the fine-tuning-only
-        "future_distance" key is stripped from the serialized JSON entirely --
-        not even emitted as an empty ``{}`` -- both at the top level and inside
-        the nested "validation" sub-object. The dataclass fields themselves are
-        kept (in-process consumers see a fixed shape); only the emitted JSON
-        drops the key. Fine-tuning output is unchanged.
+        Both modes retain input/fog/future telemetry because both now consume
+        the shared clamped input grammar.
         """
 
         if self.metrics_path is None:
             return
         record = asdict(log)
-        if not self.config.data.debut_mode:
-            # Pre-training never has a future class, so the JSONL must contain
-            # no "future_distance" key at all (see docstring above).
-            record.pop("future_distance", None)
-            validation_record = record.get("validation")
-            if isinstance(validation_record, dict):
-                validation_record.pop("future_distance", None)
         with self.metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
 
@@ -1014,7 +1022,6 @@ class TrainingLoop:
         # single shared helper is required.
         active_class_map = active_class_id_to_name(self.config)
         class_names = [_metric_class_name(name) for name in active_class_map.values()]
-        debut_mode = self.config.data.debut_mode
         # Columns emitted in BOTH pipelines: the loss headline, per-class losses,
         # and the new t-bucket / perspective breakdowns.
         fieldnames = [
@@ -1028,11 +1035,7 @@ class TrainingLoop:
             *(f"train_perspective_loss_{name}" for name in PERSPECTIVE_NAMES),
             *(f"dev_perspective_loss_{name}" for name in PERSPECTIVE_NAMES),
         ]
-        # Input-side / fog-derived / future-distance columns are FINE-TUNING ONLY.
-        # Pre-training has no input, no fog, and no future class, so these columns
-        # are omitted entirely from a pre-training epoch CSV.
-        if debut_mode:
-            fieldnames += [
+        fieldnames += [
                 "average_input_timesteps",
                 "average_enemy_future_timesteps",
                 "input_timestep_p50",
@@ -1049,7 +1052,7 @@ class TrainingLoop:
                     f"dev_enemy_future_loss_distance_{name}"
                     for name in FUTURE_DISTANCE_BUCKETS
                 ),
-            ]
+        ]
         fieldnames += [
             "total_tokens_ingested",
             "total_unique_tokens_seen",
@@ -1081,21 +1084,20 @@ class TrainingLoop:
         for name in PERSPECTIVE_NAMES:
             row[f"train_perspective_loss_{name}"] = metrics.train_perspective_loss.get(name, "")
             row[f"dev_perspective_loss_{name}"] = metrics.dev_perspective_loss.get(name, "")
-        if debut_mode:
-            row["average_input_timesteps"] = metrics.average_input_timesteps
-            row["average_enemy_future_timesteps"] = metrics.average_enemy_future_timesteps
-            for percentile in ("p50", "p90", "p95"):
-                row[f"input_timestep_{percentile}"] = metrics.input_timestep_percentiles[percentile]
-                row[f"enemy_future_timestep_{percentile}"] = (
-                    metrics.enemy_future_timestep_percentiles[percentile]
-                )
-            for name in FUTURE_DISTANCE_BUCKETS:
-                row[f"train_enemy_future_loss_distance_{name}"] = (
-                    metrics.train_future_distance.get(name, "")
-                )
-                row[f"dev_enemy_future_loss_distance_{name}"] = (
-                    metrics.dev_future_distance.get(name, "")
-                )
+        row["average_input_timesteps"] = metrics.average_input_timesteps
+        row["average_enemy_future_timesteps"] = metrics.average_enemy_future_timesteps
+        for percentile in ("p50", "p90", "p95"):
+            row[f"input_timestep_{percentile}"] = metrics.input_timestep_percentiles[percentile]
+            row[f"enemy_future_timestep_{percentile}"] = (
+                metrics.enemy_future_timestep_percentiles[percentile]
+            )
+        for name in FUTURE_DISTANCE_BUCKETS:
+            row[f"train_enemy_future_loss_distance_{name}"] = (
+                metrics.train_future_distance.get(name, "")
+            )
+            row[f"dev_enemy_future_loss_distance_{name}"] = (
+                metrics.dev_future_distance.get(name, "")
+            )
         write_header = self._prepare_epoch_metrics_file(fieldnames)
         with self.epoch_metrics_path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1339,9 +1341,9 @@ def move_batch_to_device(batch: DiffusionBatch, device: torch.device) -> Diffusi
     non_blocking = device.type == "cuda"
     features = batch.input_features
     moved_features = InputFeatures(
-        map_values=features.map_values.to(device, non_blocking=non_blocking),
-        stat_values=features.stat_values.to(device, non_blocking=non_blocking),
-        team_ids=features.team_ids.to(device, non_blocking=non_blocking),
+        continuous_values=features.continuous_values.to(device, non_blocking=non_blocking),
+        allegiance_values=features.allegiance_values.to(device, non_blocking=non_blocking),
+        feature_mask=features.feature_mask.to(device, non_blocking=non_blocking),
     )
     return DiffusionBatch(
         input_token_ids=batch.input_token_ids.to(device, non_blocking=non_blocking),

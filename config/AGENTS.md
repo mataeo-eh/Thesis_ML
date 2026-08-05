@@ -6,7 +6,7 @@
 
 ## Ownership
 
-- `default.yaml` owns the full default set of `data.*`, `fog.*`, `model.*`, `train.*`, `pipeline.*`, `storage.*`, `data_source.*`, and evaluation parameters validated by `src/thesis_ml/config.py`.
+- `default.yaml` owns the full default set of `data.*`, `fog.*`, `model.*`, `train.*`, `pipeline.*`, `storage.*`, `data_source.*`, and evaluation parameters validated by `src/thesis_ml/config.py`, including the feature-statistics path and explicit preparation switch.
 
 ## Local Contracts
 
@@ -15,6 +15,7 @@
 - Values follow `SPEC.md` §11 (provisional defaults) — treat none as load-bearing, and never hardcode a value that belongs here into code.
 - No secrets or machine-specific absolute paths: storage locations are URIs (local or `s3://`) and credentials come from the environment.
 - Absolute time, frame number, `game_loop`, and timestamp-derived values must never be introduced as model-feature config.
+- `fog` is required in both modes. `data.feature_statistics_path` names the deterministic training-statistics artifact, while `pipeline.prepare_feature_statistics` must be enabled explicitly when that artifact should be computed or replaced.
 
 ## Work Guidance
 

@@ -7,7 +7,8 @@
 ## Ownership
 
 - `src/thesis_ml/data/windowing.py` owns tokenized replay artifacts and timestep-aligned window manifests.
-- `src/thesis_ml/data/dataset.py` owns lazy per-window example construction and per-serving fog (fog exists in fine-tuning only; pre-training serves canvas-only examples with no input region).
+- `src/thesis_ml/data/dataset.py` owns lazy per-window example construction and per-serving fog for both training modes.
+- `src/thesis_ml/data/feature_stats.py` owns train-split-only normalization statistics, deterministic artifact identity, and strict loading.
 - `src/thesis_ml/data/collate.py` owns dynamic batch padding and exact input/canvas masks.
 - `src/thesis_ml/pipeline/train_pipeline.py` owns config-only preprocessing, training, checkpoint, and resume orchestration.
 - `config/default.yaml` owns canonical defaults; versioned overrides in `configs/` own reproducible local run profiles.
@@ -23,8 +24,9 @@
 - Pretraining windows contain contiguous whole timesteps from one replay and are bounded independently by input and enemy-reconstruction token budgets.
 - Debut/outcome windows tile non-overlapping input timesteps under the input token budget only; each debut canvas starts at the input-window start and runs to replay end or the canvas budget, so output horizons may overlap. Outcome mode owns a separate stamped manifest.
 - Each batch row contains exactly one replay window. Do not pack sequences or add document masks.
-- Fog is sampled while serving an example (fine-tuning only). Persisted artifacts and manifests must remain clean.
-- Input fog and canvas diffusion are independent. Fog samples one omission rate per served fine-tuning example and omits enemy content records of every token kind (entities and upgrades) from the clamped input only; pre-training has no input and no fog. Canvas corruption samples one diffusion level `t` per example and masks each loss-eligible canvas position independently with probability `t` (with a config-owned fraction of examples oversampled to exactly `t=1.0`).
+- Fog is sampled while serving every example. Persisted artifacts and manifests must remain clean.
+- Both modes serve a clamped input region with per-timestep `[self records][fog-filtered enemy records][ONE DELIMITER]`. Input fog and canvas diffusion are independent: one omission rate is sampled per example and applies to enemy content records of every token kind, while canvas corruption samples one diffusion level `t` per example and masks each loss-eligible canvas position independently (with a config-owned fraction oversampled to exactly `t=1.0`).
+- Static conditioning is learned jointly with token identity from allowlisted standardized `(map_x, map_y, unit stats)` values plus numeric allegiance. Statistics are computed only from selected training replays, persisted with a content identity, and must match resumes, warm starts, diagnostics, exports, and sampling checkpoints.
 - Pretraining and fine-tuning both expand every replay into exactly two perspective-specific sample streams: `p1` as self/`p2` as enemy and `p2` as self/`p1` as enemy. Replay splitting happens before this expansion so both perspectives remain in the same train/dev/test split.
 - Batch padding is dynamic. Padding masks must exclude batch-shape padding from attention and loss.
 - CUDA attention prefers fused Flash SDPA and falls back only to memory-efficient SDPA with a broadcast boolean key mask; math fallback is forbidden.
@@ -36,7 +38,7 @@
 - The local-full run keeps workers persistent, trims unused CUDA cache after completed epochs, does not retain ignored step-log objects, and records current allocation, peak allocation, reservation, inactive-split allocator telemetry, device-wide memory use, and the device-minus-reserved gap.
 - The overfit loader uses four persistent workers with four batches prefetched per worker; training batches drop raw metadata after worker-side feature construction, pin their custom batch tensors, and use non-blocking CUDA copies.
 - Model scale, token budgets, paths, subset selection, epochs, and checkpoint intervals remain config-owned.
-- Local runs write epoch CSV metrics and replay selections under their configured `tests/output/<run_name>/` log directory. Epoch metrics include mean and p50/p90/p95 input/future timestep counts, future-token loss bucketed at 1, 2-5, 6-10, 11-30, and 31+ prediction timesteps, cumulative attention-valid training tokens, cumulative distinct token IDs, average device-wide VRAM use, and average device-minus-PyTorch-reserved gap; batch-shape padding is excluded.
+- Local runs write epoch CSV metrics and replay selections under their configured `tests/output/<run_name>/` log directory. In both modes, epoch metrics include mean and p50/p90/p95 input/future timestep counts, future-token loss bucketed at 1, 2-5, 6-10, 11-30, and 31+ prediction timesteps, cumulative attention-valid training tokens, cumulative distinct token IDs, average device-wide VRAM use, and average device-minus-PyTorch-reserved gap; batch-shape padding is excluded.
 - Debut-mode full training also writes the same `finetune_report.json` metric schema as the overfitV2 fine-tune, using the true held-out test split.
 - Epoch patience compares noisy resampled train loss against the best loss using the configured relative minimum improvement; a single flat epoch never stops a run.
 - Absolute time and frame-derived values remain metadata only and must not enter model features.

@@ -126,9 +126,9 @@ def denoise_canvas_once(
     input_features = batch.input_features
     if input_features is not None:
         input_features = InputFeatures(
-            map_values=input_features.map_values.to(active_device),
-            stat_values=input_features.stat_values.to(active_device),
-            team_ids=input_features.team_ids.to(active_device),
+            continuous_values=input_features.continuous_values.to(active_device),
+            allegiance_values=input_features.allegiance_values.to(active_device),
+            feature_mask=input_features.feature_mask.to(active_device),
         )
     initial_input = input_token_ids.clone()
     if mask_rate >= 1.0:
@@ -374,6 +374,12 @@ def load_sampling_checkpoint(model: nn.Module, checkpoint_path: str | Path, *, d
     """Load EMA weights for sampling when present, falling back to raw weights."""
 
     checkpoint = torch.load(Path(checkpoint_path), map_location=device, weights_only=False)
+    expected = getattr(model, "feature_statistics_identity", None)
+    observed = checkpoint.get("feature_statistics_identity")
+    if not isinstance(observed, str) or observed != expected:
+        raise ValueError(
+            f"checkpoint {Path(checkpoint_path)} feature statistics are missing or incompatible"
+        )
     state = checkpoint.get("ema_model", checkpoint["model"])
     model.load_state_dict(state)
     return model

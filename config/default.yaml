@@ -6,9 +6,16 @@ data:
   within_type_tiebreak: unit_id
   tokenized_replay_dir: data/processed/tokenized_replays
   window_manifest_path: data/processed/window_manifest.jsonl
-  # Debut build-order + win/loss fine-tuning target mode. Off by default so the
-  # pretraining target path is unchanged. Set True only for fine-tuning runs.
+  feature_statistics_path: data/processed/feature_statistics.v1.json
+  # Debut build-order + win/loss fine-tuning target mode. Both modes retain the
+  # same clamped input/fog contract; this switch selects the canvas body.
   debut_mode: false
+
+fog:
+  rate_distribution:
+    name: uniform
+    min: 0.0
+    max: 0.8
 
 model:
   d_model: 256
@@ -75,6 +82,9 @@ pipeline:
   validation_replay_count: 0
   preprocess_if_missing: true
   rebuild_manifest: false
+  # Explicit one-shot preprocessing control. Normal train/eval leaves this
+  # false and requires the frozen training-split artifact to already exist.
+  prepare_feature_statistics: false
 
 train:
   lr: 0.0003

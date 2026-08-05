@@ -14,8 +14,7 @@ This module intentionally imports (rather than copies) as much as possible
 from `train_pipeline.py` -- the replay split/selection helpers, the
 dataloader builder, the checkpoint/metrics publishing helpers -- so the fine
 -tune run uses EXACTLY the same 25 train / 3 dev replays (same seeds) as
-pre-training, and so `train_pipeline.py` itself needs no edits at all. Only
-three things differ from `_run_real_pipeline`:
+pre-training. Three task-level things differ from `_run_real_pipeline`:
 
   1. Warm start: `TrainingLoop.load_model_weights(...)` copies ONLY the model
      (and EMA model) weights from the pre-trained checkpoint. The optimizer,
@@ -42,6 +41,7 @@ import torch
 
 from thesis_ml.config import load_config
 from thesis_ml.data.dataset import SC2DiffusionDataset
+from thesis_ml.data.feature_stats import load_feature_statistics
 from thesis_ml.data.split import split_replays
 from thesis_ml.data.windowing import load_window_manifest
 from thesis_ml.eval.finetune_report import build_and_write_finetune_report
@@ -166,6 +166,11 @@ def run_finetune_pipeline(
         config.data.window_manifest_path, config=config, replay_paths=dev_replays
     )
 
+    feature_statistics = load_feature_statistics(
+        config.data.feature_statistics_path,
+        expected_source_replay_ids=[Path(path).name for path in train_replays],
+    )
+
     # Because config.data.debut_mode is True here, SC2DiffusionDataset builds
     # the 7-class debut target (outcome token at canvas position 0 plus
     # visible/fogged/future debut events) for every example -- see Worker 1's
@@ -192,7 +197,11 @@ def run_finetune_pipeline(
         config,
         train=replace(config.train, checkpoint_dir=str(checkpoint_dir), max_steps=planned_steps),
     )
-    model = SC2StrategyDiffusionModel(training_config, vocab_size=vocabulary.vocab_size)
+    model = SC2StrategyDiffusionModel(
+        training_config,
+        vocab_size=vocabulary.vocab_size,
+        feature_statistics=feature_statistics,
+    )
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
 
     # Metrics land in the SAME log directory pre-training uses, but every

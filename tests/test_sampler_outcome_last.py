@@ -120,8 +120,8 @@ def _config(*, canvas_budget: int, outcome_last: bool, confidence_threshold: flo
 def _batch(config: ProjectConfig, *, count: int = 1):
     """Collate `count` synthetic examples into a diffusion batch.
 
-    `make_synthetic_examples` builds PRE-TRAINING fixtures (absent input,
-    collapsed labels), so the batch is collated in pre-training mode; the
+    `make_synthetic_examples` builds restored pretraining fixtures, so the
+    batch is collated in pretraining mode; the
     outcome-last constraint under test is a sampler behavior that applies
     identically in both modes.
     """

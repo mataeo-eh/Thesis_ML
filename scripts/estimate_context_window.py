@@ -34,15 +34,9 @@ END_TOKEN_COUNT = 1
 class ReplayTokenCounts:
     """Unpadded full-replay token lengths for both player perspectives.
 
-    Two separate input token counts are reported because the input grammar is
-    now training-mode-dependent (see ``estimate_replay`` and
-    ``thesis_ml.data.dataset``):
-        pretrain_input_tokens: always 0. Pre-training's model sequence is
-            100% output canvas -- there is no input at all (no self/enemy
-            blocks, no fog, no delimiters devoted to an input segment).
-        finetune_input_tokens: all self tokens plus all zero-fog enemy
-            tokens, interleaved per timestep with exactly ONE delimiter per
-            timestep (``_build_artifact_input``'s fine-tuning grammar).
+    The two compatibility fields now carry the same zero-fog input count:
+    all self tokens plus all enemy tokens, interleaved per timestep with
+    exactly one delimiter (``_build_artifact_input``'s shared grammar).
     The output/target canvas token counts are unaffected by this mode split
     (the reconstruction-target grammar is unchanged across both modes) and
     stay per-perspective as before.
@@ -77,15 +71,10 @@ def estimate_replay(parquet_path: Path) -> ReplayTokenCounts:
     p1_content = entity_counts["p1"] + upgrade_counts["p1"]
     p2_content = entity_counts["p2"] + upgrade_counts["p2"]
 
-    # Pre-training: the input is LITERALLY ABSENT -- the model sequence is
-    # 100% output canvas (the published MDLM/LLaDA pure-reconstruction
-    # objective). No self/enemy blocks, no fog, no delimiters.
-    pretrain_input_tokens = 0
-
-    # Fine-tuning: input interleaves [self][enemy] records per timestep with
-    # exactly ONE delimiter per timestep (previously: one delimiter per
-    # PLAYER per timestep, i.e. 2 per timestep -- that old grammar is gone).
+    # Both modes interleave [self][enemy] records with exactly one delimiter
+    # per timestep. Estimates use the clean/zero-fog upper bound.
     finetune_input_tokens = p1_content + p2_content + timesteps
+    pretrain_input_tokens = finetune_input_tokens
 
     # Output/target canvas grammar is unchanged across both modes: the full
     # enemy reconstruction, one delimiter per timestep, then [END].
@@ -106,9 +95,8 @@ def estimate_replay(parquet_path: Path) -> ReplayTokenCounts:
 def build_report(replays: Sequence[ReplayTokenCounts]) -> dict[str, object]:
     """Build auditable aggregate statistics over replay-perspective samples.
 
-    Reports statistics for BOTH training-mode input grammars side by side
-    (pre-training's absent input and fine-tuning's interleaved input) so this
-    script stays a useful context-window planning tool for either pipeline.
+    Retains both named input fields for report compatibility; they now use the
+    same restored interleaved clamped-input grammar.
     The output/target canvas statistics are shared (mode-independent).
     """
 
@@ -133,7 +121,7 @@ def build_report(replays: Sequence[ReplayTokenCounts]) -> dict[str, object]:
             finetune_combined_lengths.append(replay.finetune_input_tokens + output_length)
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "dataset": {
             "parquet_files": len(replays),
@@ -145,8 +133,8 @@ def build_report(replays: Sequence[ReplayTokenCounts]) -> dict[str, object]:
             "entity": "one token per entity instance with a non-null attribute at a timestep",
             "upgrade": "one token per listed cumulative upgrade at a timestep",
             "pretrain_input": (
-                "always 0 -- pre-training has no input at all; the model sequence is "
-                "100% output canvas (see SC2DiffusionDataset.__getitem__, debut_mode=false)"
+                "all self tokens plus all zero-fog enemy tokens, interleaved per timestep "
+                "([self][enemy] per timestep) with exactly one delimiter per timestep"
             ),
             "finetune_input": (
                 "all self tokens plus all zero-fog enemy tokens, interleaved per timestep "

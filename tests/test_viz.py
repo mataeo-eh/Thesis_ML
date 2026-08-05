@@ -570,14 +570,19 @@ def _build_replay_dir(tmp_path: Path) -> Path:
 def _write_tiny_config(tmp_path: Path) -> Path:
     """Write a YAML that extends default.yaml with tiny, fast overrides."""
 
+    from thesis_ml.data.feature_stats import FeatureStatistics, write_feature_statistics
+
     default_path = (_REPO / "config" / "default.yaml").resolve().as_posix()
     token_dict = (_REPO / "data" / "Token_Dictionary.json").resolve().as_posix()
+    statistics_path = tmp_path / "feature_statistics.json"
+    write_feature_statistics(FeatureStatistics.identity_for_tests(), statistics_path)
     config_path = tmp_path / "viz_config.yaml"
     config_path.write_text(
         f"""
 extends: {default_path}
 data:
   canvas_budget_tokens: 256
+  feature_statistics_path: {statistics_path.resolve().as_posix()}
 model:
   d_model: 32
   layers: 1
@@ -736,7 +741,12 @@ def _write_distinct_weight_checkpoint(
     ema_state = {name: tensor.clone() for name, tensor in model.state_dict().items()}
     # Make the EMA output head unmistakably different from the raw one.
     ema_state["output_head.weight"] = ema_state["output_head.weight"] + 1.0
-    payload: dict[str, object] = {"model": raw_state, "config": config, "global_step": 0}
+    payload: dict[str, object] = {
+        "model": raw_state,
+        "config": config,
+        "global_step": 0,
+        "feature_statistics_identity": model.feature_statistics_identity,
+    }
     if not drop_ema:
         payload["ema_model"] = ema_state
     torch.save(payload, checkpoint_path)

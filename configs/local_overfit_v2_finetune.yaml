@@ -28,15 +28,9 @@ data:
   debut_mode: true
   window_manifest_path: data/processed/local/finetune_window_manifest.jsonl
 
-# `fog` and `loss.class_loss_weights` are now FINE-TUNING-ONLY config sections
-# (see src/thesis_ml/config.py `_validate_debut_mode_sections`): pre-training
-# configs must not carry them, and debut_mode=true configs like this one must.
-# The values below are carried forward UNCHANGED from what this profile
-# effectively inherited before the refactor: fog.rate_distribution came from
-# config/default.yaml, and class_loss_weights is config/default.yaml's values
-# with the pad: 0.2 override that used to live in local_overfit_v2.yaml (that
-# override moved here because pre-training no longer reads class weights at
-# all). No behavior change for fine-tuning.
+# Fog is required in both modes and inherited from the base config. Only
+# `loss.class_loss_weights` remains fine-tuning-only; this profile carries the
+# pad: 0.2 override that used to live in local_overfit_v2.yaml.
 fog:
   rate_distribution:
     name: uniform

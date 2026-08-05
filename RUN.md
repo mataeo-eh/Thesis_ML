@@ -58,7 +58,10 @@ bounded launch check. The local profiles require a CUDA-enabled PyTorch build.
 For a bounded full-pipeline smoke that still exercises preprocessing, loading,
 checkpoint save, and resume, add `--max-steps N`. The first non-smoke launch
 builds or incrementally refreshes the config-owned tokenized replay artifacts
-and window manifest before training.
+and window manifest before training. Production runs also require the configured
+feature-statistics artifact; set `pipeline.prepare_feature_statistics: true`
+explicitly for the run that should compute it from the selected train replay
+artifacts, then return the switch to `false` to reuse and verify that artifact.
 
 ## Configuration
 
@@ -74,6 +77,13 @@ All input/output locations are in `config/default.yaml`:
 - `data.input_budget_tokens` / `data.canvas_budget_tokens`: hard per-window bounds.
 - `data.canvas_recon_fraction`: maximum canvas share used by in-window enemy reconstruction; the remainder is reserved for whole future timesteps.
 - `data.tokenized_replay_dir` / `data.window_manifest_path`: preprocessing outputs.
+- `data.feature_statistics_path`: deterministic normalization statistics derived
+  only from selected training replay artifacts; its identity is bound to
+  checkpoints, sampling, diagnostics, and finished exports.
+- `pipeline.prepare_feature_statistics`: explicit permission to compute or
+  replace the feature-statistics artifact; default `false` fails if it is absent.
+- `fog.rate_distribution`: one enemy-content omission rate sampled per example
+  for the clamped input in both pre-training and fine-tuning.
 - Debut fine-tuning uses a separate manifest: input windows tile whole
   timesteps under `input_budget_tokens` only, while each output runs from its
   input-window start to replay end or the canvas budget and may overlap the

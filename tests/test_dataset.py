@@ -63,13 +63,8 @@ def _config(*, window: int = 8, budget: int = 256) -> ProjectConfig:
 def _debut_config(*, window: int = 8, budget: int = 256) -> ProjectConfig:
     """Fine-tuning (debut_mode=True) config variant of `_config`.
 
-    Fog and fog-resampling only exist in fine-tuning (see
-    `SC2DiffusionDataset.__getitem__`), so any test exercising fog resampling,
-    CLASS_ENEMY_FUTURE labels, or per-serving-varying input must build its
-    dataset from a debut_mode=True config. `load_config` REQUIRES `fog` and
-    `loss.class_loss_weights` to be populated once debut_mode is True (see
-    `_validate_debut_mode_sections`), so both are supplied here with simple
-    placeholder values -- their exact numbers are not under test.
+    Fog and future labels are shared with pretraining; this helper selects the
+    separate debut canvas-body and configured class-weighting contract.
     """
 
     base = _config(window=window, budget=budget)
@@ -122,10 +117,8 @@ def _enemy_counts(frame: pd.DataFrame, config: ProjectConfig, perspective_player
 # `SC2DiffusionDataset.__getitem__` -> `_build_artifact_input` /
 # `_build_artifact_target` / `_build_debut_target` over memory-mapped artifacts).
 # The orchestrator has flagged the helpers for cleanup; until they are removed,
-# these tests document their CURRENT behavior (build_input_records now fogs
-# enemy content tokens of every kind -- the entity-only guard was removed to
-# stay consistent with the production builder -- but it keeps the OLD
-# [all self][all enemy] grammar with one delimiter per player per timestep).
+# these tests document their CURRENT behavior (build_input_records shares the
+# production [self][enemy][delimiter] grammar and fogs every enemy content kind).
 # Production-path coverage of fog application, input grammar, and canvas
 # labeling lives in the SC2DiffusionDataset / _build_artifact_input tests
 # further down and in tests/test_debut_target.py -- do NOT treat the tests in
@@ -276,12 +269,8 @@ def test_truncated_target_ends_at_boundary_and_pads_without_end() -> None:
 
 
 def test_dataset_and_collate_determinism_under_seed(tmp_path: Path) -> None:
-    # Fog resampling, non-empty input, and CLASS_ENEMY_FUTURE labels are all
-    # fine-tuning-only behaviors (see `SC2DiffusionDataset.__getitem__`), so
-    # this test's dataset must be built from a debut_mode=True config -- a
-    # pre-training (default.yaml) config would produce an EMPTY input and
-    # collapse every content label to CLASS_CONTENT, making the assertions
-    # below meaningless.
+    # Use debut mode here to retain coverage of its separate canvas-body path;
+    # fog resampling and non-empty input are shared with pretraining.
     base = _debut_config(window=8, budget=256)
     config = replace(
         base,
@@ -320,7 +309,7 @@ def test_dataset_and_collate_determinism_under_seed(tmp_path: Path) -> None:
     training_batch = collate_diffusion_examples([first, second], debut_mode=True, retain_metadata=False)
     assert training_batch.input_records == []
     assert training_batch.canvas_metadata == []
-    assert training_batch.input_features.map_values.shape[:2] == batch.input_token_ids.shape
+    assert training_batch.input_features.continuous_values.shape[:2] == batch.input_token_ids.shape
     assert torch.equal(
         training_batch.canvas_prediction_distances,
         batch.canvas_prediction_distances,
@@ -339,55 +328,38 @@ def _prepared_windows(tmp_path: Path, config: ProjectConfig):
         ),
     )
     vocab = _vocab()
-    preprocess_replays([FIXTURE], prepared, vocab, perspectives=("p1",))
+    preprocess_replays([FIXTURE], prepared, vocab, perspectives=("p1", "p2"))
     windows = load_window_manifest(prepared.data.window_manifest_path, config=prepared)
     return prepared, vocab, windows
 
 
-def test_pretraining_example_has_no_input_and_model_sequence_is_exactly_canvas(
+def test_pretraining_example_has_clamped_fogged_input_for_both_perspectives(
     tmp_path: Path,
 ) -> None:
-    """Pre-training input is LITERALLY ABSENT, end to end.
-
-    Dataset level: zero-length `input_token_ids` AND `clean_input_token_ids`,
-    no input records, no fog bookkeeping, and every content canvas position
-    labeled `CLASS_CONTENT` (the collapsed pre-training class). Model level:
-    the collated batch has a `[B, 0]` input segment, so the backbone sequence
-    and its logits are EXACTLY the canvas length -- no separator/BOS token, no
-    reserved input columns in the attention mask.
-    """
+    """Pretraining serves shared full-self/fogged-enemy clamped input."""
 
     config, vocab, windows = _prepared_windows(tmp_path, _config(window=8, budget=256))
     assert config.data.debut_mode is False
-    dataset = SC2DiffusionDataset(windows, config, vocab, seed=11)
-    example = dataset[0]
+    dataset = SC2DiffusionDataset(windows, config, vocab, seed=11, fog_rate_override=1.0)
+    p2_index = next(
+        index for index, window in enumerate(windows) if window.perspective_player == "p2"
+    )
+    examples = [dataset[index] for index in (0, p2_index)]
+    assert {example.perspective_player for example in examples} == {"p1", "p2"}
+    for example in examples:
+        assert example.input_token_ids.numel() > 0
+        assert example.clean_input_token_ids is not None
+        assert example.clean_input_token_ids.numel() > example.input_token_ids.numel()
+        assert all(record.allegiance != "enemy" for record in example.input_records)
+        assert any(record.allegiance == "self" for record in example.input_records)
+        assert sum(example.fogged_counts.values()) > 0
+        assert CLASS_ENEMY_FOGGED in example.class_labels.tolist()
+        assert CLASS_ENEMY_FUTURE in example.class_labels.tolist()
 
-    # Input is absent at the dataset level: no records, zero-length tensors,
-    # and no fog was ever applied (nothing fogged, nothing observed).
-    assert example.input_records == []
-    assert example.input_token_ids.numel() == 0
-    assert example.clean_input_token_ids is not None
-    assert example.clean_input_token_ids.numel() == 0
-    assert example.fogged_counts == {}
-    assert example.observed_counts == {}
-
-    # Every CONTENT canvas position is CLASS_CONTENT; only the structural
-    # classes and the leading win/loss token appear besides it. The
-    # fine-tuning-only ids (fogged=1 / future=2) never appear -- note
-    # CLASS_CONTENT aliases id 0, so asserting per-kind below is what proves
-    # the collapse (a bare "no id 1/2" check alone could not).
-    labels = example.class_labels.tolist()
-    assert set(labels) <= {CLASS_CONTENT, CLASS_DELIMITER, CLASS_END, CLASS_PAD, CLASS_WINLOSS}
-    for metadata, label in zip(example.canvas_metadata, labels, strict=True):
-        if metadata.get("token_kind") in {"entity", "upgrade"}:
-            assert label == CLASS_CONTENT
-
-    # Collated: the input segment has ZERO columns -- the attention mask has no
-    # input columns for the model to attend to.
-    batch = collate_diffusion_examples([example], debut_mode=False)
-    assert batch.input_token_ids.shape == (1, 0)
-    assert batch.input_attention_mask.shape == (1, 0)
-    assert batch.input_features.team_ids.shape == (1, 0)
+    batch = collate_diffusion_examples(examples, debut_mode=False)
+    assert batch.input_token_ids.shape[1] > 0
+    assert batch.input_attention_mask.any()
+    assert batch.input_features.allegiance_values.shape[:2] == batch.input_token_ids.shape
 
     # Model: hidden states / logits have sequence length EXACTLY equal to the
     # canvas length (the input contributes zero sequence positions).
@@ -410,8 +382,9 @@ def test_pretraining_example_has_no_input_and_model_sequence_is_exactly_canvas(
             canvas_attention_mask=batch.canvas_attention_mask,
             input_features=batch.input_features,
         ).logits
-    assert embeddings.shape[1] == batch.target_canvas.shape[1]
-    assert logits.shape[1] == batch.target_canvas.shape[1]
+    expected_length = batch.input_token_ids.shape[1] + batch.target_canvas.shape[1]
+    assert embeddings.shape[1] == expected_length
+    assert logits.shape[1] == expected_length
 
 
 def test_finetune_input_interleaves_self_then_enemy_with_one_delimiter_per_timestep(

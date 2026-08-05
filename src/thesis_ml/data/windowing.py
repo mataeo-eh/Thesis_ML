@@ -13,18 +13,19 @@ import numpy as np
 import pandas as pd
 
 from thesis_ml.config import ProjectConfig
-from thesis_ml.model.embedding import STAT_KEYS, _numeric_feature, _parse_position
+from thesis_ml.data.feature_stats import STAT_KEYS
+from thesis_ml.model.embedding import _numeric_feature, _parse_position
 from thesis_ml.serialize import parse_entity_columns, parse_upgrades
 from thesis_ml.vocab.content_vocab import ContentVocabulary
 
 
 TOKENIZED_ARTIFACT_VERSION = 1
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 # v3: the pre-training canvas now leads with the win/loss outcome token at
 # position 0 (folded in from the debut task). The window geometry is unchanged,
 # but the target contract is not, so bump the semantics string to force any
 # pre-outcome-token pretraining manifest to be rebuilt rather than silently reused.
-PRETRAIN_TARGET_SEMANTICS = "outcome-token-plus-reconstruction-plus-whole-future-timesteps-v3"
+PRETRAIN_TARGET_SEMANTICS = "clamped-fogged-input-plus-outcome-reconstruction-future-v4"
 DEBUT_TARGET_SEMANTICS = "input-tiled-debut-to-replay-end-or-canvas-budget-v1"
 P1_CODE = 1
 P2_CODE = 2
@@ -209,7 +210,9 @@ def build_replay_windows(
             enemy_count = 0
             while end < replay.timestep_count:
                 p1_count, p2_count = counts[end]
-                candidate_input = input_count + int(p1_count + p2_count) + 2
+                # Shared input grammar has exactly one delimiter per timestep:
+                # [self records][enemy records][DELIMITER].
+                candidate_input = input_count + int(p1_count + p2_count) + 1
                 candidate_enemy = enemy_count + int(p2_count if enemy_code == P2_CODE else p1_count) + 1
                 if candidate_input > config.data.input_budget_tokens or (
                     recon_limit is not None and candidate_enemy > recon_limit
@@ -222,7 +225,7 @@ def build_replay_windows(
                 p1_count, p2_count = counts[start]
                 raise ValueError(
                     f"single timestep exceeds a configured window budget: replay={replay_path.name} "
-                    f"perspective={perspective} timestep={start} input={int(p1_count+p2_count)+2} "
+                    f"perspective={perspective} timestep={start} input={int(p1_count+p2_count)+1} "
                     f"enemy={int(p2_count if enemy_code == P2_CODE else p1_count)+1}"
                 )
             entries.append(

@@ -17,6 +17,7 @@
 - Local profiles use equal 4096 input/canvas budgets with a 0.5 reconstruction fraction and share persisted clean replay artifacts.
 - The fine-tune profile shares tokenized replay artifacts but owns a separate input-tiled window manifest; its output horizons may overlap and do not use the pretraining reconstruction-fraction bound.
 - Window manifests carry a semantic/config stamp and are rebuilt when these rules change.
+- Each run namespace owns a feature-statistics artifact path. Preparation remains an explicit pipeline action; fine-tuning reuses and verifies the statistics learned from its selected training split.
 - The V1 overfit profile is the baseline; V2 weights `[PAD]` loss at 0.2, disables early stopping, and runs the full cosine schedule unless manually stopped.
 - Profiles keep experiments traceable to exact settings — version-control every profile that produced a reported run.
 - CUDA-required profiles must fail before preprocessing when CUDA is unavailable.

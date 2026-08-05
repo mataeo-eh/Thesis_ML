@@ -30,6 +30,7 @@ class DataConfig:
     within_type_tiebreak: str
     tokenized_replay_dir: str
     window_manifest_path: str
+    feature_statistics_path: str
     # When True, the artifact target builder produces a "debut build-order +
     # win/loss outcome" canvas (fine-tuning mode) instead of the default
     # full-reconstruction target. When False (default), the pretraining target
@@ -141,6 +142,9 @@ class PipelineConfig:
     validation_replay_count: int
     preprocess_if_missing: bool
     rebuild_manifest: bool
+    # Explicit preprocessing switch. False makes every normal consumer load
+    # the frozen artifact and fail if it is absent or incompatible.
+    prepare_feature_statistics: bool
 
 
 @dataclass(frozen=True)
@@ -236,9 +240,8 @@ class ClassLossWeightsConfig:
     delimiter: float
     end: float
     pad: float
-    # Fine-tune win/loss outcome class weight (Worker 3). Class id 6
-    # (CLASS_WINLOSS). Only used when the debut taxonomy is active; harmless in
-    # pre-training (that path never emits class-id-6 labels).
+    # Fine-tune win/loss outcome class weight (class id 6). Pretraining also
+    # emits class id 6 but uses its fixed uniform weighting instead.
     win_loss: float
 
 
@@ -256,12 +259,7 @@ class LossConfig:
 @dataclass(frozen=True)
 class ProjectConfig:
     data: DataConfig
-    # The fog paradigm is a FINE-TUNING-ONLY concern (pre-training drops fog
-    # entirely). Optional here so a pre-training config can omit the `fog`
-    # section entirely; `_validate_debut_mode_sections` enforces
-    # presence/absence based on `data.debut_mode` after the config tree is
-    # built.
-    fog: FogConfig | None
+    fog: FogConfig
     model: ModelConfig
     diffusion: DiffusionConfig
     storage: StorageConfig
@@ -427,14 +425,10 @@ def _validate_mask_schedule(config: ProjectConfig) -> None:
 
 
 def _validate_debut_mode_sections(config: ProjectConfig) -> None:
-    """Enforce that `fog` and `loss.class_loss_weights` are fine-tuning-only.
+    """Enforce mode-specific loss weights; fog is shared by both modes.
 
-    Pre-training (`data.debut_mode=false`) drops the fog paradigm and
-    per-class loss weighting entirely in favor of uniform published-style
-    MDLM loss, so pre-training configs must not carry those sections (no dead
-    knobs sitting in a config that nothing reads). Fine-tuning
-    (`data.debut_mode=true`) is the debut build-order + win/loss pathway,
-    which still needs both, so they are required there.
+    Pre-training uses the shared fog distribution but keeps uniform loss
+    weighting. Fine-tuning additionally requires per-class weights.
 
     This is a small, explicit, mode-conditional cross-field check -- there is
     no existing conditional validation machinery in this module to extend, so
@@ -445,15 +439,11 @@ def _validate_debut_mode_sections(config: ProjectConfig) -> None:
 
     debut_mode = config.data.debut_mode
     if debut_mode:
-        if config.fog is None:
-            raise ConfigError("config.fog is required when data.debut_mode=true")
         if config.loss.class_loss_weights is None:
             raise ConfigError(
                 "config.loss.class_loss_weights is required when data.debut_mode=true"
             )
     else:
-        if config.fog is not None:
-            raise ConfigError("config.fog must not be set when data.debut_mode=false")
         if config.loss.class_loss_weights is not None:
             raise ConfigError(
                 "config.loss.class_loss_weights must not be set when data.debut_mode=false"

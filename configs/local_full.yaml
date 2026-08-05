@@ -19,6 +19,7 @@ data:
   canvas_recon_fraction: 0.5
   debut_mode: false
   tokenized_replay_dir: data/processed/local/tokenized_replays
+  feature_statistics_path: data/processed/local/full_feature_statistics.v1.json
   # Pre-training (reconstruction-bounded) window manifest -- a SEPARATE file from
   # the debut manifest so the two pathways never share or overwrite windows.
   window_manifest_path: data/processed/local/full_window_manifest.jsonl

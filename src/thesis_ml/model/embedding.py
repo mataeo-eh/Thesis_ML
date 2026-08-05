@@ -1,38 +1,21 @@
-"""Token embeddings plus input-only contextual encodings."""
+"""Token embeddings plus an input-only joint static-feature residual."""
 
 from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
-import math
 import re
 from typing import Any, Sequence
 
 import torch
 from torch import nn
 
-from thesis_ml.serialize import TokenRecord
-
-STAT_KEYS = (
-    "health",
-    "energy",
-    "shields",
-    "facing",
-    "radius",
-    "build_progress",
-    "weapon_cooldown",
-    "attack_upgrade_level",
-    "armor_upgrade_level",
-    "shield_upgrade_level",
-    "cargo_space_taken",
-    "cargo_space_max",
-    "order_count",
-    "is_flying",
-    "is_burrowed",
-    "is_hallucination",
-    "is_active",
-    "is_powered",
+from thesis_ml.data.feature_stats import (
+    CONTINUOUS_FEATURE_NAMES,
+    STAT_KEYS,
+    FeatureStatistics,
 )
+from thesis_ml.serialize import TokenRecord
 
 
 @dataclass(frozen=True)
@@ -43,18 +26,18 @@ class InputFeatures:
     extracted once per batch in the DataLoader workers (see
     ``thesis_ml.data.collate``), instead of re-parsing TokenRecord objects in a
     Python loop on every forward pass. Shapes are ``[batch, seq_len, ...]``:
-      - map_values:   [B, L, 2]   exact (X, Y) map coordinate
-      - stat_values:  [B, L, S]   per-unit stats in STAT_KEYS order
-      - team_ids:     [B, L]      0 = pad, 1 = self, 2 = enemy
+      - continuous_values: [B, L, F] map X/Y followed by STAT_KEYS
+      - allegiance_values: [B, L, 1] self +1, enemy -1, structural/pad 0
+      - feature_mask: [B, L] true only for self/enemy content records
 
     Absolute game time is intentionally absent. ``TokenRecord`` may retain a
     timestamp for dataset ordering or output-side evaluation, but this type is
     the boundary that prevents that metadata from entering the model.
     """
 
-    map_values: torch.Tensor
-    stat_values: torch.Tensor
-    team_ids: torch.Tensor
+    continuous_values: torch.Tensor
+    allegiance_values: torch.Tensor
+    feature_mask: torch.Tensor
 
 
 def build_input_features(
@@ -78,7 +61,7 @@ def build_input_features(
     """
 
     batch = len(records)
-    map_values, stat_values, team_ids = _records_to_tensors(
+    continuous_values, allegiance_values, feature_mask = _records_to_tensors(
         records,
         torch.Size((batch, seq_len)),
         device=torch.device("cpu"),
@@ -86,40 +69,56 @@ def build_input_features(
         left_pad=left_pad,
     )
     return InputFeatures(
-        map_values=map_values,
-        stat_values=stat_values,
-        team_ids=team_ids,
+        continuous_values=continuous_values,
+        allegiance_values=allegiance_values,
+        feature_mask=feature_mask,
     )
 
 
-class FourierFeatures(nn.Module):
-    """Extrapolation-friendly continuous features."""
-
-    def __init__(self, input_dim: int, num_frequencies: int = 8) -> None:
-        super().__init__()
-        frequencies = 2.0 ** torch.arange(num_frequencies, dtype=torch.float32)
-        self.register_buffer("frequencies", frequencies, persistent=False)
-        self.output_dim = input_dim * num_frequencies * 2
-
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
-        angles = values.unsqueeze(-1) * self.frequencies * math.pi
-        encoded = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-        return encoded.flatten(start_dim=-2)
-
-
 class InputContextEmbedding(nn.Module):
-    """Shared token embedding with additive contextual fields for input tokens only."""
+    """Shared type embedding plus the exact learned joint input residual."""
 
-    def __init__(self, vocab_size: int, d_model: int, *, self_conditioning: bool = True) -> None:
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        *,
+        feature_statistics: FeatureStatistics,
+        self_conditioning: bool = True,
+    ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
         self.self_conditioning = self_conditioning
+        self.feature_statistics_identity = feature_statistics.identity
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.map_fourier = FourierFeatures(input_dim=2)
-        self.map_projection = nn.Linear(self.map_fourier.output_dim, d_model, bias=False)
-        self.stat_projection = nn.Linear(len(STAT_KEYS), d_model, bias=False)
-        self.team_embedding = nn.Embedding(3, d_model, padding_idx=0)
+        self.register_buffer(
+            "feature_means",
+            torch.tensor(feature_statistics.means, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "feature_stds",
+            torch.tensor(feature_statistics.stds, dtype=torch.float32),
+        )
+        feature_width = len(CONTINUOUS_FEATURE_NAMES) + 1
+        self.feature_mlp = nn.Sequential(
+            nn.Linear(feature_width, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
+        )
+        self.joint_mixer = nn.Sequential(
+            nn.Linear(d_model + 32, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
         self.self_cond_projection = nn.Linear(vocab_size, d_model, bias=False) if self_conditioning else None
+
+    def reset_joint_output(self) -> None:
+        """Make the initialized joint branch exactly zero, preserving E."""
+
+        output = self.joint_mixer[-1]
+        nn.init.zeros_(output.weight)
+        nn.init.zeros_(output.bias)
 
     def forward(
         self,
@@ -130,13 +129,6 @@ class InputContextEmbedding(nn.Module):
         canvas_self_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor:
         canvas_embeddings = self.embed_canvas(canvas_token_ids, canvas_self_conditioning=canvas_self_conditioning)
-        # Pre-training: the input is LITERALLY ABSENT (zero-length input tensor).
-        # Skip embed_input / the input contextual encodings entirely so the model
-        # sequence IS exactly the canvas: no separator/BOS token, no segment
-        # embedding, no reserved input slots, and RoPE position 0 lands on the
-        # first canvas token (the backbone runs over `canvas_embeddings` alone).
-        # The concat below would be a no-op on an empty input tensor anyway;
-        # skipping makes the absence explicit and avoids empty-tensor work.
         if input_token_ids.shape[1] == 0:
             return canvas_embeddings
         input_embeddings = self.embed_input(
@@ -151,22 +143,31 @@ class InputContextEmbedding(nn.Module):
         *,
         input_features: InputFeatures | None = None,
     ) -> torch.Tensor:
-        embeddings = self.token_embedding(input_token_ids)
+        type_embeddings = self.token_embedding(input_token_ids)
 
         if input_features is None:
-            return embeddings
+            raise ValueError("input_features are required for every non-empty input region")
 
-        device = embeddings.device
-        map_values = input_features.map_values.to(device=device, dtype=embeddings.dtype)
-        stat_values = input_features.stat_values.to(device=device, dtype=embeddings.dtype)
-        team_ids = input_features.team_ids.to(device=device, dtype=torch.long)
-
-        return (
-            embeddings
-            + self.map_projection(self.map_fourier(map_values))
-            + self.stat_projection(stat_values)
-            + self.team_embedding(team_ids)
+        device = type_embeddings.device
+        continuous = input_features.continuous_values.to(
+            device=device, dtype=type_embeddings.dtype
         )
+        allegiance = input_features.allegiance_values.to(
+            device=device, dtype=type_embeddings.dtype
+        )
+        feature_mask = input_features.feature_mask.to(device=device, dtype=torch.bool)
+        if continuous.shape[-1] != len(CONTINUOUS_FEATURE_NAMES):
+            raise ValueError(
+                f"continuous input feature width must be {len(CONTINUOUS_FEATURE_NAMES)}"
+            )
+        standardized = (
+            continuous - self.feature_means.to(dtype=type_embeddings.dtype)
+        ) / self.feature_stds.to(dtype=type_embeddings.dtype)
+        branch_input = torch.cat([standardized, allegiance], dim=-1)
+        hidden_features = self.feature_mlp(branch_input)
+        residual = self.joint_mixer(torch.cat([type_embeddings, hidden_features], dim=-1))
+        residual = residual * feature_mask.unsqueeze(-1).to(dtype=residual.dtype)
+        return type_embeddings + residual
 
     def embed_canvas(
         self,
@@ -196,26 +197,34 @@ def _records_to_tensors(
     left_pad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, seq_len = shape
-    map_values = torch.zeros(batch, seq_len, 2, device=device, dtype=dtype)
-    stat_values = torch.zeros(batch, seq_len, len(STAT_KEYS), device=device, dtype=dtype)
-    team_ids = torch.zeros(batch, seq_len, device=device, dtype=torch.long)
+    continuous_values = torch.zeros(
+        batch, seq_len, len(CONTINUOUS_FEATURE_NAMES), device=device, dtype=dtype
+    )
+    allegiance_values = torch.zeros(batch, seq_len, 1, device=device, dtype=dtype)
+    feature_mask = torch.zeros(batch, seq_len, device=device, dtype=torch.bool)
 
     for batch_index, row_records in enumerate(records):
         offset = max(0, seq_len - len(row_records)) if left_pad else 0
         for token_index, record in enumerate(row_records[:seq_len]):
             token_index += offset
             if record.allegiance == "self":
-                team_ids[batch_index, token_index] = 1
+                allegiance_values[batch_index, token_index, 0] = 1.0
+                feature_mask[batch_index, token_index] = True
             elif record.allegiance == "enemy":
-                team_ids[batch_index, token_index] = 2
+                allegiance_values[batch_index, token_index, 0] = -1.0
+                feature_mask[batch_index, token_index] = True
             position = _parse_position(record.raw_position)
             if position is not None:
-                map_values[batch_index, token_index] = torch.tensor(position[:2], device=device, dtype=dtype)
+                continuous_values[batch_index, token_index, :2] = torch.tensor(
+                    position[:2], device=device, dtype=dtype
+                )
             raw = record.raw_attributes or {}
             for stat_index, key in enumerate(STAT_KEYS):
-                stat_values[batch_index, token_index, stat_index] = _numeric_feature(raw.get(key))
+                continuous_values[batch_index, token_index, 2 + stat_index] = _numeric_feature(
+                    raw.get(key)
+                )
 
-    return map_values, stat_values, team_ids
+    return continuous_values, allegiance_values, feature_mask
 
 
 def _parse_position(value: Any) -> tuple[float, float, float] | None:

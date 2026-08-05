@@ -12,6 +12,7 @@
 ## Local Contracts
 
 - Reuse the existing preprocessing, dataset, sampler, decode, and evaluation harness; do not implement parallel inference or tokenization paths.
+- Load the configured feature-statistics artifact and require it to match the checkpoint identity before constructing the diagnostic model.
 - Write only under `--out-dir`. Checkpoints, replay sources, configs, and shared tokenized artifacts remain read-only.
 - PNG/SVG/PDF count comparisons are the default output. Each window figure aligns ground-truth counts, predicted counts, and high-contrast under/exact/over error cells on the same entity/timestep axes.
 - `--n-windows` limits windows per selected replay; there is no separate overall window cap.
