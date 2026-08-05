@@ -18,7 +18,7 @@
 - `--n-windows` limits windows per selected replay; there is no separate overall window cap.
 - First-appearance timelines are emitted only with `--first-appearance` and are intended for models fine-tuned to emit debut/build-order targets.
 - `--csv` and `--json` are independent opt-in exports and produce no files when omitted.
-- `--bypass-sampler` preserves the same figures and optional exports but replaces iterative sampling with one all-`[MASK]` denoising forward pass per example; it is off by default.
+- `--bypass-sampler` preserves the same figures and optional exports but replaces iterative sampling with one forward pass from the configured process's `t=1` prior: uniform random non-`[MASK]` states by default, all `[MASK]` only for the absorbing ablation.
 - Non-image exports preserve labelled filenames for one window. With multiple windows, `--show-input` writes labelled sections to `input_canvas.txt`, `--csv` writes all rows to `canvas_comparison.csv` with a leading `window` column, and `--json` writes all labelled examples to the existing `canvas_logits.json` array. Aggregate files are rewritten per run rather than appended across reruns.
 - `canvas_logits.json` records each position's final output token, ground-truth token, and the top 10 vocabulary items with raw logits and softmax confidence values.
 
@@ -29,7 +29,7 @@
 
 ## Verification
 
-- Visualization changes require `tests/test_viz.py`; sampler-backed logit changes also require `tests/test_sampler.py` and `tests/test_sampler_outcome_last.py`.
+- Visualization changes require `tests/test_viz.py`; sampler-backed logit changes also require `tests/test_sampler.py`.
 
 ## Child DOX Index
 

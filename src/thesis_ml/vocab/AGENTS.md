@@ -12,8 +12,8 @@
 ## Local Contracts
 
 - One vocabulary is shared by input and output. Content tokens are raw entity-type tokens and carry no spatial information of any kind.
-- `[MASK]` is the absorbing noise state and is never a content target. `[PAD]` is a real content token that surplus canvas positions denoise into.
-- `[WIN]`/`[LOSS]` are reserved from day one so embeddings exist, but are used only in outcome fine-tuning (`SPEC.md` §8).
+- `[MASK]` is the absorbing-ablation noise state and is never a content target. Uniform corruption, prior sampling, renoising, and categorical candidate sampling exclude it. `[PAD]` is a real semantic canvas token for surplus positions.
+- `[WIN]`/`[LOSS]` are targets in both pretraining and outcome fine-tuning. Ground truth places one at canvas position zero, but the sampler imposes no positional token restriction.
 - The vocabulary contains no tokens for coordinates, frame numbers, or absolute times.
 - Concrete content-token contents derive from the extractor schema documented in `SCHEMA.md`; do not assume field names ahead of it. Engine-created ability pseudo-entities that the extractor marks untracked, including `kd8charge` and creep tumor variants, must not be content tokens.
 

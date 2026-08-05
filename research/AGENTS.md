@@ -7,6 +7,7 @@
 ## Ownership
 
 - Research notes own literature summaries, comparisons, evidence, and unresolved implications.
+- `diffusiongemma-uniform-migration.md` owns the dated primary-source review and accepted adopt/adapt/reject rationale for the uniform-diffusion migration.
 
 ## Local Contracts
 

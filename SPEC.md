@@ -1,4 +1,4 @@
-# SPEC.md — SC2 Strategy Prediction via Masked Discrete Diffusion
+# SPEC.md — SC2 Strategy Prediction via Uniform Discrete Diffusion
 
 Single source of truth for all architecture decisions in this repository.
 
@@ -18,9 +18,9 @@ Data extraction is complete and lives in a separate repository (`SC2-gamestate-e
 
 ## 2. Model family — SETTLED
 
-- Masked (absorbing-state) discrete diffusion, MDLM/LLaDA family. Methodology citations: SEDD, MDLM, LLaDA.
-- Backbone: a dense bidirectional transformer in the **LLaDA / LLaMA lineage** — RMSNorm (pre-norm), SwiGLU FFN, **Llama 3.1-style frequency-scaled RoPE** for sequence position, **vanilla multi-head attention (MHA), NOT grouped-query attention**, with **QK-norm** (per-head RMSNorm on queries/keys before RoPE, for attention stability; config-gated, default on). Single stack. The RoPE base and Llama 3 scaling factors are config fields so pretraining can use shorter sequences while inference can evaluate much longer sequences without learned position tables or an architecture change. This is the Llama 3 scaled-RoPE variant, not the separately defined YaRN algorithm. Rationale for MHA over GQA: GQA exists to shrink the KV cache during autoregressive decoding; full-canvas diffusion does not decode autoregressively, so (following LLaDA) MHA is used and FFN width is the parameter-budget knob. QK-norm note: it can flatten attention and slightly weaken precise retrieval, which matters for the input→canvas copy pathway — watch the copy-class loss when toggling. Attention uses FlashAttention kernels via PyTorch SDPA (no causal mask — full bidirectional with a padding mask only).
-- Reference architecture: LLaDA (dense, from-scratch masked diffusion LM) is the closest published anchor and is downscaled to fit this project. DiffusionGemma is NOT a structural template — it is MoE, block/semi-autoregressive, and encoder-decoder, all of which this project cuts; it serves only as a family existence proof and a source of sampler defaults (§9).
+- **Uniform-state multinomial discrete diffusion is the default process.** The forward process, clean-state prediction target, self-conditioning path, and sampler are adapted from DiffusionGemma and its released Gemma/Hackable Diffusion implementations. Absorbing `[MASK]` diffusion remains available only as the config-selected scientific ablation `diffusion.process: absorbing`; it must retain process-compatible corruption, loss, prior, and sampling semantics rather than mixing masked and uniform components. See `research/diffusiongemma-uniform-migration.md` for dated provenance and the adopt/adapt/reject rationale.
+- Backbone: a dense bidirectional **Gemma 4-lineage** transformer with sandwich RMSNorm around each residual branch (pre-attention RMSNorm, post-attention RMSNorm, pre-FFN RMSNorm, post-FFN RMSNorm), dense **GeGLU** feed forwarding (`GELU(gate, approximate="tanh") * up`, then down projection), **Llama 3.1-style frequency-scaled RoPE** for sequence position, **vanilla multi-head attention (MHA), NOT grouped-query attention**, and **QK-norm** (per-head RMSNorm on queries/keys before RoPE, config-gated and default on). The stack remains dense and single-path: no MoE. The RoPE base and scaling factors are config fields so pretraining can use shorter sequences while inference can evaluate longer sequences without learned position tables or an architecture change. MHA is retained because GQA's KV-cache savings target autoregressive decoding; full-canvas diffusion has no autoregressive KV cache. Attention uses FlashAttention kernels via PyTorch SDPA with no causal mask and a padding mask only.
+- DiffusionGemma is a mechanics and modern-backbone reference, not a wholesale topology template. This project adopts uniform corruption, clean-state prediction, self-conditioning, GeGLU/sandwich normalization, and uniform EB sampling while rejecting MoE routing, local/sliding attention, prompt KV caching, encoder-decoder separation, fixed 256-token canvases, and multi-canvas block autoregression.
 - Each training example is one flat sequence: `[input region][canvas region]`. Full bidirectional attention over the entire sequence. The input region is clamped — never noised, never receives loss. The canvas region is noised; loss is computed on canvas positions only.
 - Conditioning is clamping. There is no encoder-decoder split, no cross-attention conditioning, no separate prompt encoder.
 - No SSM layers in v1 (see §12 for the shelved fallback).
@@ -35,26 +35,27 @@ One unified SSL denoising task family. Both stages use the same clamped-input co
 - Fog rate: a parameter of the corruption distribution, sampled once per example from the required `config.fog` distribution. Zero fog degenerates to clean-past-predict-future. Fog applies to the enemy sequence only.
 
 **Target canvas (noised, receives loss):**
-- Leading outcome token: the canvas begins at position 0 with the `[WIN]`/`[LOSS]` outcome token for the perspective player, denoised LAST (see §9's `outcome_last` constraint). This token is part of pre-training itself — folded in so the model's frozen embedding prior includes it, rather than being introduced only at fine-tune time when the reduced learning rate makes a brand-new token hard to learn. Outcome/debut fine-tuning (§8) reuses the same leading-outcome-token layout.
+- Leading outcome token: ground truth always begins at position 0 with the perspective player's `[WIN]`/`[LOSS]` token. It is noised, predicted, sampled, and scored exactly like every other eligible canvas position; there is no positional sampler rule or `outcome_last` mechanism. The network learns the position-zero convention through gradient descent. Outcome/debut fine-tuning (§8) reuses the same layout.
 - The enemy sequence only: full reconstruction of the enemy past/present (both observed and fogged portions) plus the enemy future continuation, regenerated jointly, following the outcome token.
-- Canvas corruption during training: uniform i.i.d. masking with `[MASK]` at a sampled global corruption level *t* (MDLM-style). Input-side fog is independent and is never applied to the output canvas.
-- **t=1.0 oversampling (`diffusion.mask_schedule.t_one_fraction`, default 0.1):** when *t* is sampled (the real training path, not explicit-*t* eval/validation calls), each example independently draws a Bernoulli(`t_one_fraction`) coin; winners get *t* forced to EXACTLY 1.0 (fully masked canvas — the inference condition), while the rest keep the uniform draw over the schedule range. This is an expected per-epoch fraction (per-example Bernoulli), not an exact per-batch quota. Applies to both training modes.
+- Canvas corruption samples one global `t ~ Uniform(0,1)` per example. In default uniform mode, each canvas position independently retains its clean token with probability `1-t`; otherwise it is replaced by a uniformly sampled allowed canvas state. A corruption draw may coincidentally equal the clean token. Input-side fog remains independent and never applies to the output canvas.
+- Uniform-mode random states are sampled from every vocabulary ID except `[MASK]`. `[PAD]`, `[END]`, `[DELIMITER]`, `[WIN]`, `[LOSS]`, and content tokens may appear at any noised position. No grammar- or position-dependent restriction is applied. `[MASK]` remains reserved for the absorbing ablation and is invalid in a completed uniform-mode canvas.
+- **No intentional terminal oversampling by default:** `diffusion.schedule.t_one_fraction` remains a config-owned experimental knob but defaults to `0.0`. The ordinary continuous uniform time draw is the training distribution unless an explicit experiment changes the field.
 - **Per-epoch generator reseeding:** the training loop reseeds its corruption/self-conditioning generator to `base_seed + epoch_index` at every epoch boundary. Each epoch's masking stream is therefore a deterministic function of (seed, epoch), which keeps a resumed run's corruption draws aligned with the stream an uninterrupted run would have produced.
-- Canvas position 0 (the `[WIN]`/`[LOSS]` outcome token) receives NO training exemption: it is masked i.i.d. at rate *t* and weighted in the loss like any other canvas position. `outcome_last` (§9) is a sampler-only inference constraint.
-- At inference, the canvas initializes as all `[MASK]`.
-- `[MASK]` is the noise state. `[PAD]` is a content token in the vocabulary that surplus canvas positions denoise into.
+- At inference, uniform mode initializes every eligible canvas position independently from the same uniform state distribution. Absorbing ablation mode initializes eligible positions as `[MASK]`.
+- `[PAD]` is a semantic canvas token for surplus output positions. Batch-shape padding remains separate and excluded by attention/loss masks.
 
 **Loss:**
 - Position-wise cross-entropy against canonically ordered targets (§5), canvas positions only.
 - Per-token-class loss logging is mandatory from the first training run. Both modes retain stable dense ids 0–6 with mode-specific names:
   - **Pre-training (7 classes — `PRETRAIN_CLASS_ID_TO_NAME`):** enemy-observed, enemy-fogged, enemy-future, delimiter, end, pad, win-loss.
   - **Debut fine-tuning (7 classes — `DEBUT_CLASS_ID_TO_NAME`):** visible-debut, fogged-debut, future-debut, delimiter, end, pad, win-loss.
-- **Pre-training loss weighting is fully uniform (published MDLM style):** every class weight is 1.0 except `[PAD]`, which is 0.0 so padding positions never contribute. Pre-training NEVER reads `config.loss.class_loss_weights` — that section must be ABSENT from a pre-training config (validation rejects it).
+- **Uniform-mode pretraining objective:** unweighted clean-state `x0` cross-entropy over every valid target-canvas position, including semantic `[PAD]` targets. It does not use the Bernoulli corruption branch as a score mask and does not apply inverse-`t` weighting. Batch-shape padding alone is excluded. Pretraining never reads `config.loss.class_loss_weights`; that section must be absent from a pretraining config.
+- **Absorbing ablation objective:** preserve masked-position-only cross-entropy with inverse-`t` weighting so the ablation remains a coherent MDLM/LLaDA-style process. The process selector owns this pairing; invalid cross-process objective combinations are not configurable.
 - **Fine-tuning per-class loss weights** remain a config knob (`loss.class_loss_weights`, REQUIRED when `data.debut_mode=true`), default 1.0 (PROVISIONAL).
-- **Loss-breakdown metrics:** BOTH modes additionally log masked-CE broken down by the example's sampled *t*-bucket (`t_eq_1`, `[0.7,1.0)`, `[0.5,0.7)`, `[0.3,0.5)`, `[0.0,0.3)` — contiguous and exhaustive over [0,1]) and by player perspective (`p1`/`p2`). Both modes also emit input/future timestep telemetry and future-distance loss buckets.
-- **Auxiliary confidence loss (config-weighted):** an auxiliary term that sharpens per-position predictive confidence so confidence-based unmasking commits reliably and aggressively (fewer denoising steps → faster inference). Purpose per LLaDA2.0 (arXiv:2512.15745); implement by verifying that source's formulation, preferring a logits-derived form over a separate head. Config weight `confidence_loss_weight` (default small; 0.0 disables). Distinct from the §14-banned outcome classification head.
+- **Loss-breakdown metrics:** both training modes log clean-state CE broken down by the example's sampled *t*-bucket (`t_eq_1`, `[0.7,1.0)`, `[0.5,0.7)`, `[0.3,0.5)`, `[0.0,0.3)`) and by player perspective (`p1`/`p2`). Uniform mode uses all valid canvas positions in these breakdowns; absorbing mode uses its scored masked positions. Both modes retain input/future telemetry and future-distance buckets.
+- **Auxiliary confidence loss is an ablation only:** keep the logits-derived, config-weighted term, but default `confidence_loss_weight` to `0.0`. Overconfidence can distort both entropy-bounded selection and entropy-based stopping, so the uniform baseline relies on the clean-state objective unless an explicit experiment enables sharpening.
 - **EMA (SOTA diffusion practice):** maintain an exponential-moving-average copy of the weights during training (decay ~0.9999); use EMA weights for validation, the final checkpoint, sampling, and evaluation. EMA is standard for diffusion training and one of the practices distinguishing it from AR pretraining.
-- **Self-conditioning (config-gated, default on):** each denoising step may condition on the model's own previous clean-state canvas prediction (the prior step's softmax distribution), projected and added to canvas embeddings (canvas-only; input untouched). Training uses a two-pass procedure (prob `self_cond_prob`, default 0.5: a no-grad estimate pass, then a conditioned grad pass on which the loss is computed; null tensor otherwise). Inference reuses the previous step's prediction and adds NO extra forward passes. Train and inference interfaces must be identical. Per SCMDM (arXiv:2604.26985). This is prediction REUSE, not committed-token revision (remasking is deferred, §12).
+- **Self-conditioning (config-gated, default on):** training uses a no-grad clean-state estimate pass followed by the loss-bearing pass; independently per example, the stopped estimate is used with probability `self_cond_prob=0.5`, otherwise a zero signal is used. Convert probabilities to an expected embedding with the shared token-embedding table, then apply RMSNorm -> dense GeGLU -> residual addition to the current canvas token embedding -> scale-less RMSNorm. The input region is untouched. Inference reuses the preceding denoising pass and adds no extra forward pass. It derives the expected embedding from the same temperature-shaped distribution used for that step's entropy and candidate sampling. Train and inference interfaces must remain aligned.
 
 There is no copy mechanism of any kind. Input-to-output copying is a learned behavior produced by the loss.
 
@@ -62,7 +63,7 @@ There is no copy mechanism of any kind. Input-to-output copying is a learned beh
 
 - Raw atomic entity-level tokens only. One token per entity instance per timestep snapshot — unit counts emerge from token repetition. No BPE, no merges, no compound tokens, no learned tokenizer.
 - Single shared vocabulary for input and output. Content tokens are **raw entity-type tokens — entirely location-agnostic**. The token identity carries NO spatial information of any kind. Position is input-only and lives entirely in the contextual encodings (§6): the exact (X,Y) coordinate from the extractor parquet is added to the input token's embedding. The output canvas is location-agnostic — it predicts entity-type presence, timing, and counts (by repetition), never position.
-- Special tokens: `[MASK]` (absorbing noise state), `[PAD]`, `[END]`, `[DELIMITER]`, and outcome tokens `[WIN]` / `[LOSS]` (used in both modes).
+- Special tokens: `[MASK]` (noise-only state for the absorbing ablation), `[PAD]`, `[END]`, `[DELIMITER]`, and outcome tokens `[WIN]` / `[LOSS]` (used in both training modes). Uniform corruption/sampling excludes `[MASK]` and otherwise permits every state at every eligible canvas position; target grammar is learned rather than imposed through positional logit masks.
 - Outputs never contain raw coordinates, frame numbers, or absolute times. The vocabulary contains no tokens for them.
 - Concrete vocabulary contents are derived from the extractor schema (§13).
 
@@ -115,7 +116,7 @@ v1 uses delimiters only for timestep structure; a separate timestep-membership e
 - `debut_mode` gates `config.loss.class_loss_weights`; `config.fog`, future-distance loss decomposition, and input/future telemetry apply to both modes.
 - Debut detection is UNIFIED across token kinds: an event debuts when its per-timestep count exceeds the running maximum seen so far in the window's scan (count increase). For cumulative upgrade tokens — whose per-timestep count is always 0 or 1 — this fires exactly once, at first appearance, reproducing the previous upgrade special case, which is deleted.
 - Task: game outcome prediction. No classification head exists anywhere in this project.
-- Mechanism: the outcome token (`[WIN]`/`[LOSS]`) occupies the leading canvas position; the model denoises the outcome token and the normal continuation jointly in one pass. Pre-training uses the identical outcome-token placement and `outcome_last` denoising order.
+- Mechanism: the outcome token (`[WIN]`/`[LOSS]`) occupies the leading ground-truth canvas position; the model denoises it and the normal continuation jointly. Sampling applies no special position-zero ordering or token restriction.
 - Input: the same observed-gamestate input as pretraining.
 - Outcome-mode inputs are separate, contiguous whole-timestep windows bounded by
   `input_budget_tokens` only. They tile each replay without overlapping input
@@ -132,9 +133,13 @@ v1 uses delimiters only for timestep structure; a separate timestep-membership e
 
 ## 9. Inference and sampling — SETTLED mechanism, PROVISIONAL hyperparameters
 
-- Iterative denoising with confidence-based unmasking: each step commits the highest-confidence positions, re-masks nothing committed, and repeats until the canvas is fully committed or early stopping triggers.
-- Starting hyperparameters (PROVISIONAL, anchored on DiffusionGemma's published serving defaults): max ~48 denoising steps; adaptive early stopping; falling temperature schedule; entropy-bound selection of tokens to commit per step.
-- Remasking-style samplers (inference-time revision of committed tokens) are a permitted future extension. Not v1. Do not implement.
+- **Uniform mode uses DiffusionGemma-style nonmonotonic entropy-bounded sampling.** Initialize eligible positions from the uniform non-`[MASK]` state distribution. At each pass, temperature-shape clean-state logits, sample one categorical candidate per eligible position, compute full-vocabulary entropy, sort positions by ascending entropy, and accept the prefix satisfying `cumsum(sorted_entropy) - sorted_entropy <= entropy_bound`. Replace every nonaccepted eligible position with a fresh independent uniform state. Recompute acceptance from scratch every pass: previously accepted tokens may be renoised and revised, and no persistent committed mask exists.
+- Uniform-mode defaults are a 64-pass hard ceiling, linear temperature `0.8 -> 0.4` (`exponent=1.0`), and `entropy_bound=0.1`. There is no minimum denoising-step count, confidence threshold, or forced minimum acceptance count.
+- Adaptive stopping is evaluated per batch row over eligible positions and fires only when BOTH conditions hold: mean model entropy is below `0.005`, and argmax clean-token predictions are identical across two consecutive denoiser passes. Completed rows freeze while unfinished rows continue up to the 64-pass ceiling.
+- Uniform candidate/noise sampling excludes `[MASK]` but applies no position-dependent grammar mask. Infill diagnostics may clamp revealed ground-truth positions; clamped positions are excluded from candidate sampling, renoising, entropy aggregation, and stability checks.
+- **Absorbing ablation mode uses process-compatible EB unmasking:** initialize as `[MASK]`, sample categorical candidates, apply the same correct EB prefix formula among still-masked eligible positions, leave nonaccepted positions masked, and never remask accepted positions. It stops when all eligible positions are unmasked. It does not use uniform full renoising.
+- Sampler traces record transient acceptance, renoising/unaccept events, entropy, argmax stability, temperature, canvas state, per-row stop reason, and actual step count. “Committed” terminology is reserved for the monotonic absorbing ablation and must not describe uniform-mode acceptance.
+- Normal sampling performs no post-sampling model call. Optional final-logit diagnostics may perform one explicit extra pass and must remain off the normal evaluation path.
 
 ## 10. Evaluation — SETTLED
 
@@ -157,16 +162,18 @@ All of the following are config fields in one YAML file, validated by a dataclas
 | `data.feature_statistics_path` | `data/processed/feature_statistics.json` | Deterministic train-split normalization artifact; required by production model construction and checked against checkpoints. |
 | `pipeline.prepare_feature_statistics` | false | Explicit permission to compute or replace the statistics artifact from the selected training replay artifacts only. |
 | `within_type_tiebreak` | unit ID | §5 |
-| `class_loss_weights` | all 1.0 | Keyed by §3's debut classes. FINE-TUNING-ONLY: required when `data.debut_mode=true`, rejected when false; pre-training uses fixed uniform weighting with `[PAD]`=0 (§3) |
-| `diffusion.mask_schedule.t_one_fraction` | 0.1 | Expected per-epoch fraction of examples oversampled to exactly t=1.0 (per-example Bernoulli); 0.0 disables (§3). Stated explicitly in every profile YAML |
+| `class_loss_weights` | all 1.0 | Keyed by §3's debut classes. Fine-tuning-only: required when `data.debut_mode=true`, rejected when false; uniform pretraining uses unweighted all-valid-position CE (§3). |
+| `diffusion.process` | `uniform` | `uniform` is the production default; `absorbing` is the coherent masked-diffusion ablation (§2–3, §9). |
+| `diffusion.schedule.t_one_fraction` | 0.0 | Experimental exact-terminal oversampling fraction. The baseline intentionally oversamples nothing (§3). |
 | local `model.*` (d_model / layers / heads / ffn) | 256 / 10 / 4 / 1024 | ~10.7M proof-of-life shape with head dimension 64. Cloud scale remains config-only. |
-| `mask_schedule` | linear, t ~ U(0,1) | MDLM/LLaDA default; loss reweighted by 1/t over masked positions |
-| `train.*` (lr / betas / weight_decay / warmup / lr_floor / grad_clip / accum / precision) | 3e-4 / (0.9,0.95) / 0.1 / 2000 / 0.1×peak / 1.0 / as-needed / bf16 | Cosine decay to lr_floor; accumulation derived from a target effective batch size (§005) |
-| `train.ema_decay / confidence_loss_weight / val_interval` | 0.9999 / 0.1 / periodic | EMA on by default; confidence loss off-able via 0.0 (§3, §005) |
+| `diffusion.schedule` | linear, t ~ U(0,1) | Uniform mode uses retain-with-`1-t`, otherwise uniform replacement; absorbing ablation uses `[MASK]` replacement and inverse-`t` masked loss. |
+| `train.*` (lr / betas / weight_decay / warmup / lr_floor / grad_clip / accum / precision) | 3e-4 / (0.9,0.95) / 0.1 / 2000 / 0.1×peak / 1.0 / as-needed / bf16 | Cosine decay to `lr_floor`; accumulation derives from the target effective batch size. |
+| `train.ema_decay / confidence_loss_weight / val_interval` | 0.9999 / 0.0 / periodic | EMA on by default; confidence sharpening is an opt-in ablation (§3). |
 | `train.epochs / early_stopping_*` | profile-owned / disabled by default | Epoch CSV metrics are always available; local overfit uses 0.1% relative improvement with five-epoch patience and a 200-epoch cap. |
-| `model.qk_norm / model.self_conditioning / train.self_cond_prob` | true / true / 0.5 | QK-norm and self-conditioning (§2, §3, §009); both gated, OFF reproduces pre-009 behavior |
+| `model.qk_norm / model.self_conditioning / train.self_cond_prob` | true / true / 0.5 | QK-norm and expected-embedding GeGLU self-conditioning (§2–3). |
 | `model.rope_theta / model.rope_scaling.*` | 500000 / llama3, factor 8, low/high 1/4, original context 8192 | Llama 3.1 frequency-scaled RoPE; all constants are config-owned and sequence length is not hard-capped in the rotary implementation |
-| `sampler.max_steps / temperature / entropy_bound` | 48 / 0.8→0.4 / 0.1 | §9 |
+| `sampler.max_steps / temperature / entropy_bound` | 64 / 0.8→0.4 / 0.1 | Hard ceiling with no minimum; temperature exponent `1.0` gives the linear schedule (§9). |
+| `sampler.adaptive_stop / entropy_threshold / stability_steps` | true / 0.005 / 2 | Both confidence and stability conditions are required (§9). |
 
 **Model-sizing note.** All `model.*` values are config; size changes require no code changes. The local ~10M shape validates the pipeline and is not a capability target. The intended cloud-scale endpoint remains approximately 450M parameters and is restored by configuration alone.
 
@@ -192,6 +199,8 @@ Each item below was explicitly evaluated and cut. Do not introduce them in any f
 - Set aggregators, set encoders, or pooling-over-entities modules of any kind
 - Encoder-decoder architecture, including cross-attention conditioning
 - Semi-autoregressive or block-autoregressive generation
+- Prompt KV caching or a separate prompt encoder
+- Mixture-of-experts routing, grouped-query attention, or cache-oriented local/sliding attention
 - Copy mechanisms: pointer networks, copy gates, copy losses
 - Classification heads (outcome prediction is generative, §8)
 - Learned or compound tokenizers: BPE, merges, hierarchical clustering
@@ -206,7 +215,7 @@ Each item below was explicitly evaluated and cut. Do not introduce them in any f
 ## 15. Repository conventions
 
 - `./prompts/` holds executable agent prompts (`NNN-name.md`); completed prompts move to `./prompts/completed/`.
-- `./research/` research outputs; `./plans/` plans; `./diagnostics/` diagnostics; `./tests/fixtures/` owner-provided sample extractor outputs.
+- `./research/` research outputs, including the dated DiffusionGemma migration evidence in `research/diffusiongemma-uniform-migration.md`; `./plans/` plans; `./diagnostics/` diagnostics; `./tests/fixtures/` owner-provided sample extractor outputs.
 - `CLAUDE.md` (created by prompt 001) carries coding conventions. This SPEC.md carries architecture truth and wins on conflict.
 - Python + PyTorch. Tests via pytest. Configuration via one YAML file validated by a dataclass.
 
@@ -228,4 +237,4 @@ Training runs on cloud GPU compute; inference runs locally (RTX 3070). This spli
 - **Data is not bundled.** It is fetched from a configured remote source (Kaggle `mataeoanderson/sc2-replay-data` and/or aiarena.net) and produced by the `SC2-gamestate-extractor` (separate repo). Data-acquisition is a **decoupled stage**, runnable independently of training (extraction is CPU-bound; training is GPU-bound — they need not share an instance or environment).
 - **Reproducible env, single entry command.** The pipeline installs and runs from a clean checkout via uv (locked) and one entry command. Secrets (data-source creds, bucket creds) come from environment/config, never hardcoded, never committed.
 - **Provider-agnostic interface, AWS as the initial target.** The pipeline runs on any Linux GPU instance via plain `git clone` + `uv sync` + run — **no Docker** (an unneeded complication until a concrete need forces it). The storage interface is generic (local path or remote bucket); the initial concrete backends are local filesystem and **AWS S3**, with EC2 GPU instances (Deep Learning AMI, CUDA/drivers preinstalled) for training and a cheap CPU instance for data-acquisition. No managed-service or orchestration lock-in (no Airflow/Prefect/K8s/SageMaker-specific glue).
-- The master training script and data-acquisition script are built in prompt 008; these conventions apply to every prompt that touches paths, storage, data, or checkpoints.
+- The existing master training and data-acquisition entry points follow these conventions; every prompt that touches paths, storage, data, or checkpoints must preserve them.

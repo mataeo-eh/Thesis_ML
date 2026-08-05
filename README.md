@@ -42,16 +42,12 @@ pip install -e .
 - Self-supervised learning with the pre-training objective of training a generative model to identify if anything is missing from a game-state snapshot, executed as % corruption via omitted tokens to approximate fog-of-war, predict what is missing, and then predict future game states based on what has already been observed, will train a generative model with a rich enough representation of the feature space that the model will be able to be fine-tuned to perform a discriminative task such as predicting opponent build order/strategy.
 
 **ML Architecture**
-- A discrete diffusion/ masked denoising backbone using a bidirectional, non-causal transformer. The reference family being the open Ermon-group work — SEDD / MDLM / LLaDA — with Mercury 2 as an existence proof in the realm of Language.
-- Two self-supervised pretraining objectives on perfect-information replay data:
-    - inter-timestep (given 1–n, predict n+1) and
-    - intra-timestep (given prior timesteps plus a partial token set at n with % corruption tokens randomly omitted, reconstruct the full set at n). (determine if anything is missing, and what is missing)
-        - | [input tokens] | [output tokens] |
-- Pre-backbone pipeline: embedding lookup (entity token ID → vector, learned during pretraining), then contextual encodings added (timestep membership, map position, unit stats).
-- Post-training is Supervised Fine Tuning (SFT) -> Strategy labels becomes additional tokens in the generative output stream
-    - | [input tokens] | [strategy-label output tokens] | [normal output tokens] |
-    - The model iteratively refines the strategy label alongside the future game-state roll-out.
-    - The input collapses to a single type: dropping the dual inter-/intra-timestep input regime that only existed for pretraining and only passing the sequence of gamestates, but each gamestate in the sequence maintains its fog-of-war approximation of missing tokens.
+- Uniform-state multinomial discrete diffusion with a dense, full-bidirectional Gemma 4-lineage transformer. The project adopts DiffusionGemma's uniform corruption, expected-embedding self-conditioning, dense GeGLU/sandwich-RMSNorm mechanics, and nonmonotonic entropy-bounded sampler while retaining one full output canvas and a clamped input instead of block-autoregressive KV-cache conditioning.
+- Self-supervised pretraining receives a fogged observed-game-state input and jointly reconstructs omitted enemy past/present state plus whole-timestep future continuation on the output canvas.
+    - | [clamped input tokens] | [uniformly noised output canvas] |
+- Input embeddings combine location-agnostic entity-token identity with allowlisted input-only map position, unit statistics, and allegiance. Sequence position uses Llama 3.1-style frequency-scaled RoPE; absolute time and frame-derived values never enter the model.
+- Ground truth begins with a perspective-relative `[WIN]` or `[LOSS]` token followed by the normal canvas body. The sampler applies no position-specific restriction: the model learns the position-zero outcome convention and refines it jointly with the strategy roll-out.
+- Absorbing `[MASK]` diffusion remains a configuration-selectable scientific ablation, not the production default.
 
 **Evaluation**
 - Evaluate the model's discriminative ability by measuring accuracy, recall, precision, and F1score against a held-out test set of replays with ground-truth strategy/build order labels.

@@ -18,6 +18,7 @@
 - Launchers forward extra CLI args, so `--max-steps N` gives a bounded launch check. CUDA-required profiles must fail before preprocessing when CUDA is unavailable.
 - Fixtures are the schema authority for tests; do not hardcode field names that contradict them or `SCHEMA.md`.
 - GPU/VRAM claims require an environment where CUDA is visible; never infer VRAM from a CPU run.
+- Diffusion coverage must exercise both process values without mixing their semantics: uniform corruption/all-valid loss/nonmonotonic full-renoising EB by default, and absorbing corruption/masked inverse-time loss/monotonic EB as the ablation. Tests must prove exact EB prefix math, categorical RNG reproducibility, adaptive stop conjunction, unrestricted outcome-token placement, and checkpoint incompatibility.
 
 ## Work Guidance
 

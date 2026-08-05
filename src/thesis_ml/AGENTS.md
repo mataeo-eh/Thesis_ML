@@ -36,9 +36,9 @@
 
 - `data/AGENTS.md`: tokenized replay artifacts, budget-driven windows, lazy example construction, per-serving fog, dynamic collation, replay split, bounded frame cache.
 - `vocab/AGENTS.md`: shared content vocabulary and reserved special tokens.
-- `model/AGENTS.md`: LLaDA/LLaMA-lineage bidirectional diffusion backbone, input-only embeddings, canvas cross-entropy loss.
-- `train/AGENTS.md`: canvas corruption, the training loop and metrics, and the synthetic smoke trainer.
-- `inference/AGENTS.md`: iterative confidence-based sampler, canvas grammar validation/decoding, external time recovery.
+- `model/AGENTS.md`: dense Gemma 4-lineage bidirectional backbone, input-only features, expected-embedding self-conditioning, and canvas clean-state loss.
+- `train/AGENTS.md`: uniform/absorbing canvas corruption, process-compatible objectives, the training loop and metrics, and the synthetic smoke trainer.
+- `inference/AGENTS.md`: nonmonotonic uniform EB sampling, absorbing EB ablation, canvas grammar validation/decoding, and external time recovery.
 - `eval/AGENTS.md`: build-order extraction, evaluation harness, precision/recall/F1 metrics, fine-tune reporting.
 - `pipeline/AGENTS.md`: config-only orchestration for data acquisition, training, fine-tuning, and storage abstraction.
 - `viz/AGENTS.md`: read-only checkpoint diagnostics, static figures, and opt-in raw canvas/logit exports.

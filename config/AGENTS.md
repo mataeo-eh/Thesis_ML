@@ -6,7 +6,7 @@
 
 ## Ownership
 
-- `default.yaml` owns the full default set of `data.*`, `fog.*`, `model.*`, `train.*`, `pipeline.*`, `storage.*`, `data_source.*`, and evaluation parameters validated by `src/thesis_ml/config.py`, including the feature-statistics path and explicit preparation switch.
+- `default.yaml` owns the full default set of `data.*`, `fog.*`, `diffusion.*`, `model.*`, `train.*`, `sampler.*`, `pipeline.*`, `storage.*`, `data_source.*`, and evaluation parameters validated by `src/thesis_ml/config.py`, including uniform diffusion, adaptive EB stopping, feature-statistics identity, and explicit preparation switches.
 
 ## Local Contracts
 
@@ -16,6 +16,7 @@
 - No secrets or machine-specific absolute paths: storage locations are URIs (local or `s3://`) and credentials come from the environment.
 - Absolute time, frame number, `game_loop`, and timestamp-derived values must never be introduced as model-feature config.
 - `fog` is required in both modes. `data.feature_statistics_path` names the deterministic training-statistics artifact, while `pipeline.prepare_feature_statistics` must be enabled explicitly when that artifact should be computed or replaced.
+- `diffusion.process` defaults to `uniform`; `absorbing` is the only supported ablation. The process determines compatible corruption, loss, prior, and sampler behavior. Default terminal oversampling and confidence sharpening are `0.0`; sampler maximum steps is `64` with the published DiffusionGemma temperature, entropy-bound, and adaptive-stop defaults.
 
 ## Work Guidance
 

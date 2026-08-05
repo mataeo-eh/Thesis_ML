@@ -2,7 +2,7 @@
 
 ## Purpose
 
-- Own the masked-discrete-diffusion research package, configuration, replay preprocessing, training, inference, and tests.
+- Own the uniform-state discrete-diffusion research package, its absorbing-process ablation, configuration, replay preprocessing, training, inference, and tests.
 
 ## Ownership
 
@@ -25,7 +25,7 @@
 - Debut/outcome windows tile non-overlapping input timesteps under the input token budget only; each debut canvas starts at the input-window start and runs to replay end or the canvas budget, so output horizons may overlap. Outcome mode owns a separate stamped manifest.
 - Each batch row contains exactly one replay window. Do not pack sequences or add document masks.
 - Fog is sampled while serving every example. Persisted artifacts and manifests must remain clean.
-- Both modes serve a clamped input region with per-timestep `[self records][fog-filtered enemy records][ONE DELIMITER]`. Input fog and canvas diffusion are independent: one omission rate is sampled per example and applies to enemy content records of every token kind, while canvas corruption samples one diffusion level `t` per example and masks each loss-eligible canvas position independently (with a config-owned fraction oversampled to exactly `t=1.0`).
+- Both training modes serve a clamped input region with per-timestep `[self records][fog-filtered enemy records][ONE DELIMITER]`. Input fog and canvas diffusion are independent. Canvas corruption samples one `t` per example; default uniform diffusion independently replaces positions with uniformly drawn non-`[MASK]` states at probability `t`, while the config-selected absorbing ablation replaces them with `[MASK]`. Intentional exact-`t=1` oversampling defaults to zero.
 - Static conditioning is learned jointly with token identity from allowlisted standardized `(map_x, map_y, unit stats)` values plus numeric allegiance. Statistics are computed only from selected training replays, persisted with a content identity, and must match resumes, warm starts, diagnostics, exports, and sampling checkpoints.
 - Pretraining and fine-tuning both expand every replay into exactly two perspective-specific sample streams: `p1` as self/`p2` as enemy and `p2` as self/`p1` as enemy. Replay splitting happens before this expansion so both perspectives remain in the same train/dev/test split.
 - Batch padding is dynamic. Padding masks must exclude batch-shape padding from attention and loss.
@@ -34,7 +34,7 @@
 - The overfit profile enables config-gated block activation checkpointing because full-size fused-attention training was measured above the VRAM ceiling; other profiles retain the default-off path.
 - The overfit profile uses batch size 10, validated for 20 real-data steps at 5.885 GiB peak reserved memory on the RTX 3070.
 - The V1 overfit profile remains the baseline. V2 weights `[PAD]` loss at 0.2, disables early stopping, and runs the full 200-epoch cosine schedule unless manually stopped.
-- The local-full pretraining run uses an exact 870-train/50-dev/remainder-test replay split, full reconstruction/future targets with perspective-relative `[WIN]`/`[LOSS]` at canvas index 0, and outcome-last sampling.
+- The local-full pretraining run uses an exact 870-train/50-dev/remainder-test replay split and full reconstruction/future targets with perspective-relative `[WIN]`/`[LOSS]` at canvas index 0. Sampling has no outcome-last or other position-dependent constraint.
 - The local-full run keeps workers persistent, trims unused CUDA cache after completed epochs, does not retain ignored step-log objects, and records current allocation, peak allocation, reservation, inactive-split allocator telemetry, device-wide memory use, and the device-minus-reserved gap.
 - The overfit loader uses four persistent workers with four batches prefetched per worker; training batches drop raw metadata after worker-side feature construction, pin their custom batch tensors, and use non-blocking CUDA copies.
 - Model scale, token budgets, paths, subset selection, epochs, and checkpoint intervals remain config-owned.
@@ -43,7 +43,8 @@
 - Epoch patience compares noisy resampled train loss against the best loss using the configured relative minimum improvement; a single flat epoch never stops a run.
 - Absolute time and frame-derived values remain metadata only and must not enter model features.
 - `thesis_ml.viz.diagnostics` always writes high-contrast, aligned ground-truth/prediction/error count figures. `--n-windows` is interpreted per selected replay. First-appearance timelines require `--first-appearance`; comparison CSV, input text, and final-canvas top-10 logit JSON exports consolidate multiple windows into one labelled artifact per export type and output-mask directory.
-- `thesis_ml.viz.diagnostics --bypass-sampler` keeps those outputs unchanged while replacing iterative sampling with exactly one all-`[MASK]` denoising forward pass per example; default behavior remains iterative.
+- `thesis_ml.viz.diagnostics --bypass-sampler` keeps those outputs unchanged while replacing iterative sampling with exactly one denoising forward pass from the selected process's terminal prior (uniform random non-`[MASK]` canvas by default; all-`[MASK]` only for the absorbing ablation).
+- Uniform diffusion, dense GeGLU/sandwich-RMSNorm architecture, and process-stamped checkpoints form one compatibility boundary. Loaders must reject retired checkpoints before partial loading; repository-local retired checkpoints are removed only after the migration and verification complete.
 
 ## Work Guidance
 
@@ -70,7 +71,7 @@
 - `tests/AGENTS.md`: pytest suite, owner-provided extractor fixtures, and thin Windows launchers.
 - `prompts/AGENTS.md`: executable task prompts and the completed-prompt archive.
 - `plans/AGENTS.md`: implementation plans derived from accepted prompts and current contracts.
-- `research/AGENTS.md`: source-attributed research outputs that inform, but do not override, project contracts.
+- `research/AGENTS.md`: source-attributed research outputs, including the dated DiffusionGemma uniform-migration evidence, that inform but do not override project contracts.
 - `diagnostics/AGENTS.md`: reproducible audits, investigations, and failure analyses.
 - `notebooks/AGENTS.md`: exploratory notebooks whose reusable logic must graduate into the package.
 - `experiments/AGENTS.md`: reproducible experiment definitions linked to versioned configs; generated runs remain ignored.

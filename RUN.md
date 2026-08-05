@@ -140,7 +140,7 @@ snapshots (otherwise only the rolling `last.pt` is kept, so disk/S3 stays flat).
 
 ### Monitoring a long run
 
-Per-step metrics (loss, per-class losses, learning rate, masked fraction, step
+Per-step metrics (loss, per-class losses, learning rate, corruption fraction, step
 wall time, tokens/sec, CUDA peak allocated bytes, CUDA reserved bytes, and
 periodic held-out validation) are appended to `metrics.jsonl` and uploaded to
 `storage.log_uri` on the checkpoint cadence. CUDA attention is restricted to
