@@ -32,15 +32,18 @@ diffusion:
 # configs/local_overfit_v2_finetune.yaml.
 #
 # Diagnostics this run writes to tests/output/overfitV2/ (see
-# TrainingLoop._write_interval_metrics for the full column list):
-#   - interval_metrics.csv : ten rows per epoch (~every 10% of the epoch), each
-#     scoped to that slice, carrying train AND dev values for every loss
-#     sub-class below. 30 epochs x 10 = 300 rows.
-#   - epoch_metrics.csv    : one row per epoch, same loss columns plus timestep
-#     percentiles, future-distance buckets, and memory/throughput telemetry.
+# TrainingLoop._write_epoch_metrics for the full column list):
+#   - epoch_metrics.csv    : one row per epoch (150 rows), carrying train AND dev
+#     values for every loss sub-class below, plus timestep percentiles,
+#     future-distance buckets, and memory/throughput telemetry.
 #   - step_metrics.jsonl   : one line per optimizer step.
+#   - interval_metrics.csv : NOT written by this profile. Both
+#     train.interval_dev_evaluation and train.interval_train_evaluation are
+#     false in local_overfit.yaml (see the reasoning there), so everything is
+#     reported at the epoch boundary instead. The wiring is intact -- flip
+#     either flag to restore the ten-rows-per-epoch file.
 #
-# Loss sub-classes reported in both CSVs:
+# Loss sub-classes reported per epoch:
 #   per-class    : [PAD], [DELIMITER], [END], win-loss, enemy-observed
 #                  (copying observed enemy tokens onto the canvas),
 #                  enemy-fogged (reconstructing fogged enemy tokens), and
@@ -51,3 +54,17 @@ diffusion:
 #   t-bucket     : overall loss at 0-25%, 25-75%, 75-<100%, and exactly 100%
 #                  canvas corruption.
 #   perspective  : p1 vs p2.
+#   rare-class x t-bucket : the headline diagnostic for this run. The win/loss,
+#                  [END], and [DELIMITER] tokens crossed with all four
+#                  corruption buckets -- 12 loss columns and 12 position-count
+#                  columns per split. Reading per-class and t-bucket side by side
+#                  CANNOT answer the question these columns exist for, because
+#                  each of those marginalizes away the other's axis: a win/loss
+#                  token that is learned at low corruption and hopeless at high
+#                  corruption shows up in per-class as one mediocre average. The
+#                  count columns are what make the loss columns trustworthy --
+#                  win_loss_* is one position per example, and [END] appears only
+#                  in windows that reach game end, so a bucket can legitimately
+#                  contain zero of them. A count of 0 (recorded as 0, not blank)
+#                  says the empty loss cell is a sampling artifact rather than a
+#                  result.

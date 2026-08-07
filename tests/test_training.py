@@ -2,6 +2,7 @@ from dataclasses import replace
 import csv
 from functools import partial
 from pathlib import Path
+import time
 
 import pytest
 import torch
@@ -28,11 +29,15 @@ from thesis_ml.data.dataset import (
     PRETRAIN_CLASS_ID_TO_NAME,
     DatasetExample,
 )
+from thesis_ml.model.loss import RARE_CLASS_T_BUCKET_NAMES
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.train.corruption import corrupt_batch, inverse_t_weights
 from thesis_ml.train.loop import (
     INTERVAL_REPORTS_PER_EPOCH,
     TrainingLoop,
+    _append_csv_row,
+    _finalize_rare_class_t_bucket,
+    _latest_metrics_csv_path,
     auxiliary_confidence_loss,
     interval_boundaries,
 )
@@ -526,6 +531,46 @@ def test_epoch_metrics_csv_contains_train_dev_classes_and_throughput(tmp_path: P
     assert "train_enemy_future_loss" in fieldnames
 
 
+def test_locked_metrics_csv_continues_with_full_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    csv_path = tmp_path / "epoch_metrics.csv"
+    fieldnames = ["epoch", "train_loss"]
+    assert _append_csv_row(
+        csv_path,
+        fieldnames,
+        {"epoch": 1, "train_loss": 2.0},
+    ) == csv_path
+
+    original_open = Path.open
+
+    def locked_open(self: Path, mode: str = "r", *args: object, **kwargs: object):
+        if self == csv_path and "a" in mode:
+            raise PermissionError(13, "simulated viewer lock", str(self))
+        return original_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", locked_open)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    continuation_path = _append_csv_row(
+        csv_path,
+        fieldnames,
+        {"epoch": 2, "train_loss": 1.0},
+    )
+
+    assert continuation_path != csv_path
+    assert continuation_path.name.startswith("epoch_metrics-continued-")
+    with original_open(continuation_path, newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [int(row["epoch"]) for row in rows] == [1, 2]
+    assert _latest_metrics_csv_path(csv_path) == continuation_path
+    output = capsys.readouterr().out
+    assert "metrics_csv_locked action=continued" in output
+    assert "history_rows_copied=1" in output
+
+
 def test_interval_boundaries_are_evenly_spaced_and_end_on_the_epoch(tmp_path: Path) -> None:
     """Report boundaries tile the epoch and always close on its final batch.
 
@@ -681,6 +726,224 @@ def test_interval_dev_evaluation_can_be_disabled_without_losing_train_rows(
     assert len(epoch_rows) == 1
     assert float(epoch_rows[0]["dev_loss"]) > 0
     assert float(epoch_rows[0]["dev_pad_loss"]) > 0
+
+
+def test_epoch_metrics_reports_rare_class_loss_and_counts_per_t_bucket(
+    tmp_path: Path,
+) -> None:
+    """The rare-class x t-bucket cross decomposition, losses AND position counts.
+
+    The three rare classes (win/loss, [END], [DELIMITER]) are crossed with all
+    four corruption buckets, so a trend that runs along the corruption axis stays
+    visible instead of being averaged away by the `per_class` marginal.
+
+    The counts are the half that makes the losses readable. Each synthetic canvas
+    holds exactly one win/loss token, one [END], and three [DELIMITER]s, so with
+    two examples per epoch and `fixed_t=1.0` pinning every example to the
+    exact-t==1 bucket the expected counts are exact -- and every other bucket
+    must report a real 0 rather than a blank, which is what distinguishes "no
+    [END] landed in this bucket" from "this bucket was never evaluated".
+    """
+
+    config = _small_config(tmp_path)
+    examples = make_synthetic_examples(config, count=4)
+    train_loader = DataLoader(examples[:2], batch_size=2, collate_fn=_collate_pretrain)
+    dev_loader = DataLoader(examples[2:], batch_size=2, collate_fn=_collate_pretrain)
+    csv_path = tmp_path / "epoch_metrics.csv"
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=91, epoch_metrics_path=csv_path)
+
+    loop.fit(train_loader, val_dataloader=dev_loader, max_steps=2, epochs=2, fixed_t=1.0)
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = set(reader.fieldnames or [])
+        rows = list(reader)
+
+    # All 12 cells exist as a loss column and a count column, for both splits.
+    for split in ("train", "dev"):
+        for name in RARE_CLASS_T_BUCKET_NAMES:
+            assert f"{split}_rare_class_loss_{name}" in fieldnames
+            assert f"{split}_rare_class_count_{name}" in fieldnames
+    assert len(RARE_CLASS_T_BUCKET_NAMES) == 12
+
+    for row in rows:
+        for split in ("train", "dev"):
+            # One win/loss + one [END] + three [DELIMITER] per canvas, two
+            # canvases per epoch, all pinned to t == 1 by fixed_t.
+            assert int(row[f"{split}_rare_class_count_win_loss_t_eq_1"]) == 2
+            assert int(row[f"{split}_rare_class_count_end_t_eq_1"]) == 2
+            assert int(row[f"{split}_rare_class_count_delimiter_t_eq_1"]) == 6
+            # A populated cell carries a real loss.
+            assert float(row[f"{split}_rare_class_loss_win_loss_t_eq_1"]) > 0
+            assert float(row[f"{split}_rare_class_loss_end_t_eq_1"]) > 0
+            assert float(row[f"{split}_rare_class_loss_delimiter_t_eq_1"]) > 0
+            # Every other bucket scored nothing: the COUNT is an explicit 0 (the
+            # observation) while the LOSS is blank (no positions to average).
+            for bucket in ("t_0_75_to_1_0", "t_0_25_to_0_75", "t_0_0_to_0_25"):
+                for rare_class in ("win_loss", "end", "delimiter"):
+                    cell = f"{rare_class}_{bucket}"
+                    assert int(row[f"{split}_rare_class_count_{cell}"]) == 0
+                    assert row[f"{split}_rare_class_loss_{cell}"] == ""
+
+
+def test_rare_class_cells_pool_by_position_count_not_by_microbatch(
+    tmp_path: Path,
+) -> None:
+    """A cell's reported loss is its mean over every scored position.
+
+    The loss module hands back a SUM and a COUNT per cell rather than a finished
+    mean precisely so the training loop can pool this way. Averaging
+    per-microbatch means instead would weight a microbatch holding 3 [DELIMITER]
+    positions the same as one holding 6, which is wrong whenever the rare tokens
+    are unevenly spread across batches -- the normal case for [END], which only
+    appears in windows that reach game end.
+
+    Proven directly against the loss module: the pooled mean of two unequal
+    batches must equal the total-sum / total-count, not the mean of the two
+    batch means.
+    """
+
+    config = _small_config(tmp_path)
+    examples = make_synthetic_examples(config, count=3)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=92)
+
+    # Deliberately unequal batches: 1 example then 2, so the delimiter cell holds
+    # 3 positions and then 6.
+    small = loop.compute_batch_loss(
+        _collate_pretrain(examples[:1]), fixed_t=1.0
+    ).loss_output
+    large = loop.compute_batch_loss(
+        _collate_pretrain(examples[1:]), fixed_t=1.0
+    ).loss_output
+
+    cell = "delimiter_t_eq_1"
+    small_count = int(small.rare_class_t_bucket_counts[cell])
+    large_count = int(large.rare_class_t_bucket_counts[cell])
+    assert (small_count, large_count) == (3, 6)
+
+    small_sum = float(small.rare_class_t_bucket_sums[cell].detach())
+    large_sum = float(large.rare_class_t_bucket_sums[cell].detach())
+    pooled = (small_sum + large_sum) / (small_count + large_count)
+    mean_of_means = ((small_sum / small_count) + (large_sum / large_count)) / 2
+
+    # The helper the loop uses must produce the pooled value.
+    finalized = _finalize_rare_class_t_bucket(
+        {cell: small_sum + large_sum},
+        {cell: small_count + large_count},
+    )
+    assert finalized[cell] == pytest.approx(pooled)
+    # And that value is genuinely different from the naive reduction, so this
+    # test would fail if the pooling ever regressed to a mean of means.
+    assert pooled != pytest.approx(mean_of_means)
+
+    # A cell that scored nothing is omitted from the finalized means entirely
+    # rather than dividing by zero.
+    assert _finalize_rare_class_t_bucket({"end_t_eq_1": 0.0}, {"end_t_eq_1": 0}) == {}
+
+
+def test_interval_train_evaluation_false_blanks_train_and_keeps_dev(
+    tmp_path: Path,
+) -> None:
+    """`interval_train_evaluation: false` is the exact mirror of the dev knob.
+
+    Train columns go blank while the dev pass still populates its half of every
+    interval row, and train loss is instead reported once per epoch.
+    """
+
+    config = _small_config(tmp_path)
+    config = replace(config, train=replace(config.train, interval_train_evaluation=False))
+    examples = make_synthetic_examples(config, count=24)
+    train_loader = DataLoader(examples[:20], batch_size=2, collate_fn=_collate_pretrain)
+    dev_loader = DataLoader(examples[20:], batch_size=2, collate_fn=_collate_pretrain)
+    interval_path = tmp_path / "interval_metrics.csv"
+    epoch_path = tmp_path / "epoch_metrics.csv"
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(
+        model=model,
+        config=config,
+        seed=93,
+        interval_metrics_path=interval_path,
+        epoch_metrics_path=epoch_path,
+    )
+
+    loop.fit(train_loader, val_dataloader=dev_loader, max_steps=10, epochs=1, fixed_t=1.0)
+
+    with interval_path.open(newline="", encoding="utf-8") as handle:
+        interval_rows = list(csv.DictReader(handle))
+    # Rows are still emitted at the same cadence, still carrying dev.
+    assert len(interval_rows) == INTERVAL_REPORTS_PER_EPOCH
+    assert all(float(row["dev_loss"]) > 0 for row in interval_rows)
+    assert all(float(row["dev_pad_loss"]) > 0 for row in interval_rows)
+    # Train columns blank across the headline, per-class, and rare-class cells.
+    assert all(row["train_loss"] == "" for row in interval_rows)
+    assert all(row["train_pad_loss"] == "" for row in interval_rows)
+    assert all(row["train_canvas_state_loss_noised"] == "" for row in interval_rows)
+    assert all(
+        row["train_rare_class_count_win_loss_t_eq_1"] == "" for row in interval_rows
+    )
+
+    # Train is not lost -- it is reported once, at the epoch end.
+    with epoch_path.open(newline="", encoding="utf-8") as handle:
+        epoch_rows = list(csv.DictReader(handle))
+    assert len(epoch_rows) == 1
+    assert float(epoch_rows[0]["train_loss"]) > 0
+    assert float(epoch_rows[0]["train_pad_loss"]) > 0
+    assert int(epoch_rows[0]["train_rare_class_count_win_loss_t_eq_1"]) > 0
+
+
+def test_both_interval_evaluations_false_writes_no_interval_file(
+    tmp_path: Path,
+) -> None:
+    """Both sides off means no row at all, not a file full of blank cells.
+
+    This is the overfit profile's configuration: every number is reported once
+    per epoch instead. The accumulation wiring must stay intact regardless, so
+    the epoch row is still fully populated -- including the rare-class cells,
+    whose per-epoch totals are exactly what the interval rows would have been
+    summed over.
+    """
+
+    config = _small_config(tmp_path)
+    config = replace(
+        config,
+        train=replace(
+            config.train,
+            interval_train_evaluation=False,
+            interval_dev_evaluation=False,
+        ),
+    )
+    examples = make_synthetic_examples(config, count=24)
+    train_loader = DataLoader(examples[:20], batch_size=2, collate_fn=_collate_pretrain)
+    dev_loader = DataLoader(examples[20:], batch_size=2, collate_fn=_collate_pretrain)
+    interval_path = tmp_path / "interval_metrics.csv"
+    epoch_path = tmp_path / "epoch_metrics.csv"
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(
+        model=model,
+        config=config,
+        seed=94,
+        interval_metrics_path=interval_path,
+        epoch_metrics_path=epoch_path,
+    )
+
+    loop.fit(train_loader, val_dataloader=dev_loader, max_steps=10, epochs=1, fixed_t=1.0)
+
+    # No all-blank rows, and no empty CSV left behind either.
+    assert not interval_path.exists()
+
+    # Everything still lands in the epoch row, for both splits.
+    with epoch_path.open(newline="", encoding="utf-8") as handle:
+        epoch_rows = list(csv.DictReader(handle))
+    assert len(epoch_rows) == 1
+    row = epoch_rows[0]
+    assert float(row["train_loss"]) > 0
+    assert float(row["dev_loss"]) > 0
+    assert int(row["train_rare_class_count_delimiter_t_eq_1"]) > 0
+    assert int(row["dev_rare_class_count_delimiter_t_eq_1"]) > 0
+    assert float(row["train_rare_class_loss_delimiter_t_eq_1"]) > 0
+    assert float(row["dev_rare_class_loss_delimiter_t_eq_1"]) > 0
 
 
 def test_epoch_metrics_migrates_an_existing_narrower_schema(tmp_path: Path) -> None:
@@ -1012,7 +1275,11 @@ def test_resume_continues_epoch_instead_of_replaying_batches(tmp_path: Path) -> 
     assert resumed_loop.global_step == 6
 
 
-def test_cuda_reserved_memory_limit_fails_hard(tmp_path: Path) -> None:
+def test_cuda_reserved_memory_limit_trims_reclaimable_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     config = replace(
         _small_config(tmp_path),
         train=replace(_small_config(tmp_path).train, max_cuda_reserved_gb=7.0),
@@ -1020,7 +1287,38 @@ def test_cuda_reserved_memory_limit_fails_hard(tmp_path: Path) -> None:
     loop = TrainingLoop(model=SC2StrategyDiffusionModel(config, vocab_size=128), config=config, seed=74)
     loop.device = torch.device("cuda")
 
-    with pytest.raises(RuntimeError, match="reserved-memory safety limit exceeded"):
+    empty_cache_calls = 0
+
+    def empty_cache() -> None:
+        nonlocal empty_cache_calls
+        empty_cache_calls += 1
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _device: 2 * 1024**3)
+
+    loop._enforce_cuda_memory_limit(7 * 1024**3)
+
+    assert empty_cache_calls == 1
+    output = capsys.readouterr().out
+    assert "cuda_cache_trim reason=reserved_memory_ceiling" in output
+    assert "reserved_before_gb=7.000" in output
+    assert "reserved_after_gb=2.000" in output
+
+
+def test_cuda_reserved_memory_limit_fails_after_cache_trim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        _small_config(tmp_path),
+        train=replace(_small_config(tmp_path).train, max_cuda_reserved_gb=7.0),
+    )
+    loop = TrainingLoop(model=SC2StrategyDiffusionModel(config, vocab_size=128), config=config, seed=74)
+    loop.device = torch.device("cuda")
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _device: 7 * 1024**3)
+
+    with pytest.raises(RuntimeError, match="reserved-memory safety limit exceeded after cache trim"):
         loop._enforce_cuda_memory_limit(7 * 1024**3)
 
 

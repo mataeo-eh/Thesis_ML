@@ -202,6 +202,27 @@ class TrainConfig:
     # Independent of `val_interval`, which drives the separate step-cadence
     # validation written into the per-step JSONL.
     interval_dev_evaluation: bool
+    # Whether the ten-per-epoch interval reports carry TRAIN values.
+    #
+    # The exact counterpart of `interval_dev_evaluation` above, for the other
+    # half of each interval row. True (default): the train-side breakdown is
+    # reported ten times per epoch, which is what keeps the diagnostics readable
+    # on a corpus large enough to converge in one epoch.
+    #
+    # False: the interval rows' train columns stay blank and train loss is
+    # reported once per epoch in `epoch_metrics.csv`, exactly as dev already is
+    # under `interval_dev_evaluation: false`. Choose this on a run measured in
+    # many epochs, where a ~10%-of-epoch slice spans only a handful of batches:
+    # those rows are then noise around a number the per-epoch row already
+    # reports, and the epoch series is long enough to show the trend on its own.
+    #
+    # Unlike the dev knob this saves no compute -- the train values are already
+    # accumulated by the training pass -- so it is purely about signal.
+    #
+    # When BOTH this and `interval_dev_evaluation` are false, no interval row is
+    # written at all rather than an all-blank one. The accumulation wiring stays
+    # live either way, so re-enabling either side needs no other change.
+    interval_train_evaluation: bool
     checkpoint_interval: int
     checkpoint_dir: str
     # When False (default), each periodic checkpoint overwrites a single

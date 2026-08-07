@@ -93,7 +93,7 @@ All input/output locations are in `config/default.yaml`:
 - `train.epochs`: used when `train.max_steps` is `0`.
 - `train.early_stopping_patience_epochs`: consecutive sub-threshold epochs before stopping (`0` disables).
 - `train.early_stopping_min_relative_improvement`: relative improvement required to reset patience.
-- `train.max_cuda_reserved_gb`: hard CUDA allocator reservation ceiling (`0` disables); the overfit profile uses 7 GiB.
+- `train.max_cuda_reserved_gb`: reclaim-first CUDA allocator reservation ceiling (`0` disables). Reaching it releases unused cached blocks and aborts only if the post-trim reservation remains at or above the limit; the overfit profile uses 7.5 GiB.
 - `model.gradient_checkpointing`: recompute transformer blocks during backward to bound saved-activation memory; enabled for the local overfit profile after measured RTX 3070 spillover.
 
 `s3://bucket/prefix` is supported for data, checkpoints, and logs through the same resolver as local paths. AWS credentials must come from the normal AWS environment/instance profile chain.
@@ -178,6 +178,10 @@ epochs. Step telemetry distinguishes current allocation, lifetime peak allocatio
 reserved allocator memory, inactive split memory, device-wide VRAM use, and the
 device-minus-reserved gap. Epoch CSV rows average the last two measurements across
 optimizer steps so drift outside PyTorch's caching allocator is visible.
+CSV writes retry transient Windows locks. If a viewer or sync process keeps the
+configured epoch/interval CSV locked, training copies all readable history plus
+the current row into a timestamped `*-continued-*.csv`, logs the redirection, and
+uses that continuation for later rows, publishing, and process resumes.
 
 `configs/local_full.yaml` runs the full debut/outcome task for eight epochs with
 870 train replays, 50 dev replays, and all 23 remaining quickstart replays held

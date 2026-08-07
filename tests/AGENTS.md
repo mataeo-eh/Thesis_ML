@@ -9,7 +9,7 @@
 - `test_*.py` own package regression coverage (config, serialization, windowing, dataset, model, training, sampler, eval, pipeline, fine-tune report, launcher checks). `test_diffusion_integration.py` owns bounded real-model checks spanning corruption/loss/backward, self-conditioning, sampling, and checkpoint transfer between training and inference.
 - `fixtures/` owns owner-provided sample extractor parquet (`match_*_game_state.parquet`); it is the ground truth for schema-dependent tests.
 - `overfit.bat`, `smallTrainingTestV2.bat`, and `overfit-fine-tune.BAT` are thin launchers; training behavior stays owned by YAML and the Python entry points.
-- `output/` holds per-run launcher artifacts and console logs (generated; not durable contract material).
+- `output/` holds per-run launcher artifacts and console logs (generated; not durable contract material). If an epoch/interval CSV is persistently write-locked by a viewer or sync process, training emits a full-history timestamped `*-continued-*.csv` beside it and continues there.
 
 ## Local Contracts
 

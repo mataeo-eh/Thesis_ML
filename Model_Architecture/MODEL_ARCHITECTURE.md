@@ -386,7 +386,7 @@ All pretraining class weights are 1.0. The optional entropy-based auxiliary conf
 
 ### Reported loss decompositions
 
-`CanvasCrossEntropyLoss.forward` returns the scalar training loss plus five read-only decompositions of the same per-position cross-entropy. None of them changes the optimized objective; they exist so a run's failure mode can be localized. Every decomposition follows one emptiness convention: a key with zero scored positions is absent from the dict, and the CSV writers render it as a blank cell rather than a sentinel.
+`CanvasCrossEntropyLoss.forward` returns the scalar training loss plus six read-only decompositions of the same per-position cross-entropy. None of them changes the optimized objective; they exist so a run's failure mode can be localized. Every decomposition follows one emptiness convention: a key with zero scored positions is absent from the dict, and the CSV writers render it as a blank cell rather than a sentinel. The rare-class cross decomposition takes one deliberate exception, described below.
 
 | Decomposition | Keys | Partitions by |
 |---|---|---|
@@ -395,23 +395,32 @@ All pretraining class weights are 1.0. The optional entropy-based auxiliary conf
 | `canvas_state` | `ground_truth_preserved`, `noised` | whether the shown canvas token already equalled the target |
 | `perspective` | `p1`, `p2` | which player the example was built from |
 | `future_distance` | `1`, `2_5`, `6_10`, `11_30`, `31_plus` | prediction distance in timesteps, over `enemy-future` positions only |
+| `rare_class_t_bucket_sums` / `_counts` | `{win_loss, end, delimiter} × {the four t-buckets}` = 12 cells | rare target class **crossed with** corruption level |
 
-Two boundaries carry meaning beyond bookkeeping:
+Three boundaries carry meaning beyond bookkeeping:
 
 - **`t_eq_1` is separate from `t_0_75_to_1_0`.** At exactly `t = 1` no ground-truth canvas token survives and the sequence must be generated from the clamped input alone. At `t = 0.99` a few true tokens survive and can anchor the rest. Merging the two would hide performance in the only regime that matches unconditional sampling. With `schedule.t_one_fraction = 0.0` the `t_eq_1` bucket is populated only by an exact 1.0 draw and is usually empty; raising `t_one_fraction` densifies it.
 - **`canvas_state` keys on token inequality (`CorruptionOutput.changed_positions`), not on the Bernoulli corruption flag (`corrupted_positions`).** Under uniform diffusion a corrupted position can be re-drawn as its own target token; the model cannot distinguish that from an untouched position, so scoring it as noised would blur the exact distinction the split measures. `ground_truth_preserved` therefore reads as "does the model recognize an already-valid token and leave it alone", which is a direct probe of how well it has learned the shape of a legal sequence. Under the absorbing ablation only corrupted positions are scored at all, so that key is legitimately absent there.
+
+- **`rare_class_t_bucket_*` is a CROSS, not a sixth marginal, and it reports counts alongside losses.** `per_class` and `t_bucket` are both marginals: the first averages a class over every corruption level, the second averages every class at one corruption level. Neither can show a trend that runs along the corruption axis for one class, because marginalizing is exactly what destroys it — a win/loss token learned at `t < 0.25` and hopeless at `t ≥ 0.75` appears in `per_class` as a single mediocre average. The three classes crossed here are the rare ones: a window carries exactly one win/loss token, at most one `[END]`, and one `[DELIMITER]` per timestep, against a canvas of up to 4096 positions. They therefore receive gradient on nearly every step but through a handful of positions, which is both why their trend is worth isolating and why the counts matter — a cell averaged over 2 positions and one averaged over 200 are not comparable observations. Consequently this decomposition breaks the emptiness convention on purpose: all 12 count cells are always present, **including explicit zeros**, because "no `[END]` token landed in this corruption bucket" is the observation being recorded and an absent key could not be told apart from a bucket that was never evaluated. The loss cells still go blank when their count is zero. It is also the only decomposition returned as an unreduced sum/count pair rather than a finished mean: that lets `TrainingLoop` pool across microbatches by total scored positions (a cell holding 6 positions in one microbatch and 0 in the next must not be weighted equally against it), and keeps all 12 cells free of the host synchronization a boolean-index-and-mean would force into the forward pass.
 
 `TrainingLoop` writes these decompositions to three artifacts under the profile's log directory:
 
 | Artifact | Cadence | Contents |
 |---|---|---|
 | `step_metrics.jsonl` | every optimizer step | last microbatch's loss and all decompositions |
-| `interval_metrics.csv` | `INTERVAL_REPORTS_PER_EPOCH` = 10 times per epoch | train values for every decomposition, each row scoped to that ~10% slice of the epoch, plus dev values when `train.interval_dev_evaluation` is true |
-| `epoch_metrics.csv` | once per epoch | the same loss columns plus timestep percentiles, future-distance buckets, and memory/throughput telemetry |
+| `interval_metrics.csv` | `INTERVAL_REPORTS_PER_EPOCH` = 10 times per epoch | train values for every decomposition when `train.interval_train_evaluation` is true, each row scoped to that ~10% slice of the epoch, plus dev values when `train.interval_dev_evaluation` is true |
+| `epoch_metrics.csv` | once per epoch | the same loss columns plus the rare-class count columns, timestep percentiles, future-distance buckets, and memory/throughput telemetry |
 
 The intra-epoch cadence exists because a corpus large enough that pretraining converges in one epoch would otherwise yield exactly one per-epoch observation and no visible trend. Report boundaries are `ceil(batches_per_epoch × k / 10)` for `k = 1..10`, so the tenth boundary always coincides with the epoch end and the two CSVs describe the same point in training.
 
-`train.interval_dev_evaluation` controls the dev half of those rows, and defaults to true. When true, each interval row's dev values come from a full pass over the dev loader with EMA weights, identical to epoch-end validation. When false the train-side breakdown is still reported ten times per epoch and only the dev columns are left blank, with dev evaluated once per epoch into `epoch_metrics.csv`. The knob exists because dev cost does not scale with training cost: on the overfit profile a dev pass is ~18 s against ~105 s of training per epoch, so ten of them would more than double a 30-epoch run for resolution that 30 per-epoch dev points already supply.
+Each half of those rows is independently gated, and both knobs default to true.
+
+`train.interval_dev_evaluation` controls the dev half. When true, each interval row's dev values come from a full pass over the dev loader with EMA weights, identical to epoch-end validation. When false the dev columns are left blank and dev is evaluated once per epoch into `epoch_metrics.csv`. The knob exists because dev cost does not scale with training cost: on the overfit profile a dev pass is ~18 s against ~105 s of training per epoch, so ten of them would roughly double the run for resolution the per-epoch dev points already supply.
+
+`train.interval_train_evaluation` controls the train half. Unlike the dev knob it saves no compute — the values are already accumulated by the training pass — so it is purely about signal. When false the train columns are left blank and train loss is reported once per epoch, the same treatment dev gets. It exists for the opposite regime from the intra-epoch cadence itself: on a profile with few batches per epoch, a ~10% slice spans only a handful of batches, and with a fresh fog draw and a fresh corruption level `t` per example those rows measure mostly which `t` values happened to be drawn. The overfit profile runs 34 batches over 150 epochs, so its slices are 3–4 batches wide while its per-epoch series is 150 points long; it therefore sets both knobs false.
+
+Setting both false writes no interval row at all rather than an all-blank one, and `interval_metrics.csv` is then never created. The accumulation wiring stays live either way, so re-enabling either side requires no other change.
 
 ## Exact trainable parameter inventory
 

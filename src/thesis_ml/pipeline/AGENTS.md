@@ -17,7 +17,7 @@
 - Training is resumable: roll `last.pt` to `storage.checkpoint_uri` every `checkpoint_interval` and pull it back on startup before any local fallback, so a replacement spot instance resumes with at most one interval lost.
 - Acquisition is a separate stage runnable without a GPU; it must not be coupled into the training instance. `pipeline.auto_acquire` may invoke it when processed data is absent.
 - CUDA-required profiles must fail before preprocessing when CUDA is unavailable; never infer GPU/VRAM behavior from a CPU run.
-- The overfit profile fails when CUDA reserved memory reaches `max_cuda_reserved_gb` and logs timing, throughput, allocated peak, and reserved memory every step.
+- The overfit profile uses `max_cuda_reserved_gb` as a reclaim-first safety ceiling: crossing it trims unused CUDA allocator cache, and the run fails only when reservation remains at or above the ceiling afterward. Timing, throughput, allocated peak, and reserved memory are logged every step.
 - Secrets (Kaggle, AWS) come from environment/config only, never hardcoded or committed.
 - Model scale, token budgets, paths, subset selection, epochs, and checkpoint intervals stay config-owned.
 - Debut-mode full training evaluates the EMA model with the fine-tune report schema against the true test split; uncapped evaluation remains lazy instead of materializing every window in host RAM.

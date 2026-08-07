@@ -23,11 +23,17 @@ train:
   epochs: 150
   # Pinned explicitly so this fine-tune keeps its own schedule regardless of
   # what the pre-training profile it extends chooses. local_overfit.yaml sets a
-  # short warmup and a per-epoch checkpoint cadence sized for its 1020-step run;
+  # short warmup and a per-epoch checkpoint cadence sized for its own run;
   # neither is appropriate for a 150-epoch fine-tune, and inheriting them would
   # change this pathway as a side effect of tuning the other one.
   warmup: 2000
   checkpoint_interval: 100
+  # Pinned for the same reason. local_overfit.yaml turns the train side of the
+  # interval reports off for its own diagnostic reasons; this fine-tune still
+  # wants its ten train-side rows per epoch, so it keeps interval_metrics.csv.
+  # (interval_dev_evaluation stays inherited-false: the dev-pass cost argument
+  # applies here unchanged.)
+  interval_train_evaluation: true
   init_from_checkpoint: checkpoints/local-overfitV2/last.pt
 
 pipeline:

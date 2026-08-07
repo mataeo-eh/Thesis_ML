@@ -123,6 +123,40 @@ PERSPECTIVE_NAMES = ("p1", "p2")
 PERSPECTIVE_P1 = 1
 PERSPECTIVE_P2 = 2
 
+# ---------------------------------------------------------------------------
+# Rare-class x t-bucket cross decomposition
+# ---------------------------------------------------------------------------
+# The three classes below are RARE in the canvas: a window carries exactly one
+# win/loss token, at most one [END], and one [DELIMITER] per timestep, against a
+# 4096-position canvas dominated by enemy reconstruction tokens. They therefore
+# receive gradient on nearly every step, but only through a handful of positions
+# out of thousands, so their signal is easy to lose in the aggregate loss.
+#
+# WHY cross them with the t-buckets rather than reading `per_class` and
+# `t_bucket` side by side: those two are MARGINALS. `per_class["[END]"]` averages
+# [END] over every corruption level at once, and `t_bucket["t_0_75_to_1_0"]`
+# averages every class at that corruption level. Neither can answer the actual
+# question -- does the win/loss token survive HIGH corruption, or only get
+# memorized at low corruption? -- because a trend that runs along the corruption
+# axis is exactly what marginalizing over it destroys. This decomposition keeps
+# both axes, so a rare class that is learned at t < 0.25 and hopeless at
+# t >= 0.75 is visible as such instead of averaging into one mediocre number.
+#
+# Keys are "<class>_<t-bucket>", e.g. "win_loss_t_eq_1", giving 3 x 4 = 12 cells.
+# Class spellings match `_metric_class_name` in train/loop.py, so these names are
+# identical in pre-training ("[END]") and debut ("end") taxonomies.
+RARE_CLASS_IDS: dict[str, int] = {
+    "win_loss": CLASS_WINLOSS,
+    "end": CLASS_END,
+    "delimiter": CLASS_DELIMITER,
+}
+
+RARE_CLASS_T_BUCKET_NAMES: tuple[str, ...] = tuple(
+    f"{class_name}_{bucket_name}"
+    for class_name in RARE_CLASS_IDS
+    for bucket_name in T_BUCKET_NAMES
+)
+
 
 @dataclass(frozen=True)
 class LossOutput:
@@ -139,6 +173,21 @@ class LossOutput:
     t_bucket: dict[str, torch.Tensor]
     perspective: dict[str, torch.Tensor]
     canvas_state: dict[str, torch.Tensor]
+    # Rare-class x t-bucket cross decomposition (see RARE_CLASS_T_BUCKET_NAMES).
+    # These two dicts BREAK the emptiness convention above on purpose: they carry
+    # all 12 keys unconditionally, because "this bucket scored zero [END] tokens"
+    # is itself the observation being recorded -- an absent key could not be
+    # distinguished from a bucket that was never evaluated.
+    #
+    # They are also the only decomposition reported as SUM + COUNT rather than as
+    # a finished mean. Two reasons: (1) the consumer needs the raw count anyway,
+    # and (2) summing lets the training loop pool across microbatches by total
+    # scored positions instead of averaging per-microbatch means, which is the
+    # only correct pooling when a bucket holds 6 positions in one microbatch and
+    # 0 in the next. Both are on-device tensors, left unsynchronized so the
+    # training loop's lagged finalize (not the forward pass) pays the transfer.
+    rare_class_t_bucket_sums: dict[str, torch.Tensor]
+    rare_class_t_bucket_counts: dict[str, torch.Tensor]
 
 
 class CanvasCrossEntropyLoss(nn.Module):
@@ -232,6 +281,12 @@ class CanvasCrossEntropyLoss(nn.Module):
         # that bucket across the batch. Empty buckets are omitted (per_class
         # convention). See T_BUCKET_NAMES for the exact, exhaustive boundaries.
         t_bucket: dict[str, torch.Tensor] = {}
+        # Rare-class x t-bucket cross decomposition, computed in the same block
+        # because it reuses the very same per-example bucket row masks. See
+        # RARE_CLASS_T_BUCKET_NAMES for why the marginals above cannot answer the
+        # question this one answers.
+        rare_class_t_bucket_sums: dict[str, torch.Tensor] = {}
+        rare_class_t_bucket_counts: dict[str, torch.Tensor] = {}
         if sampled_t is not None:
             t_row = sampled_t.to(ce.device)
             bucket_row_masks = {
@@ -244,6 +299,23 @@ class CanvasCrossEntropyLoss(nn.Module):
                 bucket_mask = active & bucket_row_masks[name].unsqueeze(1)
                 if bucket_mask.any():
                     t_bucket[name] = ce[bucket_mask].mean()
+
+            for class_name, class_id in RARE_CLASS_IDS.items():
+                class_mask = active & (class_labels == class_id)
+                for bucket_name in T_BUCKET_NAMES:
+                    cell_mask = (
+                        class_mask & bucket_row_masks[bucket_name].unsqueeze(1)
+                    ).to(ce.dtype)
+                    key = f"{class_name}_{bucket_name}"
+                    # Multiply-and-sum rather than boolean-index-and-mean: this
+                    # keeps all 12 cells sync-free (a boolean index has to read
+                    # the mask's popcount back to the host to size its output,
+                    # which would stall the forward pass 12 extra times per
+                    # microbatch), and it yields the sum/count pair the caller
+                    # pools with. An empty cell is a clean 0.0 sum over a 0
+                    # count, never a NaN.
+                    rare_class_t_bucket_sums[key] = (ce * cell_mask).sum()
+                    rare_class_t_bucket_counts[key] = cell_mask.sum()
 
         # Perspective breakdown (BOTH pipelines). Same shape of logic as the
         # t-bucket split, but partitioning examples by which player perspective
@@ -285,4 +357,6 @@ class CanvasCrossEntropyLoss(nn.Module):
             t_bucket=t_bucket,
             perspective=perspective,
             canvas_state=canvas_state,
+            rare_class_t_bucket_sums=rare_class_t_bucket_sums,
+            rare_class_t_bucket_counts=rare_class_t_bucket_counts,
         )

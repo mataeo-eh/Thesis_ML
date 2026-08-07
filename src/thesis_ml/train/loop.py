@@ -23,6 +23,7 @@ from thesis_ml.model.loss import (
     CANVAS_STATE_NAMES,
     FUTURE_DISTANCE_BUCKETS,
     PERSPECTIVE_NAMES,
+    RARE_CLASS_T_BUCKET_NAMES,
     T_BUCKET_NAMES,
     CanvasCrossEntropyLoss,
     LossOutput,
@@ -55,6 +56,13 @@ class ValidationLog:
     t_bucket: dict[str, float]
     perspective: dict[str, float]
     canvas_state: dict[str, float]
+    # Rare-class x t-bucket cross decomposition. `rare_class_t_bucket` holds the
+    # count-weighted mean loss for each populated cell and omits cells that
+    # scored nothing; `rare_class_t_bucket_counts` holds ALL 12 cells including
+    # the zeros, because "no [END] token landed in this corruption bucket" is
+    # itself a reportable observation. See loss.RARE_CLASS_T_BUCKET_NAMES.
+    rare_class_t_bucket: dict[str, float]
+    rare_class_t_bucket_counts: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -72,6 +80,10 @@ class TrainStepLog:
     t_bucket_loss: dict[str, float]
     perspective_loss: dict[str, float]
     canvas_state_loss: dict[str, float]
+    # Rare-class x t-bucket cross decomposition for this step's last microbatch:
+    # mean loss per populated cell, plus the scored-position count of every cell.
+    rare_class_t_bucket_loss: dict[str, float]
+    rare_class_t_bucket_count: dict[str, int]
     lr: float
     t_mean: float
     noise_fraction: float
@@ -105,6 +117,14 @@ class EpochMetrics:
     dev_perspective_loss: dict[str, float]
     train_canvas_state_loss: dict[str, float]
     dev_canvas_state_loss: dict[str, float]
+    # Rare-class x t-bucket cross decomposition, pooled over the whole epoch by
+    # total scored positions (not by averaging per-microbatch means -- see
+    # LossOutput.rare_class_t_bucket_sums for why). The `_counts` dicts carry all
+    # 12 cells including zeros; the loss dicts omit cells that scored nothing.
+    train_rare_class_t_bucket_loss: dict[str, float]
+    dev_rare_class_t_bucket_loss: dict[str, float]
+    train_rare_class_t_bucket_counts: dict[str, int]
+    dev_rare_class_t_bucket_counts: dict[str, int]
     total_tokens_ingested: int
     total_unique_tokens_seen: int
     tokens_per_second: float
@@ -133,7 +153,13 @@ class IntervalMetrics:
 
     The ``dev_*`` fields come from a full pass over the dev loader taken at this
     interval boundary with EMA weights, and are empty dicts (``dev_loss`` None)
-    when the run has no dev loader.
+    when the run has no dev loader or ``train.interval_dev_evaluation`` is false.
+
+    The ``train_*`` fields are likewise empty (``train_loss`` None) when
+    ``train.interval_train_evaluation`` is false, in which case train loss is
+    reported once per epoch in the epoch CSV instead. Both sides being disabled
+    suppresses the row entirely rather than emitting an all-blank one; see
+    TrainingLoop.fit.
     """
 
     epoch: int
@@ -145,7 +171,7 @@ class IntervalMetrics:
     # Batch index within the epoch that triggered this report.
     epoch_batch_index: int
     batches_in_epoch: int
-    train_loss: float
+    train_loss: float | None
     dev_loss: float | None
     train_per_class: dict[str, float]
     dev_per_class: dict[str, float]
@@ -155,6 +181,12 @@ class IntervalMetrics:
     dev_canvas_state_loss: dict[str, float]
     train_perspective_loss: dict[str, float]
     dev_perspective_loss: dict[str, float]
+    # Rare-class x t-bucket cross decomposition for this slice, pooled by scored
+    # positions exactly as the epoch row pools it over the whole epoch.
+    train_rare_class_t_bucket_loss: dict[str, float]
+    dev_rare_class_t_bucket_loss: dict[str, float]
+    train_rare_class_t_bucket_counts: dict[str, int]
+    dev_rare_class_t_bucket_counts: dict[str, int]
     lr: float
     wall_clock_elapsed_seconds: float
 
@@ -220,7 +252,11 @@ class TrainingLoop:
         self.metrics_path = Path(metrics_path) if metrics_path is not None else None
         if self.metrics_path is not None:
             self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        self.epoch_metrics_path = Path(epoch_metrics_path) if epoch_metrics_path is not None else None
+        self.epoch_metrics_path = (
+            _latest_metrics_csv_path(Path(epoch_metrics_path))
+            if epoch_metrics_path is not None
+            else None
+        )
         if self.epoch_metrics_path is not None:
             self.epoch_metrics_path.parent.mkdir(parents=True, exist_ok=True)
         # Intra-epoch diagnostic CSV: INTERVAL_REPORTS_PER_EPOCH rows per epoch
@@ -228,7 +264,9 @@ class TrainingLoop:
         # that only trains for a single epoch. Same append-and-migrate handling
         # as the epoch CSV.
         self.interval_metrics_path = (
-            Path(interval_metrics_path) if interval_metrics_path is not None else None
+            _latest_metrics_csv_path(Path(interval_metrics_path))
+            if interval_metrics_path is not None
+            else None
         )
         if self.interval_metrics_path is not None:
             self.interval_metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -407,6 +445,13 @@ class TrainingLoop:
             epoch_t_bucket_losses: dict[str, list[float]] = {}
             epoch_perspective_losses: dict[str, list[float]] = {}
             epoch_canvas_state_losses: dict[str, list[float]] = {}
+            # The rare-class x t-bucket cells accumulate as SUM + COUNT rather
+            # than as a list of per-microbatch means. A cell can hold 6 positions
+            # in one microbatch and 0 in the next, so a simple average of
+            # per-microbatch means would weight those equally and misreport the
+            # epoch; pooling by total scored positions is the correct reduction.
+            epoch_rare_class_sums: dict[str, float] = {}
+            epoch_rare_class_counts: dict[str, int] = {}
             # ---- Intra-epoch diagnostic reporting ---------------------------
             # `interval_*` accumulators mirror the epoch ones but are CLEARED
             # after every report, so each row covers only the slice of the epoch
@@ -423,6 +468,8 @@ class TrainingLoop:
             interval_t_bucket_losses: dict[str, list[float]] = {}
             interval_perspective_losses: dict[str, list[float]] = {}
             interval_canvas_state_losses: dict[str, list[float]] = {}
+            interval_rare_class_sums: dict[str, float] = {}
+            interval_rare_class_counts: dict[str, int] = {}
             epoch_cuda_device_memory_used = 0
             epoch_cuda_device_memory_gap = 0
             epoch_cuda_memory_samples = 0
@@ -532,6 +579,26 @@ class TrainingLoop:
                         state_value = float(value.cpu())
                         epoch_canvas_state_losses.setdefault(name, []).append(state_value)
                         interval_canvas_state_losses.setdefault(name, []).append(state_value)
+                    # Rare-class cells: accumulate the on-device sum/count pair
+                    # into running host totals. All 12 keys are always present,
+                    # so a cell that scored nothing accumulates 0.0 over 0 and
+                    # is reported as a real zero count rather than going missing.
+                    for name, value in mb["rare_class_sums"].items():
+                        cell_sum = float(value.cpu())
+                        epoch_rare_class_sums[name] = (
+                            epoch_rare_class_sums.get(name, 0.0) + cell_sum
+                        )
+                        interval_rare_class_sums[name] = (
+                            interval_rare_class_sums.get(name, 0.0) + cell_sum
+                        )
+                    for name, value in mb["rare_class_counts"].items():
+                        count = int(value.cpu())
+                        epoch_rare_class_counts[name] = (
+                            epoch_rare_class_counts.get(name, 0) + count
+                        )
+                        interval_rare_class_counts[name] = (
+                            interval_rare_class_counts.get(name, 0) + count
+                        )
 
                 tokens_per_second = record["step_tokens"] / step_wall_seconds
                 print(
@@ -572,6 +639,17 @@ class TrainingLoop:
                     canvas_state_loss={
                         name: float(v.cpu()) for name, v in last["canvas_state"].items()
                     },
+                    # Per-step rare-class cells are reduced to a mean here so the
+                    # JSONL matches the other decompositions' shape; the count
+                    # dict rides alongside because a mean over 1 position and a
+                    # mean over 40 are not the same observation.
+                    rare_class_t_bucket_loss=_finalize_rare_class_t_bucket(
+                        {name: float(v.cpu()) for name, v in last["rare_class_sums"].items()},
+                        {name: int(v.cpu()) for name, v in last["rare_class_counts"].items()},
+                    ),
+                    rare_class_t_bucket_count={
+                        name: int(v.cpu()) for name, v in last["rare_class_counts"].items()
+                    },
                     lr=record["lr"],
                     t_mean=float(last["t_mean"].cpu()),
                     noise_fraction=float(last["noise_fraction"].cpu()),
@@ -605,75 +683,133 @@ class TrainingLoop:
                     crossed += 1
                 if crossed:
                     interval_cursor += crossed
-                    # The dev pass runs with EMA weights over the whole dev
-                    # loader, exactly as epoch-end validation does, so interval
-                    # and epoch dev numbers are directly comparable. It is
-                    # config-gated (train.interval_dev_evaluation) because on a
-                    # small run a full dev pass can cost more than the slice of
-                    # training it follows; when disabled the dev columns stay
-                    # blank here and dev is reported once per epoch in the epoch
-                    # CSV instead.
+                    # Each SIDE of the interval row is independently config-gated.
+                    #
+                    # Dev (train.interval_dev_evaluation): the pass runs with EMA
+                    # weights over the whole dev loader, exactly as epoch-end
+                    # validation does, so interval and epoch dev numbers are
+                    # directly comparable -- but on a small run it can cost more
+                    # than the slice of training it follows.
+                    #
+                    # Train (train.interval_train_evaluation): costs nothing
+                    # extra (the values are already accumulated), but on a run
+                    # measured in many epochs a ~10%-of-epoch slice is only a
+                    # handful of batches, so the rows are noise around what the
+                    # epoch row already reports.
+                    #
+                    # Either side disabled leaves its columns blank and its
+                    # numbers reported once per epoch in the epoch CSV instead.
+                    # BOTH disabled means there is nothing left to report, so no
+                    # row is written at all rather than an all-blank one -- the
+                    # accumulators above still run untouched, so re-enabling
+                    # either side needs no other change.
+                    report_train = self.config.train.interval_train_evaluation
+                    report_dev = (
+                        val_dataloader is not None
+                        and self.config.train.interval_dev_evaluation
+                    )
                     interval_validation = (
                         self.validate(val_dataloader, fixed_t=fixed_t)
-                        if val_dataloader is not None
-                        and self.config.train.interval_dev_evaluation
+                        if report_dev
                         else None
                     )
-                    self._write_interval_metrics(
-                        IntervalMetrics(
-                            epoch=epoch_index + 1,
-                            interval=interval_cursor,
-                            epoch_fraction=interval_cursor / len(boundaries),
-                            global_step=record["step"],
-                            epoch_batch_index=record["epoch_batch_index"],
-                            batches_in_epoch=batches_per_epoch,
-                            train_loss=sum(interval_losses) / len(interval_losses),
-                            dev_loss=(
-                                interval_validation.loss
-                                if interval_validation is not None
-                                else None
-                            ),
-                            train_per_class=_mean_of_lists(interval_class_losses),
-                            dev_per_class=(
-                                interval_validation.per_class
-                                if interval_validation is not None
-                                else {}
-                            ),
-                            train_t_bucket_loss=_mean_of_lists(interval_t_bucket_losses),
-                            dev_t_bucket_loss=(
-                                interval_validation.t_bucket
-                                if interval_validation is not None
-                                else {}
-                            ),
-                            train_canvas_state_loss=_mean_of_lists(
-                                interval_canvas_state_losses
-                            ),
-                            dev_canvas_state_loss=(
-                                interval_validation.canvas_state
-                                if interval_validation is not None
-                                else {}
-                            ),
-                            train_perspective_loss=_mean_of_lists(
-                                interval_perspective_losses
-                            ),
-                            dev_perspective_loss=(
-                                interval_validation.perspective
-                                if interval_validation is not None
-                                else {}
-                            ),
-                            lr=record["lr"],
-                            wall_clock_elapsed_seconds=(
-                                self.elapsed_wall_seconds
-                                + (time.perf_counter() - fit_started)
-                            ),
+                    if report_train or report_dev:
+                        self._write_interval_metrics(
+                            IntervalMetrics(
+                                epoch=epoch_index + 1,
+                                interval=interval_cursor,
+                                epoch_fraction=interval_cursor / len(boundaries),
+                                global_step=record["step"],
+                                epoch_batch_index=record["epoch_batch_index"],
+                                batches_in_epoch=batches_per_epoch,
+                                train_loss=(
+                                    sum(interval_losses) / len(interval_losses)
+                                    if report_train and interval_losses
+                                    else None
+                                ),
+                                dev_loss=(
+                                    interval_validation.loss
+                                    if interval_validation is not None
+                                    else None
+                                ),
+                                train_per_class=(
+                                    _mean_of_lists(interval_class_losses)
+                                    if report_train
+                                    else {}
+                                ),
+                                dev_per_class=(
+                                    interval_validation.per_class
+                                    if interval_validation is not None
+                                    else {}
+                                ),
+                                train_t_bucket_loss=(
+                                    _mean_of_lists(interval_t_bucket_losses)
+                                    if report_train
+                                    else {}
+                                ),
+                                dev_t_bucket_loss=(
+                                    interval_validation.t_bucket
+                                    if interval_validation is not None
+                                    else {}
+                                ),
+                                train_canvas_state_loss=(
+                                    _mean_of_lists(interval_canvas_state_losses)
+                                    if report_train
+                                    else {}
+                                ),
+                                dev_canvas_state_loss=(
+                                    interval_validation.canvas_state
+                                    if interval_validation is not None
+                                    else {}
+                                ),
+                                train_perspective_loss=(
+                                    _mean_of_lists(interval_perspective_losses)
+                                    if report_train
+                                    else {}
+                                ),
+                                dev_perspective_loss=(
+                                    interval_validation.perspective
+                                    if interval_validation is not None
+                                    else {}
+                                ),
+                                train_rare_class_t_bucket_loss=(
+                                    _finalize_rare_class_t_bucket(
+                                        interval_rare_class_sums,
+                                        interval_rare_class_counts,
+                                    )
+                                    if report_train
+                                    else {}
+                                ),
+                                dev_rare_class_t_bucket_loss=(
+                                    interval_validation.rare_class_t_bucket
+                                    if interval_validation is not None
+                                    else {}
+                                ),
+                                train_rare_class_t_bucket_counts=(
+                                    dict(interval_rare_class_counts) if report_train else {}
+                                ),
+                                dev_rare_class_t_bucket_counts=(
+                                    interval_validation.rare_class_t_bucket_counts
+                                    if interval_validation is not None
+                                    else {}
+                                ),
+                                lr=record["lr"],
+                                wall_clock_elapsed_seconds=(
+                                    self.elapsed_wall_seconds
+                                    + (time.perf_counter() - fit_started)
+                                ),
+                            )
                         )
-                    )
-                    # Scope the NEXT row to the next slice only.
+                    # Scope the NEXT row to the next slice only. Done regardless
+                    # of whether a row was written, so a re-enabled train side
+                    # never inherits a stale backlog of earlier slices.
                     interval_losses.clear()
                     interval_class_losses.clear()
                     interval_t_bucket_losses.clear()
                     interval_perspective_losses.clear()
                     interval_canvas_state_losses.clear()
+                    interval_rare_class_sums.clear()
+                    interval_rare_class_counts.clear()
 
             while self.global_step < target_steps:
                 iter_top = time.perf_counter()
@@ -753,6 +889,19 @@ class TrainingLoop:
                             "canvas_state": {
                                 name: value.detach()
                                 for name, value in batch_loss.loss_output.canvas_state.items()
+                            },
+                            # Rare-class cells travel as the raw sum/count pair
+                            # so the lagged finalize can pool them by scored
+                            # positions across microbatches.
+                            "rare_class_sums": {
+                                name: value.detach()
+                                for name, value in
+                                batch_loss.loss_output.rare_class_t_bucket_sums.items()
+                            },
+                            "rare_class_counts": {
+                                name: value.detach()
+                                for name, value in
+                                batch_loss.loss_output.rare_class_t_bucket_counts.items()
                             },
                             "t_mean": batch_loss.corruption.t.detach().mean(),
                             "noise_fraction": (
@@ -877,6 +1026,21 @@ class TrainingLoop:
                 train_canvas_state_loss=_mean_of_lists(epoch_canvas_state_losses),
                 dev_canvas_state_loss=(
                     epoch_validation.canvas_state if epoch_validation is not None else {}
+                ),
+                train_rare_class_t_bucket_loss=_finalize_rare_class_t_bucket(
+                    epoch_rare_class_sums,
+                    epoch_rare_class_counts,
+                ),
+                dev_rare_class_t_bucket_loss=(
+                    epoch_validation.rare_class_t_bucket
+                    if epoch_validation is not None
+                    else {}
+                ),
+                train_rare_class_t_bucket_counts=dict(epoch_rare_class_counts),
+                dev_rare_class_t_bucket_counts=(
+                    epoch_validation.rare_class_t_bucket_counts
+                    if epoch_validation is not None
+                    else {}
                 ),
                 total_tokens_ingested=self.total_tokens_ingested,
                 total_unique_tokens_seen=len(self.unique_token_ids_seen),
@@ -1157,6 +1321,8 @@ class TrainingLoop:
         t_bucket_loss: dict[str, float],
         perspective_loss: dict[str, float],
         canvas_state_loss: dict[str, float],
+        rare_class_t_bucket_loss: dict[str, float],
+        rare_class_t_bucket_count: dict[str, int],
         lr: float,
         t_mean: float,
         noise_fraction: float,
@@ -1184,6 +1350,8 @@ class TrainingLoop:
             t_bucket_loss=dict(sorted(t_bucket_loss.items())),
             perspective_loss=dict(sorted(perspective_loss.items())),
             canvas_state_loss=dict(sorted(canvas_state_loss.items())),
+            rare_class_t_bucket_loss=dict(sorted(rare_class_t_bucket_loss.items())),
+            rare_class_t_bucket_count=dict(sorted(rare_class_t_bucket_count.items())),
             lr=lr,
             t_mean=t_mean,
             noise_fraction=noise_fraction,
@@ -1203,10 +1371,31 @@ class TrainingLoop:
         if self.device.type != "cuda" or limit_gb <= 0:
             return
         limit_bytes = int(limit_gb * 1024**3)
-        if reserved_bytes >= limit_bytes:
+        if reserved_bytes < limit_bytes:
+            return
+
+        # `memory_reserved` includes completely unused blocks held by PyTorch's
+        # caching allocator. Dynamic padding can visit several large shapes in
+        # one shuffled epoch and cache a segment for each even though the live
+        # allocation returns to a small, stable baseline after every step. Treat
+        # the configured ceiling as a cache-trim trigger first; otherwise a
+        # healthy run can be killed merely because reclaimable blocks happen to
+        # sum above the limit. `empty_cache` preserves live tensors and makes the
+        # post-trim reservation the meaningful safety signal.
+        torch.cuda.empty_cache()
+        reserved_after_trim = int(torch.cuda.memory_reserved(self.device))
+        print(
+            "cuda_cache_trim reason=reserved_memory_ceiling "
+            f"reserved_before_gb={reserved_bytes / 1024**3:.3f} "
+            f"reserved_after_gb={reserved_after_trim / 1024**3:.3f} "
+            f"limit_gb={limit_gb:.3f}",
+            flush=True,
+        )
+        if reserved_after_trim >= limit_bytes:
             raise RuntimeError(
-                "CUDA reserved-memory safety limit exceeded: "
-                f"reserved={reserved_bytes / 1024**3:.3f} GiB, "
+                "CUDA reserved-memory safety limit exceeded after cache trim: "
+                f"reserved_before={reserved_bytes / 1024**3:.3f} GiB, "
+                f"reserved_after={reserved_after_trim / 1024**3:.3f} GiB, "
                 f"limit={limit_gb:.3f} GiB"
             )
 
@@ -1287,6 +1476,14 @@ class TrainingLoop:
             *(f"dev_perspective_loss_{name}" for name in PERSPECTIVE_NAMES),
             *(f"train_canvas_state_loss_{name}" for name in CANVAS_STATE_NAMES),
             *(f"dev_canvas_state_loss_{name}" for name in CANVAS_STATE_NAMES),
+            # Rare-class x t-bucket cross decomposition: 12 loss cells and their
+            # 12 scored-position counts, per split. The count columns are not
+            # redundant -- a loss cell averaged over 2 positions and one averaged
+            # over 200 look identical without them, and a 0 there is the finding.
+            *(f"train_rare_class_loss_{name}" for name in RARE_CLASS_T_BUCKET_NAMES),
+            *(f"dev_rare_class_loss_{name}" for name in RARE_CLASS_T_BUCKET_NAMES),
+            *(f"train_rare_class_count_{name}" for name in RARE_CLASS_T_BUCKET_NAMES),
+            *(f"dev_rare_class_count_{name}" for name in RARE_CLASS_T_BUCKET_NAMES),
         ]
         fieldnames += [
                 "average_input_timesteps",
@@ -1340,6 +1537,22 @@ class TrainingLoop:
         for name in CANVAS_STATE_NAMES:
             row[f"train_canvas_state_loss_{name}"] = metrics.train_canvas_state_loss.get(name, "")
             row[f"dev_canvas_state_loss_{name}"] = metrics.dev_canvas_state_loss.get(name, "")
+        # Loss cells follow the blank-when-empty convention. Count cells do NOT:
+        # a populated split reports every count including 0 (that zero is the
+        # observation), and only a split that never ran at all leaves them blank.
+        for name in RARE_CLASS_T_BUCKET_NAMES:
+            row[f"train_rare_class_loss_{name}"] = (
+                metrics.train_rare_class_t_bucket_loss.get(name, "")
+            )
+            row[f"dev_rare_class_loss_{name}"] = (
+                metrics.dev_rare_class_t_bucket_loss.get(name, "")
+            )
+            row[f"train_rare_class_count_{name}"] = (
+                metrics.train_rare_class_t_bucket_counts.get(name, "")
+            )
+            row[f"dev_rare_class_count_{name}"] = (
+                metrics.dev_rare_class_t_bucket_counts.get(name, "")
+            )
         row["average_input_timesteps"] = metrics.average_input_timesteps
         row["average_enemy_future_timesteps"] = metrics.average_enemy_future_timesteps
         for percentile in ("p50", "p90", "p95"):
@@ -1354,7 +1567,7 @@ class TrainingLoop:
             row[f"dev_enemy_future_loss_distance_{name}"] = (
                 metrics.dev_future_distance.get(name, "")
             )
-        _append_csv_row(self.epoch_metrics_path, fieldnames, row)
+        self.epoch_metrics_path = _append_csv_row(self.epoch_metrics_path, fieldnames, row)
 
     def _write_interval_metrics(self, metrics: IntervalMetrics) -> None:
         """Append one intra-epoch diagnostic row to the interval CSV.
@@ -1398,6 +1611,10 @@ class TrainingLoop:
             *(f"dev_canvas_state_loss_{name}" for name in CANVAS_STATE_NAMES),
             *(f"train_perspective_loss_{name}" for name in PERSPECTIVE_NAMES),
             *(f"dev_perspective_loss_{name}" for name in PERSPECTIVE_NAMES),
+            *(f"train_rare_class_loss_{name}" for name in RARE_CLASS_T_BUCKET_NAMES),
+            *(f"dev_rare_class_loss_{name}" for name in RARE_CLASS_T_BUCKET_NAMES),
+            *(f"train_rare_class_count_{name}" for name in RARE_CLASS_T_BUCKET_NAMES),
+            *(f"dev_rare_class_count_{name}" for name in RARE_CLASS_T_BUCKET_NAMES),
             "lr",
             "wall_clock_elapsed_seconds",
         ]
@@ -1408,7 +1625,7 @@ class TrainingLoop:
             "global_step": metrics.global_step,
             "epoch_batch_index": metrics.epoch_batch_index,
             "batches_in_epoch": metrics.batches_in_epoch,
-            "train_loss": metrics.train_loss,
+            "train_loss": "" if metrics.train_loss is None else metrics.train_loss,
             "dev_loss": "" if metrics.dev_loss is None else metrics.dev_loss,
             "lr": metrics.lr,
             "wall_clock_elapsed_seconds": metrics.wall_clock_elapsed_seconds,
@@ -1426,11 +1643,34 @@ class TrainingLoop:
         for name in PERSPECTIVE_NAMES:
             row[f"train_perspective_loss_{name}"] = metrics.train_perspective_loss.get(name, "")
             row[f"dev_perspective_loss_{name}"] = metrics.dev_perspective_loss.get(name, "")
-        _append_csv_row(self.interval_metrics_path, fieldnames, row)
+        for name in RARE_CLASS_T_BUCKET_NAMES:
+            row[f"train_rare_class_loss_{name}"] = (
+                metrics.train_rare_class_t_bucket_loss.get(name, "")
+            )
+            row[f"dev_rare_class_loss_{name}"] = (
+                metrics.dev_rare_class_t_bucket_loss.get(name, "")
+            )
+            row[f"train_rare_class_count_{name}"] = (
+                metrics.train_rare_class_t_bucket_counts.get(name, "")
+            )
+            row[f"dev_rare_class_count_{name}"] = (
+                metrics.dev_rare_class_t_bucket_counts.get(name, "")
+            )
+        self.interval_metrics_path = _append_csv_row(
+            self.interval_metrics_path,
+            fieldnames,
+            row,
+        )
         print(
             f"interval_report epoch={metrics.epoch} "
             f"interval={metrics.interval}/{INTERVAL_REPORTS_PER_EPOCH} "
-            f"step={metrics.global_step} train_loss={metrics.train_loss:.6f} "
+            f"step={metrics.global_step} "
+            + (
+                "train_loss=none"
+                if metrics.train_loss is None
+                else f"train_loss={metrics.train_loss:.6f}"
+            )
+            + " "
             + (
                 "dev_loss=none"
                 if metrics.dev_loss is None
@@ -1558,6 +1798,12 @@ class TrainingLoop:
         perspective_counts: dict[str, int] = {}
         canvas_state_sums: dict[str, float] = {}
         canvas_state_counts: dict[str, int] = {}
+        # Rare-class cells pool by scored positions rather than by batch, so
+        # these are running totals of the loss sums and the position counts --
+        # not sums of per-batch means like the dicts above. See
+        # LossOutput.rare_class_t_bucket_sums.
+        rare_class_sums: dict[str, float] = {}
+        rare_class_counts: dict[str, int] = {}
         for batch in dataloader:
             batch_loss = self.compute_batch_loss(batch, fixed_t=fixed_t, model=self.ema_model)
             loss_sum += float(batch_loss.loss.detach().cpu())
@@ -1581,6 +1827,14 @@ class TrainingLoop:
                     canvas_state_sums.get(name, 0.0) + float(value.detach().cpu())
                 )
                 canvas_state_counts[name] = canvas_state_counts.get(name, 0) + 1
+            for name, value in batch_loss.loss_output.rare_class_t_bucket_sums.items():
+                rare_class_sums[name] = (
+                    rare_class_sums.get(name, 0.0) + float(value.detach().cpu())
+                )
+            for name, value in batch_loss.loss_output.rare_class_t_bucket_counts.items():
+                rare_class_counts[name] = (
+                    rare_class_counts.get(name, 0) + int(value.detach().cpu())
+                )
         if was_training:
             self.ema_model.train()
         if loss_count == 0:
@@ -1608,6 +1862,11 @@ class TrainingLoop:
                 name: canvas_state_sums[name] / canvas_state_counts[name]
                 for name in sorted(canvas_state_sums)
             },
+            rare_class_t_bucket=_finalize_rare_class_t_bucket(
+                rare_class_sums,
+                rare_class_counts,
+            ),
+            rare_class_t_bucket_counts=dict(rare_class_counts),
         )
 
 
@@ -1636,8 +1895,8 @@ def _append_csv_row(
     path: Path,
     fieldnames: list[str],
     row: dict[str, object],
-) -> None:
-    """Append one row to a metrics CSV, migrating the file if columns changed.
+) -> Path:
+    """Append one row without allowing a Windows file lock to kill training.
 
     A run whose CSV was written by an older column schema (e.g. before the
     canvas-state breakdown existed) would otherwise raise on the first append.
@@ -1646,15 +1905,52 @@ def _append_csv_row(
     resumed after a schema change keeps its history in one readable file.
 
     Args:
-        path: destination CSV; parent directories must already exist.
+        path: destination CSV; parent directories must already exist. This may
+            already be a continuation selected after an earlier lock.
         fieldnames: the current column schema, in emission order.
         row: values keyed by ``fieldnames``; missing keys become blank cells.
+
+    Returns:
+        The path that received the row. Normally this is ``path``. If another
+        Windows process keeps ``path`` write-locked through the bounded retries,
+        this is a new timestamped continuation CSV containing the readable
+        history plus the new row. Callers retain the returned path for all later
+        rows and publishing, so logging remains contiguous and training proceeds.
 
     Called by: TrainingLoop._write_epoch_metrics and
         TrainingLoop._write_interval_metrics.
     """
 
+    retry_delays = (0.25, 0.5, 1.0, 2.0)
+    last_error: PermissionError | None = None
+    for attempt in range(len(retry_delays) + 1):
+        if attempt:
+            time.sleep(retry_delays[attempt - 1])
+        try:
+            _append_csv_row_at_path(path, fieldnames, row)
+            return path
+        except PermissionError as exc:
+            last_error = exc
+
+    continuation_path, copied_rows = _write_csv_continuation(path, fieldnames, row)
+    print(
+        "metrics_csv_locked action=continued "
+        f"locked_path={path} continuation_path={continuation_path} "
+        f"history_rows_copied={copied_rows} error={last_error}",
+        flush=True,
+    )
+    return continuation_path
+
+
+def _append_csv_row_at_path(
+    path: Path,
+    fieldnames: list[str],
+    row: dict[str, object],
+) -> None:
+    """Append or schema-migrate one CSV path; propagate a writer lock."""
+
     write_header = True
+    migration_path: Path | None = None
     if path.exists() and path.stat().st_size > 0:
         with path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
@@ -1666,17 +1962,72 @@ def _append_csv_row(
         if existing_rows is not None:
             # Rewrite the whole file under the new header, then swap it in.
             migration_path = path.with_suffix(f"{path.suffix}.schema-migration")
-            with migration_path.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(existing_rows)
-            migration_path.replace(path)
+            try:
+                with migration_path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=fieldnames,
+                        extrasaction="ignore",
+                    )
+                    writer.writeheader()
+                    writer.writerows(existing_rows)
+                migration_path.replace(path)
+            finally:
+                # A locked destination can make replace() fail after the
+                # migration file was fully written. It is only a generated temp
+                # artifact, so do not leave it behind across every retry.
+                if migration_path.exists():
+                    try:
+                        migration_path.unlink()
+                    except OSError:
+                        pass
             write_header = False
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+
+
+def _write_csv_continuation(
+    locked_path: Path,
+    fieldnames: list[str],
+    row: dict[str, object],
+) -> tuple[Path, int]:
+    """Write a full-history continuation beside a persistently locked CSV."""
+
+    existing_rows: list[dict[str, str]] = []
+    try:
+        if locked_path.exists() and locked_path.stat().st_size > 0:
+            with locked_path.open(newline="", encoding="utf-8") as handle:
+                existing_rows = list(csv.DictReader(handle))
+    except PermissionError:
+        # Some lockers deny reads as well as writes. The current row is still
+        # persisted; the console message's copied-row count makes the absent
+        # history explicit instead of silently pretending it was recovered.
+        existing_rows = []
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    continuation_path = locked_path.with_name(
+        f"{locked_path.stem}-continued-{stamp}-{time.time_ns()}{locked_path.suffix}"
+    )
+    with continuation_path.open("x", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(existing_rows)
+        writer.writerow(row)
+    return continuation_path, len(existing_rows)
+
+
+def _latest_metrics_csv_path(canonical_path: Path) -> Path:
+    """Resume the newest continuation, if a prior launch escaped a file lock."""
+
+    continuations = sorted(
+        canonical_path.parent.glob(
+            f"{canonical_path.stem}-continued-*{canonical_path.suffix}"
+        )
+    )
+    return continuations[-1] if continuations else canonical_path
 
 
 def _mean_of_lists(accumulated: dict[str, list[float]]) -> dict[str, float]:
@@ -1730,6 +2081,40 @@ def _finalize_future_distance(
     return {
         name: sums[name] / counts[name]
         for name in FUTURE_DISTANCE_BUCKETS
+        if counts.get(name, 0) > 0
+    }
+
+
+def _finalize_rare_class_t_bucket(
+    sums: dict[str, float],
+    counts: dict[str, int],
+) -> dict[str, float]:
+    """Reduce accumulated rare-class cell sums/counts to per-cell mean losses.
+
+    The division is what makes these cells POOLED means over every scored
+    position, rather than means of per-microbatch means: a cell holding 6
+    positions in one microbatch and 0 in the next must not weight those equally.
+
+    Args:
+        sums: cell name -> total cross-entropy summed over its scored positions.
+        counts: cell name -> number of scored positions, including explicit
+            zeros for cells that scored nothing.
+
+    Returns:
+        Cell name -> mean loss, in the canonical RARE_CLASS_T_BUCKET_NAMES order,
+        with zero-count cells OMITTED. That omission is the same blank-cell
+        convention every other decomposition uses; the count itself is reported
+        separately and does keep its zero, which is how a reader distinguishes
+        "this bucket contained no [END] token" from "this bucket was not
+        evaluated".
+
+    Called by: TrainingLoop.fit (epoch and interval rows), TrainingLoop.validate,
+        and the per-step log assembly in _finalize.
+    """
+
+    return {
+        name: sums[name] / counts[name]
+        for name in RARE_CLASS_T_BUCKET_NAMES
         if counts.get(name, 0) > 0
     }
 

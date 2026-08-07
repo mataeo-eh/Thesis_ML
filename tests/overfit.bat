@@ -3,7 +3,7 @@ REM ---------------------------------------------------------------------------
 REM Overfit (learnability probe) launcher -- PRE-TRAINING pathway.
 REM
 REM Runs configs\local_overfit_v2.yaml through thesis_ml.pipeline.train_pipeline:
-REM 30 epochs over an explicitly named 10-train / 3-dev replay subset chosen at
+REM 150 epochs over an explicitly named 10-train / 3-dev replay subset chosen at
 REM the corpus median token count. The point is to confirm the full current
 REM pipeline can drive loss down at all before spending a long run on it.
 REM
@@ -18,10 +18,13 @@ REM
 REM Outputs land in tests\output\overfitV2\:
 REM     console.log            full stdout+stderr of the LATEST run
 REM     console-<timestamp>.log archived copy of each completed run
-REM     interval_metrics.csv   10 diagnostic rows per epoch (train + dev)
-REM     epoch_metrics.csv      1 row per epoch
+REM     epoch_metrics.csv      1 row per epoch, train + dev, every loss
+REM                            decomposition including the rare-class x
+REM                            corruption-bucket losses and position counts
 REM     step_metrics.jsonl     1 line per optimizer step
 REM     replay_selection.json  exactly which replays were used
+REM   (no interval_metrics.csv: this profile reports train AND dev once per
+REM    epoch -- see the interval_*_evaluation notes in configs\local_overfit.yaml)
 REM ---------------------------------------------------------------------------
 setlocal
 set "PROJECT_ROOT=%~dp0.."
@@ -56,5 +59,5 @@ if exist "%OUTPUT_DIR%\console.log" copy /y "%OUTPUT_DIR%\console.log" "%OUTPUT_
 echo.
 echo overfit run finished with exit code %EXIT_CODE%
 echo   console : %OUTPUT_DIR%\console-%RUN_STAMP%.log
-echo   metrics : %OUTPUT_DIR%\interval_metrics.csv
+echo   metrics : %OUTPUT_DIR%\epoch_metrics.csv
 exit /b %EXIT_CODE%

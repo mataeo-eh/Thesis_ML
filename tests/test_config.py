@@ -134,13 +134,19 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert overfit.pipeline.num_workers == 4
     assert overfit.pipeline.prefetch_factor == 4
     assert overfit.pipeline.persistent_workers is True
-    assert overfit.train.epochs == 30
+    assert overfit.train.epochs == 150
     # Overfitting is the point; early stopping must never cut the run short.
     assert overfit.train.early_stopping_patience_epochs == 0
-    # 34 steps/epoch x 30 epochs = 1020 steps. Warmup must stay far below that
+    # 34 steps/epoch x 150 epochs = 5100 steps. Warmup must stay far below that
     # or the run ends while still ramping and never trains at the configured lr.
     assert overfit.train.warmup == 40
     assert overfit.train.warmup < 34 * overfit.train.epochs
+    # max_steps 0 is what makes the cosine horizon DERIVED rather than fixed:
+    # train_pipeline injects len(train_loader) * epochs as train.max_steps, which
+    # is the horizon _lr_multiplier decays over. A non-zero value here would pin
+    # the schedule to a step count unrelated to the configured epoch budget.
+    assert overfit.train.max_steps == 0
+    assert overfit_v2.train.max_steps == 0
     # This profile evaluates dev once per epoch, not at each of the ten interval
     # reports: a dev pass costs more than the training slice it follows here.
     # The DEFAULT stays true, for runs that converge in a single epoch.
@@ -148,6 +154,13 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert overfit_v2.train.interval_dev_evaluation is False
     assert load_config(DEFAULT_CONFIG).train.interval_dev_evaluation is True
     assert full.train.interval_dev_evaluation is True
+    # The train side of those interval rows is switched off too, so this profile
+    # reports BOTH train and dev once per epoch and writes no interval rows at
+    # all. Same default-true contract as the dev knob.
+    assert overfit.train.interval_train_evaluation is False
+    assert overfit_v2.train.interval_train_evaluation is False
+    assert load_config(DEFAULT_CONFIG).train.interval_train_evaluation is True
+    assert full.train.interval_train_evaluation is True
     # overfit / overfit_v2 are PRE-TRAINING profiles (data.debut_mode=false,
     # inherited from config/default.yaml): class_loss_weights is a
     # fine-tuning-only section and must be None here, not populated.
@@ -155,7 +168,7 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert overfit.fog is not None
     assert overfit.train.max_cuda_reserved_gb == 7.5
     assert overfit.model.gradient_checkpointing is True
-    assert overfit_v2.train.epochs == 30
+    assert overfit_v2.train.epochs == 150
     assert overfit_v2.train.early_stopping_patience_epochs == 0
     # V2 inherits the explicit selection unchanged; only output paths differ.
     assert overfit_v2.pipeline.train_replay_ids == overfit.pipeline.train_replay_ids

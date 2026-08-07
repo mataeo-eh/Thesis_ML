@@ -76,15 +76,37 @@ train:
   #     same one configs/local_full.yaml uses).
   #   - warmup: steps spent linearly ramping up to lr. This MUST stay well below
   #     the run's total steps. The inherited default is 2000, but this profile
-  #     runs 34 steps/epoch x 30 epochs = 1020 steps total -- with warmup 2000
-  #     the run would end while still ramping and would never once train at the
-  #     configured rate, which reads as "the model refuses to learn". 40 steps
-  #     is a little over one epoch of warmup. The loop prints an `lr_schedule`
-  #     line at startup (with a WARNING when warmup >= target steps) so the
-  #     effective rate is visible before any training happens.
+  #     runs 34 steps/epoch x 150 epochs = 5100 steps total -- with warmup 2000
+  #     the run would spend its first 39% still ramping, and at the previous
+  #     30-epoch length (1020 steps) it would have ended while still ramping and
+  #     never once trained at the configured rate, which reads as "the model
+  #     refuses to learn". 40 steps is a little over one epoch of warmup. The
+  #     loop prints an `lr_schedule` line at startup (with a WARNING when warmup
+  #     >= target steps) so the effective rate is visible before any training
+  #     happens.
+  #
+  # HOW THE COSINE DECAY IS FITTED TO THIS RUN'S LENGTH: `max_steps: 0` is not
+  # "no limit" -- it is the signal that the schedule horizon must be DERIVED.
+  # train_pipeline._run_real_pipeline computes
+  # `planned_steps = len(train_loader) * train.epochs` and injects it as
+  # `train.max_steps` before the TrainingLoop is constructed, and
+  # TrainingLoop._lr_multiplier decays the cosine over exactly that horizon. So
+  # the schedule re-fits itself to `epochs` automatically: at 30 epochs it decayed
+  # to the lr_floor_ratio (0.1) floor over 1020 steps, and at 150 it stretches the
+  # same shape over 5100. Verify from the run's own `lr=` prints, which walk from
+  # 3.0e-4 down to 3.0e-5 across the whole run rather than bottoming out early.
   lr: 3.0e-4
   warmup: 40
-  epochs: 30
+  # 150 epochs, not 30. An aggressively augmented subset (per-serving fog, a
+  # freshly sampled corruption level t per example per epoch) means the model
+  # never sees the same training example twice, so short runs only have time to
+  # memorize the easy, high-frequency positions. The rare tokens are the reason
+  # for the length: the win/loss token appears exactly ONCE in a 4096-position
+  # canvas, so it draws gradient every step but through ~0.02% of the scored
+  # positions. Giving the run 5x the steps is what lets that signal accumulate
+  # -- and the rare-class x t-bucket columns (see the diagnostics note in
+  # local_overfit_v2.yaml) are what make it readable when it does.
+  epochs: 150
   max_steps: 0
   # Overfitting is the POINT of this profile: it must be allowed to keep driving
   # train loss down on a subset it has memorized, so early stopping stays off.
@@ -92,23 +114,34 @@ train:
   early_stopping_min_relative_improvement: 0.001
   accumulation_steps: 1
   target_effective_batch_tokens: 0
-  # ~1 checkpoint per epoch (34 steps/epoch) rather than per 3 epochs.
+  # ~1 checkpoint per epoch (34 steps/epoch) rather than per 3 epochs. Over 150
+  # epochs this overwrites last.pt 150 times (keep_step_checkpoints stays false),
+  # so disk use is flat and a crash costs at most one epoch of training.
   checkpoint_interval: 34
-  # Dev evaluation for this profile happens ONCE per epoch, at the epoch end.
+  # BOTH dev and train loss are reported ONCE per epoch, at the epoch end, and
+  # this profile therefore emits no interval_metrics.csv rows at all.
   #
-  # val_interval 0 disables the step-cadence validation, and
-  # interval_dev_evaluation false stops the ten per-epoch interval reports from
-  # each running their own dev pass. Measured on the RTX 3070: a train step is
-  # ~2.9s (34 per epoch, ~105s) while a full dev pass over the 101 dev windows
-  # is ~18s, so ten interval dev passes would add ~180s per epoch and more than
-  # double a 30-epoch run. This profile has 30 epochs of dev points already, so
-  # the intra-epoch dev resolution buys little here -- unlike a full run that
-  # converges in one epoch, which is why the default stays true.
+  # val_interval 0 disables the step-cadence validation. interval_dev_evaluation
+  # false stops the ten per-epoch interval reports from each running their own
+  # dev pass: measured on the RTX 3070, a train step is ~2.9s (34 per epoch,
+  # ~105s) while a full dev pass over the 101 dev windows is ~18s, so ten
+  # interval dev passes would add ~180s per epoch and roughly double the run.
   #
-  # The interval rows still carry the full TRAIN-side breakdown ten times per
-  # epoch; only their dev columns are blank.
+  # interval_train_evaluation false then does the same to the train side, for a
+  # different reason -- it costs no compute, it costs SIGNAL. This profile runs
+  # 34 batches per epoch, so a "10% of the epoch" slice is 3-4 batches; with a
+  # fresh fog draw and a fresh corruption level t per example, the loss over 3
+  # batches is dominated by which t values happened to be drawn. Across 150
+  # epochs that would be 1500 rows of resampling noise. The per-epoch row
+  # averages all 34 batches and gives 150 clean points, which is ample here.
+  #
+  # This is a REPORTING switch only. Every interval accumulator still runs, so
+  # flipping either flag back to true restores the ten-per-epoch rows with no
+  # other change -- which is what a full run (one epoch, needing intra-epoch
+  # resolution) relies on, and why both default to true.
   val_interval: 0
   interval_dev_evaluation: false
+  interval_train_evaluation: false
   confidence_loss_weight: 0.0
   self_cond_prob: 0.5
   precision: bf16

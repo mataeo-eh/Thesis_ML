@@ -111,6 +111,11 @@ train:
   # true so a single-epoch run still gets ten dev observations; set false when
   # the dev pass costs more than the training it interleaves with.
   interval_dev_evaluation: true
+  # Carry train values in those same ten per-epoch interval reports. Default
+  # true; set false on a many-epoch run where a ~10% slice is only a few batches
+  # and the per-epoch row already carries the trend. Both false = no interval
+  # rows at all.
+  interval_train_evaluation: true
   checkpoint_interval: 1000
   checkpoint_dir: checkpoints
   keep_step_checkpoints: false

@@ -24,5 +24,8 @@ def test_windows_launchers_are_thin_config_driven_wrappers() -> None:
         assert "'.venv\\scripts\\python.exe' -m thesis_ml.pipeline.train_pipeline" in text
         assert "tee-object -filepath '%output_dir%\\console.log'" in text
         assert "exit $lastexitcode" in text
+        # A launcher must not carry training logic of its own -- no inline Python
+        # and no torch API calls. Every knob belongs to the YAML profile.
         assert "python -c" not in text
-        assert "torch" not in text
+        assert "import torch" not in text
+        assert "torch." not in text

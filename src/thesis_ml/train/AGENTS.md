@@ -24,7 +24,7 @@
 - Epoch patience compares noisy resampled train loss against the best using the configured relative minimum improvement; a single flat epoch never stops a run.
 - Optimizer/schedule fields (`lr`, `betas`, `weight_decay`, `warmup`, `lr_floor`, `grad_clip`, `accum`, `precision`, `epochs`, `early_stopping_*`) are config-owned.
 - Checkpoints persist `feature_statistics_identity`; resume and warm-start must reject missing or mismatched identities before loading weights.
-- Production pipelines stream step metrics to disk without retaining returned log objects; validation aggregates scalar metrics on CPU. CUDA runs report current/peak allocation, reservation, inactive split bytes, device-wide used memory from `cudaMemGetInfo`, and the device-minus-reserved gap. Epoch CSVs average the latter two across optimizer steps. Profiles may trim unused cache at completed epoch boundaries via config.
+- Production pipelines stream step metrics to disk without retaining returned log objects; validation aggregates scalar metrics on CPU. Epoch/interval CSV writes retry transient file locks and, when a lock persists, switch to a timestamped continuation containing readable prior history; new loop instances resume the newest continuation. CUDA runs report current/peak allocation, reservation, inactive split bytes, device-wide used memory from `cudaMemGetInfo`, and the device-minus-reserved gap. Epoch CSVs average the latter two across optimizer steps. A configured reserved-memory ceiling first trims reclaimable allocator cache and fails only if the post-trim reservation still breaches the ceiling; profiles may also trim unused cache at completed epoch boundaries via config.
 
 ## Work Guidance
 
