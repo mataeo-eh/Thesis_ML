@@ -11,31 +11,11 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
+from thesis_ml.data.features import CONTINUOUS_FEATURE_NAMES, STAT_KEYS
 
-FEATURE_STATISTICS_VERSION = 1
+
+FEATURE_STATISTICS_VERSION = 3
 ZERO_VARIANCE_POLICY = "unit-scale"
-
-STAT_KEYS = (
-    "health",
-    "energy",
-    "shields",
-    "facing",
-    "radius",
-    "build_progress",
-    "weapon_cooldown",
-    "attack_upgrade_level",
-    "armor_upgrade_level",
-    "shield_upgrade_level",
-    "cargo_space_taken",
-    "cargo_space_max",
-    "order_count",
-    "is_flying",
-    "is_burrowed",
-    "is_hallucination",
-    "is_active",
-    "is_powered",
-)
-CONTINUOUS_FEATURE_NAMES = ("map_x", "map_y", *STAT_KEYS)
 
 
 class FeatureStatisticsError(ValueError):
@@ -96,32 +76,51 @@ def compute_feature_statistics(
         raise FeatureStatisticsError("cannot compute feature statistics from an empty training split")
 
     width = len(CONTINUOUS_FEATURE_NAMES)
-    count = 0
+    counts = np.zeros(width, dtype=np.int64)
     total = np.zeros(width, dtype=np.float64)
     total_sq = np.zeros(width, dtype=np.float64)
     for artifact_path in ordered_paths:
-        values = np.asarray(TokenizedReplay(artifact_path).features, dtype=np.float64)
+        replay = TokenizedReplay(artifact_path)
+        values = np.asarray(replay.features, dtype=np.float64)
+        validity = np.asarray(replay.feature_validity, dtype=np.uint32)
         if values.ndim != 2 or values.shape[1] != width:
             raise FeatureStatisticsError(
                 f"feature artifact {artifact_path} has shape {values.shape}; expected [N, {width}]"
             )
+        if validity.shape != (values.shape[0],):
+            raise FeatureStatisticsError(
+                f"feature validity artifact {artifact_path} has shape {validity.shape}; "
+                f"expected [{values.shape[0]}]"
+            )
         if not np.isfinite(values).all():
             raise FeatureStatisticsError(f"feature artifact {artifact_path} contains non-finite values")
-        count += int(values.shape[0])
-        total += values.sum(axis=0, dtype=np.float64)
-        total_sq += np.square(values, dtype=np.float64).sum(axis=0, dtype=np.float64)
+        for feature_index in range(width):
+            valid = (validity & np.uint32(1 << feature_index)) != 0
+            feature_values = values[valid, feature_index]
+            counts[feature_index] += int(feature_values.shape[0])
+            total[feature_index] += feature_values.sum(dtype=np.float64)
+            total_sq[feature_index] += np.square(feature_values, dtype=np.float64).sum(
+                dtype=np.float64
+            )
 
-    if count <= 0:
-        raise FeatureStatisticsError("training split contains no entity feature rows")
-    means = total / count
-    variances = np.maximum(total_sq / count - np.square(means), 0.0)
+    if np.any(counts <= 0):
+        missing = [
+            name
+            for name, count in zip(CONTINUOUS_FEATURE_NAMES, counts, strict=True)
+            if count <= 0
+        ]
+        raise FeatureStatisticsError(
+            f"training split has no valid observations for features: {missing}"
+        )
+    means = total / counts
+    variances = np.maximum(total_sq / counts - np.square(means), 0.0)
     raw_stds = np.sqrt(variances)
     zero_variance = raw_stds == 0.0
     stds = np.where(zero_variance, 1.0, raw_stds)
     payload = {
         "version": FEATURE_STATISTICS_VERSION,
         "feature_names": list(CONTINUOUS_FEATURE_NAMES),
-        "counts": [count] * width,
+        "counts": counts.tolist(),
         "means": means.tolist(),
         "stds": stds.tolist(),
         "zero_variance_features": [

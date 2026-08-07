@@ -29,6 +29,10 @@ import torch
 from torch.utils.data import Dataset, get_worker_info
 
 from thesis_ml.config import ProjectConfig
+from thesis_ml.data.features import (
+    CONTINUOUS_FEATURE_NAMES,
+    continuous_feature_is_valid,
+)
 from thesis_ml.data.windowing import (
     ENTITY_CODE,
     P1_CODE,
@@ -36,7 +40,6 @@ from thesis_ml.data.windowing import (
     TokenizedReplay,
     WindowManifestEntry,
 )
-from thesis_ml.model.embedding import STAT_KEYS
 from thesis_ml.serialize import TokenRecord, serialize_snapshot
 from thesis_ml.vocab.content_vocab import ContentVocabulary
 from thesis_ml.vocab.special_tokens import (
@@ -741,17 +744,40 @@ def _artifact_timestep_records(
 ) -> list[tuple[int, TokenRecord]]:
     result: list[tuple[int, TokenRecord]] = []
     token_slice = replay.token_slice(timestep)
+    buff_cursor = int(replay.buff_timestep_offsets[timestep])
     for position in range(token_slice.start, token_slice.stop):
         owner_code = int(replay.owners[position])
         owner = "p1" if owner_code == P1_CODE else "p2"
         token_id = int(replay.token_ids[position])
         token_name = vocabulary.token_name_for(token_id)
         values = replay.features[position]
-        raw_attributes = {
-            key: float(values[2 + stat_index])
-            for stat_index, key in enumerate(STAT_KEYS)
-            if float(values[2 + stat_index]) != 0.0
-        }
+        validity_mask = int(replay.feature_validity[position])
+        raw_attributes: dict[str, Any] = {}
+        for feature_index, name in enumerate(CONTINUOUS_FEATURE_NAMES):
+            if feature_index < 2 or not continuous_feature_is_valid(
+                validity_mask, feature_index
+            ):
+                continue
+            raw_attributes[name] = float(values[feature_index])
+
+        cloak_state = int(replay.cloak_states[position])
+        if cloak_state != 255:
+            raw_attributes["cloak"] = cloak_state
+        buff_count = int(replay.buff_counts[position])
+        if buff_count != 255:
+            raw_attributes["buff_ids"] = [
+                int(value)
+                for value in replay.buff_ids[buff_cursor : buff_cursor + buff_count]
+            ]
+            buff_cursor += buff_count
+
+        position_valid = all(
+            continuous_feature_is_valid(validity_mask, feature_index)
+            for feature_index in (0, 1)
+        )
+        raw_position = (
+            (float(values[0]), float(values[1]), 0.0) if position_valid else None
+        )
         record = TokenRecord(
             token_id=token_id,
             token_name=token_name,
@@ -761,10 +787,12 @@ def _artifact_timestep_records(
             game_loop=int(replay.game_loops[timestep]),
             timestamp_seconds=_optional_artifact_timestamp(replay.timestamps[timestep]),
             entity_type=token_name,
-            raw_position=(float(values[0]), float(values[1]), 0.0),
+            raw_position=raw_position,
             raw_attributes=raw_attributes,
         )
         result.append((owner_code, record))
+    if buff_cursor != int(replay.buff_timestep_offsets[timestep + 1]):
+        raise ValueError(f"buff feature offsets are corrupt at timestep {timestep}")
     return result
 
 

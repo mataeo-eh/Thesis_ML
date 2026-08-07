@@ -26,10 +26,13 @@ from thesis_ml.data.resumable_sampler import ResumableBatchSampler
 from thesis_ml.data.split import split_replays
 from thesis_ml.data.windowing import (
     MANIFEST_VERSION,
+    TOKENIZED_ARTIFACT_VERSION,
     load_window_manifest,
     manifest_config_stamp,
     preprocess_replays,
     read_manifest_metadata,
+    replay_source_stamp,
+    vocabulary_stamp,
 )
 from thesis_ml.eval.finetune_report import build_and_write_finetune_report
 from thesis_ml.model.model import SC2StrategyDiffusionModel
@@ -178,23 +181,29 @@ def _run_real_pipeline(
     replay_paths = _materialize_replay_paths(config, resolver)
     _ensure_window_manifest(replay_paths, config, vocabulary)
 
-    # Reproducible split over replays (not windows) to avoid leakage. The test
-    # set is held out here for later evaluation; dev drives in-training
-    # validation / early-abort decisions.
-    split = split_replays(
-        replay_paths,
-        seed=config.pipeline.split_seed,
-        test_fraction=config.pipeline.test_fraction,
-        dev_fraction=config.pipeline.dev_fraction,
-        train_count=config.pipeline.train_replay_count,
-        dev_count=config.pipeline.validation_replay_count,
-    )
-    train_replays, dev_replays = _select_replays(
-        list(split.train),
-        list(split.dev),
-        config,
-    )
-    test_replays = list(split.test)
+    # Replay-level (not window-level) partitioning, to avoid leakage between
+    # windows of the same game. Two mutually exclusive routes:
+    #   1. An explicit named selection, when pipeline.train_replay_ids is set.
+    #      Used by diagnostic profiles that must train on a KNOWN subset.
+    #   2. Otherwise the reproducible seeded split, then the seeded subset draw.
+    explicit = _explicit_replay_selection(replay_paths, config)
+    if explicit is not None:
+        train_replays, dev_replays, test_replays = explicit
+    else:
+        split = split_replays(
+            replay_paths,
+            seed=config.pipeline.split_seed,
+            test_fraction=config.pipeline.test_fraction,
+            dev_fraction=config.pipeline.dev_fraction,
+            train_count=config.pipeline.train_replay_count,
+            dev_count=config.pipeline.validation_replay_count,
+        )
+        train_replays, dev_replays = _select_replays(
+            list(split.train),
+            list(split.dev),
+            config,
+        )
+        test_replays = list(split.test)
     _record_replay_selection(config, resolver, train_replays, dev_replays, test_replays)
     train_windows = load_window_manifest(
         config.data.window_manifest_path,
@@ -278,6 +287,10 @@ def _run_real_pipeline(
     metrics_dir = _local_metrics_dir(config, resolver)
     metrics_path = metrics_dir / "step_metrics.jsonl"
     epoch_metrics_path = metrics_dir / "epoch_metrics.csv"
+    # Intra-epoch diagnostics: the same loss breakdowns as epoch_metrics.csv but
+    # emitted ten times per epoch, so sub-class loss trends stay readable on a
+    # run that only needs a single epoch. See TrainingLoop._write_interval_metrics.
+    interval_metrics_path = metrics_dir / "interval_metrics.csv"
     loop = TrainingLoop(
         model=model,
         config=training_config,
@@ -285,6 +298,7 @@ def _run_real_pipeline(
         seed=config.pipeline.seed,
         metrics_path=metrics_path,
         epoch_metrics_path=epoch_metrics_path,
+        interval_metrics_path=interval_metrics_path,
         checkpoint_publisher=_checkpoint_publisher(config, resolver),
         metrics_publisher=_metrics_publisher(config, resolver),
     )
@@ -370,6 +384,92 @@ def _run_real_pipeline(
     )
 
 
+def _explicit_replay_selection(
+    replay_paths: list[str],
+    config: ProjectConfig,
+) -> tuple[list[str], list[str], list[str]] | None:
+    """Resolve the config's named replay lists into train/dev/test path groups.
+
+    This is the opt-in alternative to the seeded split (see
+    PipelineConfig.train_replay_ids for why a diagnostic run needs a named,
+    reproducible subset rather than an arbitrary seeded one). It runs INSTEAD of
+    split_replays + _select_replays, not after them, because the seeded split
+    would otherwise have already scattered the named replays across train, dev,
+    and test.
+
+    Replays are named by FILE STEM (``match_4746821_game_state``), matching what
+    ``_record_replay_selection`` writes to replay_selection.json. Every replay
+    not named in either list becomes test, preserving the invariant that each
+    replay lands in exactly one group.
+
+    Args:
+        replay_paths: every replay path in the corpus.
+        config: read for ``pipeline.train_replay_ids`` / ``dev_replay_ids``.
+
+    Returns:
+        ``(train, dev, test)`` path lists ordered to match the configured id
+        order, or None when no explicit train selection is configured (the
+        caller then falls back to the seeded split).
+
+    Raises:
+        ValueError: a named replay is absent from the corpus, a name is
+            duplicated, or the train and dev lists overlap. Failing loudly here
+            beats silently training on a smaller subset than intended.
+    """
+
+    train_ids = _replay_id_list(config.pipeline.train_replay_ids)
+    dev_ids = _replay_id_list(config.pipeline.dev_replay_ids)
+    if not train_ids:
+        if dev_ids:
+            raise ValueError(
+                "pipeline.dev_replay_ids is set but pipeline.train_replay_ids is empty; "
+                "name both lists or neither"
+            )
+        return None
+
+    by_stem = {Path(path).stem: path for path in replay_paths}
+    missing = [stem for stem in (*train_ids, *dev_ids) if stem not in by_stem]
+    if missing:
+        raise ValueError(
+            f"configured replay ids not found in the corpus: {', '.join(missing)}"
+        )
+    overlap = set(train_ids) & set(dev_ids)
+    if overlap:
+        raise ValueError(
+            f"replay ids appear in both train and dev selections: {', '.join(sorted(overlap))}"
+        )
+
+    train_replays = [by_stem[stem] for stem in train_ids]
+    dev_replays = [by_stem[stem] for stem in dev_ids]
+    selected = set(train_replays) | set(dev_replays)
+    test_replays = [path for path in replay_paths if path not in selected]
+    print(
+        f"replay_selection=explicit train={len(train_replays)} "
+        f"dev={len(dev_replays)} test={len(test_replays)}",
+        flush=True,
+    )
+    return train_replays, dev_replays, test_replays
+
+
+def _replay_id_list(raw: str) -> list[str]:
+    """Parse a comma-separated replay-id string into a deduplicated list.
+
+    Whitespace around entries and empty entries (from trailing commas or a
+    multi-line YAML string) are ignored, so the config can be formatted for
+    readability. Order is preserved.
+
+    Raises:
+        ValueError: the same id appears twice, which almost always means a
+            copy-paste slip that would silently shrink the selection.
+    """
+
+    ids = [entry.strip() for entry in raw.split(",") if entry.strip()]
+    duplicates = sorted({entry for entry in ids if ids.count(entry) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate replay ids configured: {', '.join(duplicates)}")
+    return ids
+
+
 def _select_replays(
     train_candidates: list[str],
     dev_candidates: list[str],
@@ -413,7 +513,10 @@ def _ensure_window_manifest(
         rebuild = any(
             (
                 metadata.get("manifest_version") != MANIFEST_VERSION,
+                metadata.get("tokenized_artifact_version") != TOKENIZED_ARTIFACT_VERSION,
                 metadata.get("config_stamp") != manifest_config_stamp(config),
+                metadata.get("replay_source_stamp") != replay_source_stamp(replay_paths),
+                metadata.get("vocabulary_stamp") != vocabulary_stamp(vocabulary),
                 metadata.get("replay_count") != len(replay_paths),
                 metadata.get("perspectives") != list(perspectives),
             )

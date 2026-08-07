@@ -11,8 +11,16 @@ data:
   input_budget_tokens: 4096
   canvas_budget_tokens: 4096
   canvas_recon_fraction: 0.5
+  debut_mode: false
   tokenized_replay_dir: data/processed/local/tokenized_replays
-  window_manifest_path: data/processed/local/window_manifest.jsonl
+  # These budgets/fractions are IDENTICAL to configs/local_full.yaml, so this
+  # profile's manifest config stamp matches the full run's. That means
+  # overfit_window_manifest.jsonl can be seeded by copying the already-built
+  # full_window_manifest.jsonl and preprocessing is skipped entirely, instead of
+  # re-deriving windows for all 943 replays before a 10-replay run. It is a
+  # SEPARATE file so a stamp mismatch can only ever rebuild the overfit
+  # manifest, never clobber the full run's.
+  window_manifest_path: data/processed/local/overfit_window_manifest.jsonl
   feature_statistics_path: data/processed/local/overfit_feature_statistics.v1.json
 
 pipeline:
@@ -22,8 +30,31 @@ pipeline:
   replay_glob: "*.parquet"
   num_workers: 4
   prefetch_factor: 4
-  replay_subset_size: 25
-  validation_replay_count: 3
+  # Explicit, named replay subset -- this profile does NOT use the seeded
+  # shuffle (replay_subset_size / validation_replay_count are therefore 0).
+  #
+  # HOW THESE 13 REPLAYS WERE CHOSEN (deterministic, no RNG): every replay was
+  # ranked ascending by the total input tokens it contributes across all its
+  # windows and both perspectives, tie-broken by replay id. The 13 replays at
+  # ranks 465-477 of 943 -- the run centered on the median rank 471 -- were
+  # taken; the first 10 are train, the last 3 are dev. They therefore sit at the
+  # corpus median size (~108k-114k input tokens each vs a 111,860 corpus
+  # median), which is the point: an overfit run must not be made artificially
+  # easy by short replays or artificially slow by the long tail (the corpus max
+  # is 1.49M input tokens, over 13x the median).
+  #
+  # Resulting shape: 334 train windows -> 34 optimizer steps/epoch at
+  # batch_size 10, and 101 dev windows -> 11 batches per validation pass.
+  replay_subset_size: 0
+  validation_replay_count: 0
+  train_replay_ids: "match_4746821_game_state,match_4746300_game_state,match_4746422_game_state,match_4746328_game_state,match_4746242_game_state,match_4746352_game_state,match_4746416_game_state,match_4746492_game_state,match_4745788_game_state,match_4745798_game_state"
+  dev_replay_ids: "match_4746726_game_state,match_4746321_game_state,match_4746049_game_state"
+  # Feature statistics are keyed to the EXACT train replay list and this profile
+  # owns a named 10-replay list, so the frozen artifact is (re)built from those
+  # replays on every launch rather than requiring a separate one-shot command.
+  # It is deterministic and reads only 10 replays' windows, so recomputing it is
+  # cheap and can never drift from the selection above.
+  prepare_feature_statistics: true
 
 model:
   d_model: 256
@@ -39,16 +70,48 @@ diffusion:
     t_one_fraction: 0.0
 
 train:
-  epochs: 200
+  # From-scratch LR schedule, declared explicitly here rather than inherited so
+  # this profile can never silently pick up a value meant for another run.
+  #   - lr: peak base learning rate (3e-4, the standard from-scratch value, the
+  #     same one configs/local_full.yaml uses).
+  #   - warmup: steps spent linearly ramping up to lr. This MUST stay well below
+  #     the run's total steps. The inherited default is 2000, but this profile
+  #     runs 34 steps/epoch x 30 epochs = 1020 steps total -- with warmup 2000
+  #     the run would end while still ramping and would never once train at the
+  #     configured rate, which reads as "the model refuses to learn". 40 steps
+  #     is a little over one epoch of warmup. The loop prints an `lr_schedule`
+  #     line at startup (with a WARNING when warmup >= target steps) so the
+  #     effective rate is visible before any training happens.
+  lr: 3.0e-4
+  warmup: 40
+  epochs: 30
   max_steps: 0
-  early_stopping_patience_epochs: 5
+  # Overfitting is the POINT of this profile: it must be allowed to keep driving
+  # train loss down on a subset it has memorized, so early stopping stays off.
+  early_stopping_patience_epochs: 0
   early_stopping_min_relative_improvement: 0.001
   accumulation_steps: 1
   target_effective_batch_tokens: 0
-  checkpoint_interval: 100
+  # ~1 checkpoint per epoch (34 steps/epoch) rather than per 3 epochs.
+  checkpoint_interval: 34
+  # Dev evaluation for this profile happens ONCE per epoch, at the epoch end.
+  #
+  # val_interval 0 disables the step-cadence validation, and
+  # interval_dev_evaluation false stops the ten per-epoch interval reports from
+  # each running their own dev pass. Measured on the RTX 3070: a train step is
+  # ~2.9s (34 per epoch, ~105s) while a full dev pass over the 101 dev windows
+  # is ~18s, so ten interval dev passes would add ~180s per epoch and more than
+  # double a 30-epoch run. This profile has 30 epochs of dev points already, so
+  # the intra-epoch dev resolution buys little here -- unlike a full run that
+  # converges in one epoch, which is why the default stays true.
+  #
+  # The interval rows still carry the full TRAIN-side breakdown ten times per
+  # epoch; only their dev columns are blank.
   val_interval: 0
+  interval_dev_evaluation: false
   confidence_loss_weight: 0.0
   self_cond_prob: 0.5
   precision: bf16
   require_cuda: true
   max_cuda_reserved_gb: 7.5
+  empty_cuda_cache_after_epoch: true

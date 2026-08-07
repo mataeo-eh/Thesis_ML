@@ -55,14 +55,14 @@ Parsed fields:
 | Owner/player | Column prefix | `p1`, `p2` | Raw allegiance input field. Not token identity. Later training can map one player to self and the other to enemy per training perspective. |
 | Bot name | Column middle before entity type | `jimmybott`, `who`, `phobos` | Metadata only. Not token identity. |
 | Entity type | Last segment before `instance_id` | `scv`, `marine`, `zergling`, `unknown(1943)` | Token identity. Content vocabulary is raw entity-type tokens only. |
-| Instance id | Three digit segment | `001`, `084`, `201` | Deterministic within-type tiebreak candidate for canonical ordering. The fixtures do not expose a separate persistent own-unit game tag field. |
+| Instance id | Digit segment (historically zero-padded to three digits) | `001`, `084`, `1000`, `1664` | Deterministic within-type tiebreak candidate for canonical ordering. The fixtures do not expose a separate persistent own-unit game tag field. |
 | Attribute | Column suffix after instance id | `pos_(X,Y,Z)`, `health`, `is_flying` | Raw input-only contextual/stat field. Not token identity. |
 
 Observed player prefixes: `p1`, `p2`.
 
 Observed bot names in fixtures: `avocados`, `caninana`, `jimmybott`, `phobos`, `sharkbot`, `who`.
 
-Observed instance-id range in fixtures: `001` through `201`.
+Observed instance-id range in the five fixtures: `001` through `201`. The broader 943-replay corpus reaches `1664`, so consumers must not impose a three-digit limit.
 
 ## Entity Attributes
 
@@ -110,17 +110,19 @@ Representative values:
 
 | Attribute | Example values | SPEC role |
 |---|---|---|
-| `pos_(X,Y,Z)` | `(68.481689453125, 176.035888671875, 11.990320205688477)` | Exact map position. Input-only contextual value. Never token identity. |
-| `health` | `45.0/45.0`, `6.0/45.0` | Unit stat. Input-only raw value. |
-| `energy` | `51.23046875/200.0` | Unit stat. Input-only raw value. |
-| `shields` | shield values where present | Unit stat. Input-only raw value. |
-| `facing` | `0.22607851028442383` | Unit stat/context. Input-only raw value. |
-| `radius` | `0.375` | Unit stat/context. Input-only raw value. |
+| `pos_(X,Y,Z)` | `(68.481689453125, 176.035888671875, 11.990320205688477)` | X/Y are input-only context; Z is deliberately excluded. A valid tuple is required for entity presence. |
+| `health` | `45.0/45.0`, `6.0/45.0` | Unit stat. Input-only current/max fraction. |
+| `energy` | `51.23046875/200.0` | Unit stat. Input-only current/max fraction. |
+| `shields` | shield values where present | Unit stat. Input-only current/max fraction when slash-form. |
+| `facing` | `0.22607851028442383` | Input-only, losslessly encoded as `sin(facing)` and `cos(facing)`. |
+| `radius` | `0.375` | Input-only collision/footprint radius; for buildings this represents their footprint radius. |
 | `build_progress` | `1.0` | Unit/building stat. Input-only raw value. |
 | `is_flying`, `is_burrowed`, `is_hallucination`, `is_active`, `is_powered` | `True`, `False` | Unit flags. Input-only raw values. |
 | `attack_upgrade_level`, `armor_upgrade_level`, `shield_upgrade_level` | `0`, `1`, `2` | Unit stat. Input-only raw value. |
 | `cargo_space_taken`, `cargo_space_max`, `order_count` | `0`, `1` | Unit stat. Input-only raw value. |
-| `buff_ids` | `[]`, `[271]`, `[271, 33]` | Unit stat/list. Input-only raw value. |
+| `ideal_harvesters`, `buff_duration_remain`, `buff_duration_max`, `detect_range` | numeric strings | Approved input-only scalar features. `assigned_harvesters` and `radar_range` remain excluded. |
+| `cloak` | `0` through `4` | Input-only categorical one-hot over the complete SC2 `CloakState` enum. |
+| `buff_ids` | `[]`, `[271]`, `[271, 33]`, `[302]` | Input-only sparse categorical multi-hot over raw SC2 protocol IDs. The audited 943-replay corpus contains 43 IDs through `302`, including IDs above PySC2 4.0's stale `289` enum ceiling; values beyond the audited range fail loudly pending schema review. |
 | `engaged_target_tag`, `rally_tag`, `add_on_tag` | integer-looking tag strings | Relationship fields. Input-only raw value. Not entity identity. |
 | `rally_x`, `rally_y` | `67.0`, `176.5` | Rally-point coordinates. Not token identity. |
 
@@ -132,9 +134,12 @@ destroyed
 building_started
 inside refinery
 inside orbitalcommand
+inside extractor
+inside assimilator
+inside bunker
 ```
 
-Some rows contain these sentinel strings instead of numeric/boolean/tuple values. Owner-approved Phase 2 rule: every non-null entity attribute value indicates that the entity instance is present for that snapshot. `destroyed` is the final valid frame of an entity life, and following rows should be null for that entity. `inside ...` values also indicate that the unit still exists even if it is not literally visible on the map.
+**Important tokenization rule:** non-null sentinel text is treated as null, not as entity data. An entity token exists for a snapshot only when `pos_(X,Y,Z)` parses as a finite coordinate tuple. Therefore lifecycle rows such as `building_started`, `completed`, `destroyed`, `cancelled`, and any future non-position sentinel do not emit that entity token. A valid `(0,0,Z)` tuple remains a valid position. Nonnumeric sentinel text in an individual allowlisted stat is missing for that stat and receives validity `0`; it is never coerced to numeric zero. `inside ...` status text can coexist with a valid position, so it invalidates the affected stat cells without deleting the positioned entity.
 
 ## Entity Types
 
@@ -294,8 +299,8 @@ These parquet values must not enter the vocabulary:
 | SPEC concept | Derived parquet source |
 |---|---|
 | Entity type token identity | Entity type embedded in column name: `{player}_{bot_name}_{entity_type}_{instance_id}_{attribute}` |
-| Unit instance for deterministic ordering | Three-digit `instance_id` embedded in column name; owner-approved as the within-type tiebreak |
-| Map position | `pos_(X,Y,Z)` attribute value, exact tuple string |
+| Unit instance for deterministic ordering | Variable-width digit `instance_id` embedded in column name; owner-approved as the within-type tiebreak |
+| Entity presence and map position | A finite tuple in `pos_(X,Y,Z)`; X/Y enter input features and Z is excluded |
 | Unit stats | Remaining entity attributes such as `health`, `energy`, `build_progress`, flags, upgrades, cargo, buffs |
 | Absolute game clock (non-model metadata only) | `timestamp_seconds` row field; excluded by the model-facing feature allowlist |
 | Snapshot/timestep | One parquet row, ordered by `game_loop` |
@@ -306,6 +311,7 @@ These parquet values must not enter the vocabulary:
 
 Owner approval received before Phase 2 implementation:
 
-1. The three-digit `instance_id` is acceptable for tiebreaking.
-2. Every non-null entity attribute value indicates an active/present entity for that snapshot. `destroyed` is the last valid frame before disappearance, and `inside ...` statuses still represent existing units.
+1. The numeric `instance_id` is acceptable for tiebreaking; its digit width is not bounded.
+2. Entity presence requires a finite `pos_(X,Y,Z)` tuple. Lifecycle or other non-position sentinels are treated as null and emit no entity token; a valid `(0,0,Z)` is not missing. Individual nonnumeric stat sentinels are missing values with validity `0`.
 3. Units, buildings, and individual upgrades belong in the content vocabulary. Resource fields, derived features, count columns, frame/time fields, coordinates, and upgrade-list column names do not.
+4. Input feature additions are `ideal_harvesters`, both buff-duration fields, `detect_range`, categorical `cloak`, and categorical `buff_ids`. `assigned_harvesters`, `radar_range`, rally coordinates, display type, and raw relationship tags remain excluded.

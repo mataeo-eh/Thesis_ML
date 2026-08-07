@@ -20,6 +20,7 @@ from thesis_ml.config import ProjectConfig
 from thesis_ml.data.collate import DiffusionBatch
 from thesis_ml.model.embedding import InputFeatures
 from thesis_ml.model.loss import (
+    CANVAS_STATE_NAMES,
     FUTURE_DISTANCE_BUCKETS,
     PERSPECTIVE_NAMES,
     T_BUCKET_NAMES,
@@ -53,6 +54,7 @@ class ValidationLog:
     future_distance: dict[str, float]
     t_bucket: dict[str, float]
     perspective: dict[str, float]
+    canvas_state: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -63,11 +65,13 @@ class TrainStepLog:
     confidence_loss: float
     per_class: dict[str, float]
     future_distance: dict[str, float]
-    # Clean-state CE broken down by the example's sampled t-bucket and by player
-    # perspective. Emitted in BOTH pipelines. Empty buckets/perspectives are
-    # simply absent from these dicts (per_class convention).
+    # Clean-state CE broken down by the example's sampled t-bucket, by player
+    # perspective, and by per-position canvas state (ground-truth-preserved vs
+    # actually-noised). Emitted in BOTH pipelines. Empty keys are simply absent
+    # from these dicts (per_class convention).
     t_bucket_loss: dict[str, float]
     perspective_loss: dict[str, float]
+    canvas_state_loss: dict[str, float]
     lr: float
     t_mean: float
     noise_fraction: float
@@ -99,12 +103,91 @@ class EpochMetrics:
     dev_t_bucket_loss: dict[str, float]
     train_perspective_loss: dict[str, float]
     dev_perspective_loss: dict[str, float]
+    train_canvas_state_loss: dict[str, float]
+    dev_canvas_state_loss: dict[str, float]
     total_tokens_ingested: int
     total_unique_tokens_seen: int
     tokens_per_second: float
     wall_clock_elapsed_seconds: float
     average_cuda_device_memory_used_bytes: float
     average_cuda_device_memory_gap_bytes: float
+
+
+# How many diagnostic reports are emitted per epoch, evenly spaced across the
+# epoch's batches. WHY this exists in addition to the per-epoch CSV: on a corpus
+# large enough that pre-training only needs ONE epoch, a per-epoch breakdown
+# yields exactly one data point and shows no trend at all. Reporting at every
+# ~10% of an epoch gives ten ordered observations of each loss sub-class within
+# a single epoch, so the same diagnostics that are readable on a 30-epoch
+# overfit run stay readable on a 1-epoch full run.
+INTERVAL_REPORTS_PER_EPOCH = 10
+
+
+@dataclass(frozen=True)
+class IntervalMetrics:
+    """One intra-epoch diagnostic report (see INTERVAL_REPORTS_PER_EPOCH).
+
+    Every loss field is scoped to the SLICE of the epoch since the previous
+    interval report -- not to the epoch so far -- so consecutive rows show the
+    losses actually moving rather than a slowly-updating running average.
+
+    The ``dev_*`` fields come from a full pass over the dev loader taken at this
+    interval boundary with EMA weights, and are empty dicts (``dev_loss`` None)
+    when the run has no dev loader.
+    """
+
+    epoch: int
+    # 1..INTERVAL_REPORTS_PER_EPOCH within the epoch.
+    interval: int
+    # Fraction of the epoch completed at this boundary (interval / reports).
+    epoch_fraction: float
+    global_step: int
+    # Batch index within the epoch that triggered this report.
+    epoch_batch_index: int
+    batches_in_epoch: int
+    train_loss: float
+    dev_loss: float | None
+    train_per_class: dict[str, float]
+    dev_per_class: dict[str, float]
+    train_t_bucket_loss: dict[str, float]
+    dev_t_bucket_loss: dict[str, float]
+    train_canvas_state_loss: dict[str, float]
+    dev_canvas_state_loss: dict[str, float]
+    train_perspective_loss: dict[str, float]
+    dev_perspective_loss: dict[str, float]
+    lr: float
+    wall_clock_elapsed_seconds: float
+
+
+def interval_boundaries(batches_per_epoch: int, reports: int = INTERVAL_REPORTS_PER_EPOCH) -> list[int]:
+    """Batch indices at which an intra-epoch report fires.
+
+    Returns the 1-indexed batch numbers closest to each ``k / reports`` share of
+    the epoch, for k = 1..reports. The final boundary is always
+    ``batches_per_epoch``, so the last interval report coincides with the epoch
+    end and the per-epoch CSV row.
+
+    Duplicates are removed, which matters only when an epoch has fewer batches
+    than ``reports``: a 4-batch epoch then reports 4 times, not 10, because
+    there is no finer granularity available to report at.
+
+    Args:
+        batches_per_epoch: number of batches the epoch will yield.
+        reports: how many evenly spaced reports to request.
+
+    Returns:
+        Sorted, strictly increasing batch indices in ``[1, batches_per_epoch]``.
+        Empty when the epoch has no batches.
+
+    Called by: TrainingLoop.fit (to schedule reports) and the tests.
+    """
+
+    if batches_per_epoch <= 0 or reports <= 0:
+        return []
+    boundaries = sorted(
+        {math.ceil(batches_per_epoch * index / reports) for index in range(1, reports + 1)}
+    )
+    return [boundary for boundary in boundaries if boundary > 0]
 
 
 class TrainingLoop:
@@ -121,6 +204,7 @@ class TrainingLoop:
         seed: int | None = None,
         metrics_path: str | Path | None = None,
         epoch_metrics_path: str | Path | None = None,
+        interval_metrics_path: str | Path | None = None,
         checkpoint_publisher: Callable[[Path], None] | None = None,
         metrics_publisher: Callable[[Path], None] | None = None,
     ) -> None:
@@ -139,6 +223,15 @@ class TrainingLoop:
         self.epoch_metrics_path = Path(epoch_metrics_path) if epoch_metrics_path is not None else None
         if self.epoch_metrics_path is not None:
             self.epoch_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        # Intra-epoch diagnostic CSV: INTERVAL_REPORTS_PER_EPOCH rows per epoch
+        # instead of one, so loss sub-class trends stay legible even on a run
+        # that only trains for a single epoch. Same append-and-migrate handling
+        # as the epoch CSV.
+        self.interval_metrics_path = (
+            Path(interval_metrics_path) if interval_metrics_path is not None else None
+        )
+        if self.interval_metrics_path is not None:
+            self.interval_metrics_path.parent.mkdir(parents=True, exist_ok=True)
         self.checkpoint_publisher = checkpoint_publisher
         self.metrics_publisher = metrics_publisher
         self.loss_fn = loss_fn or CanvasCrossEntropyLoss(config)
@@ -313,6 +406,23 @@ class TrainingLoop:
             # (a list of per-microbatch means, later simple-averaged).
             epoch_t_bucket_losses: dict[str, list[float]] = {}
             epoch_perspective_losses: dict[str, list[float]] = {}
+            epoch_canvas_state_losses: dict[str, list[float]] = {}
+            # ---- Intra-epoch diagnostic reporting ---------------------------
+            # `interval_*` accumulators mirror the epoch ones but are CLEARED
+            # after every report, so each row covers only the slice of the epoch
+            # since the previous boundary. `interval_cursor` walks `boundaries`;
+            # on a mid-epoch resume it is advanced past the boundaries this epoch
+            # already reported so a resumed epoch does not emit duplicate rows
+            # (with empty accumulators) for slices it already trained through.
+            boundaries = interval_boundaries(batches_per_epoch)
+            interval_cursor = sum(
+                1 for boundary in boundaries if boundary <= self.batches_completed_in_epoch
+            )
+            interval_losses: list[float] = []
+            interval_class_losses: dict[str, list[float]] = {}
+            interval_t_bucket_losses: dict[str, list[float]] = {}
+            interval_perspective_losses: dict[str, list[float]] = {}
+            interval_canvas_state_losses: dict[str, list[float]] = {}
             epoch_cuda_device_memory_used = 0
             epoch_cuda_device_memory_gap = 0
             epoch_cuda_memory_samples = 0
@@ -348,7 +458,7 @@ class TrainingLoop:
                 """
 
                 nonlocal epoch_cuda_device_memory_used, epoch_cuda_device_memory_gap
-                nonlocal epoch_cuda_memory_samples
+                nonlocal epoch_cuda_memory_samples, interval_cursor
                 if self.device.type == "cuda":
                     record["end_evt"].synchronize()
                     compute_seconds = (
@@ -394,9 +504,13 @@ class TrainingLoop:
                 # Epoch loss/per-class/future-distance aggregation over every
                 # microbatch of the step (same values the inline loop appended).
                 for mb in record["microbatches"]:
-                    epoch_losses.append(float(mb["loss"].cpu()))
+                    loss_value = float(mb["loss"].cpu())
+                    epoch_losses.append(loss_value)
+                    interval_losses.append(loss_value)
                     for name, value in mb["per_class"].items():
-                        epoch_class_losses.setdefault(name, []).append(float(value.cpu()))
+                        class_value = float(value.cpu())
+                        epoch_class_losses.setdefault(name, []).append(class_value)
+                        interval_class_losses.setdefault(name, []).append(class_value)
                     for name, value in mb["future_distance"].items():
                         count = mb["future_distance_counts"][name]
                         epoch_future_distance_sums[name] = (
@@ -407,9 +521,17 @@ class TrainingLoop:
                             epoch_future_distance_counts.get(name, 0) + count
                         )
                     for name, value in mb["t_bucket"].items():
-                        epoch_t_bucket_losses.setdefault(name, []).append(float(value.cpu()))
+                        bucket_value = float(value.cpu())
+                        epoch_t_bucket_losses.setdefault(name, []).append(bucket_value)
+                        interval_t_bucket_losses.setdefault(name, []).append(bucket_value)
                     for name, value in mb["perspective"].items():
-                        epoch_perspective_losses.setdefault(name, []).append(float(value.cpu()))
+                        perspective_value = float(value.cpu())
+                        epoch_perspective_losses.setdefault(name, []).append(perspective_value)
+                        interval_perspective_losses.setdefault(name, []).append(perspective_value)
+                    for name, value in mb["canvas_state"].items():
+                        state_value = float(value.cpu())
+                        epoch_canvas_state_losses.setdefault(name, []).append(state_value)
+                        interval_canvas_state_losses.setdefault(name, []).append(state_value)
 
                 tokens_per_second = record["step_tokens"] / step_wall_seconds
                 print(
@@ -447,6 +569,9 @@ class TrainingLoop:
                     perspective_loss={
                         name: float(v.cpu()) for name, v in last["perspective"].items()
                     },
+                    canvas_state_loss={
+                        name: float(v.cpu()) for name, v in last["canvas_state"].items()
+                    },
                     lr=record["lr"],
                     t_mean=float(last["t_mean"].cpu()),
                     noise_fraction=float(last["noise_fraction"].cpu()),
@@ -463,6 +588,92 @@ class TrainingLoop:
                 if retain_logs:
                     logs.append(step_log)
                 self._write_metrics_line(step_log)
+
+                # ---- Intra-epoch diagnostic report --------------------------
+                # A single step can consume several microbatches (gradient
+                # accumulation) and so cross more than one boundary at once. When
+                # that happens we advance the cursor past ALL of them but emit
+                # ONE row, labelled with the last boundary crossed: the slice
+                # since the previous report is a single indivisible set of
+                # microbatches, so splitting it into several rows would mean
+                # emitting rows with no data behind them.
+                crossed = 0
+                while (
+                    interval_cursor + crossed < len(boundaries)
+                    and record["epoch_batch_index"] >= boundaries[interval_cursor + crossed]
+                ):
+                    crossed += 1
+                if crossed:
+                    interval_cursor += crossed
+                    # The dev pass runs with EMA weights over the whole dev
+                    # loader, exactly as epoch-end validation does, so interval
+                    # and epoch dev numbers are directly comparable. It is
+                    # config-gated (train.interval_dev_evaluation) because on a
+                    # small run a full dev pass can cost more than the slice of
+                    # training it follows; when disabled the dev columns stay
+                    # blank here and dev is reported once per epoch in the epoch
+                    # CSV instead.
+                    interval_validation = (
+                        self.validate(val_dataloader, fixed_t=fixed_t)
+                        if val_dataloader is not None
+                        and self.config.train.interval_dev_evaluation
+                        else None
+                    )
+                    self._write_interval_metrics(
+                        IntervalMetrics(
+                            epoch=epoch_index + 1,
+                            interval=interval_cursor,
+                            epoch_fraction=interval_cursor / len(boundaries),
+                            global_step=record["step"],
+                            epoch_batch_index=record["epoch_batch_index"],
+                            batches_in_epoch=batches_per_epoch,
+                            train_loss=sum(interval_losses) / len(interval_losses),
+                            dev_loss=(
+                                interval_validation.loss
+                                if interval_validation is not None
+                                else None
+                            ),
+                            train_per_class=_mean_of_lists(interval_class_losses),
+                            dev_per_class=(
+                                interval_validation.per_class
+                                if interval_validation is not None
+                                else {}
+                            ),
+                            train_t_bucket_loss=_mean_of_lists(interval_t_bucket_losses),
+                            dev_t_bucket_loss=(
+                                interval_validation.t_bucket
+                                if interval_validation is not None
+                                else {}
+                            ),
+                            train_canvas_state_loss=_mean_of_lists(
+                                interval_canvas_state_losses
+                            ),
+                            dev_canvas_state_loss=(
+                                interval_validation.canvas_state
+                                if interval_validation is not None
+                                else {}
+                            ),
+                            train_perspective_loss=_mean_of_lists(
+                                interval_perspective_losses
+                            ),
+                            dev_perspective_loss=(
+                                interval_validation.perspective
+                                if interval_validation is not None
+                                else {}
+                            ),
+                            lr=record["lr"],
+                            wall_clock_elapsed_seconds=(
+                                self.elapsed_wall_seconds
+                                + (time.perf_counter() - fit_started)
+                            ),
+                        )
+                    )
+                    # Scope the NEXT row to the next slice only.
+                    interval_losses.clear()
+                    interval_class_losses.clear()
+                    interval_t_bucket_losses.clear()
+                    interval_perspective_losses.clear()
+                    interval_canvas_state_losses.clear()
 
             while self.global_step < target_steps:
                 iter_top = time.perf_counter()
@@ -539,6 +750,10 @@ class TrainingLoop:
                                 name: value.detach()
                                 for name, value in batch_loss.loss_output.perspective.items()
                             },
+                            "canvas_state": {
+                                name: value.detach()
+                                for name, value in batch_loss.loss_output.canvas_state.items()
+                            },
                             "t_mean": batch_loss.corruption.t.detach().mean(),
                             "noise_fraction": (
                                 batch_loss.corruption.corrupted_positions
@@ -585,6 +800,10 @@ class TrainingLoop:
                 record = {
                     "step": self.global_step,
                     "microbatches": mb_scalars,
+                    # Batch index within the epoch AFTER this step's microbatches
+                    # were consumed. The lagged _finalize uses it to decide which
+                    # intra-epoch report boundaries this step crossed.
+                    "epoch_batch_index": epoch_batch_index,
                     "step_tokens": step_tokens,
                     "data_wait_seconds": data_wait_seconds,
                     "iter_top": iter_top,
@@ -632,10 +851,7 @@ class TrainingLoop:
                 epoch=self.completed_epochs,
                 train_loss=sum(epoch_losses) / len(epoch_losses),
                 dev_loss=epoch_validation.loss if epoch_validation is not None else None,
-                train_per_class={
-                    name: sum(values) / len(values)
-                    for name, values in sorted(epoch_class_losses.items())
-                },
+                train_per_class=_mean_of_lists(epoch_class_losses),
                 dev_per_class=epoch_validation.per_class if epoch_validation is not None else {},
                 average_input_timesteps=epoch_input_timesteps / epoch_examples,
                 average_enemy_future_timesteps=epoch_enemy_future_timesteps / epoch_examples,
@@ -650,19 +866,17 @@ class TrainingLoop:
                 dev_future_distance=(
                     epoch_validation.future_distance if epoch_validation is not None else {}
                 ),
-                train_t_bucket_loss={
-                    name: sum(values) / len(values)
-                    for name, values in sorted(epoch_t_bucket_losses.items())
-                },
+                train_t_bucket_loss=_mean_of_lists(epoch_t_bucket_losses),
                 dev_t_bucket_loss=(
                     epoch_validation.t_bucket if epoch_validation is not None else {}
                 ),
-                train_perspective_loss={
-                    name: sum(values) / len(values)
-                    for name, values in sorted(epoch_perspective_losses.items())
-                },
+                train_perspective_loss=_mean_of_lists(epoch_perspective_losses),
                 dev_perspective_loss=(
                     epoch_validation.perspective if epoch_validation is not None else {}
+                ),
+                train_canvas_state_loss=_mean_of_lists(epoch_canvas_state_losses),
+                dev_canvas_state_loss=(
+                    epoch_validation.canvas_state if epoch_validation is not None else {}
                 ),
                 total_tokens_ingested=self.total_tokens_ingested,
                 total_unique_tokens_seen=len(self.unique_token_ids_seen),
@@ -771,6 +985,11 @@ class TrainingLoop:
                 # loss breakdowns; both are [B] tensors aligned to the batch rows.
                 sampled_t=corruption.t,
                 perspective_ids=batch.perspective_ids,
+                # Token-level inequality between the canvas the model was shown
+                # and the target, which is what separates "already correct, keep
+                # it" positions from "actually corrupted, repair it" positions.
+                # See CANVAS_STATE_NAMES for why this is NOT corrupted_positions.
+                changed_positions=corruption.changed_positions,
             )
             confidence_loss = auxiliary_confidence_loss(canvas_logits.float(), batch.target_canvas, scored_mask)
             weighted_confidence_loss = confidence_loss * self.config.train.confidence_loss_weight
@@ -937,6 +1156,7 @@ class TrainingLoop:
         future_distance: dict[str, float],
         t_bucket_loss: dict[str, float],
         perspective_loss: dict[str, float],
+        canvas_state_loss: dict[str, float],
         lr: float,
         t_mean: float,
         noise_fraction: float,
@@ -963,6 +1183,7 @@ class TrainingLoop:
             future_distance=dict(sorted(future_distance.items())),
             t_bucket_loss=dict(sorted(t_bucket_loss.items())),
             perspective_loss=dict(sorted(perspective_loss.items())),
+            canvas_state_loss=dict(sorted(canvas_state_loss.items())),
             lr=lr,
             t_mean=t_mean,
             noise_fraction=noise_fraction,
@@ -1034,6 +1255,12 @@ class TrainingLoop:
             and self.epoch_metrics_path.exists()
         ):
             self.metrics_publisher(self.epoch_metrics_path)
+        if (
+            self.metrics_publisher is not None
+            and self.interval_metrics_path is not None
+            and self.interval_metrics_path.exists()
+        ):
+            self.metrics_publisher(self.interval_metrics_path)
 
     def _write_epoch_metrics(self, metrics: EpochMetrics) -> None:
         if self.epoch_metrics_path is None:
@@ -1058,6 +1285,8 @@ class TrainingLoop:
             *(f"dev_t_bucket_loss_{name}" for name in T_BUCKET_NAMES),
             *(f"train_perspective_loss_{name}" for name in PERSPECTIVE_NAMES),
             *(f"dev_perspective_loss_{name}" for name in PERSPECTIVE_NAMES),
+            *(f"train_canvas_state_loss_{name}" for name in CANVAS_STATE_NAMES),
+            *(f"dev_canvas_state_loss_{name}" for name in CANVAS_STATE_NAMES),
         ]
         fieldnames += [
                 "average_input_timesteps",
@@ -1108,6 +1337,9 @@ class TrainingLoop:
         for name in PERSPECTIVE_NAMES:
             row[f"train_perspective_loss_{name}"] = metrics.train_perspective_loss.get(name, "")
             row[f"dev_perspective_loss_{name}"] = metrics.dev_perspective_loss.get(name, "")
+        for name in CANVAS_STATE_NAMES:
+            row[f"train_canvas_state_loss_{name}"] = metrics.train_canvas_state_loss.get(name, "")
+            row[f"dev_canvas_state_loss_{name}"] = metrics.dev_canvas_state_loss.get(name, "")
         row["average_input_timesteps"] = metrics.average_input_timesteps
         row["average_enemy_future_timesteps"] = metrics.average_enemy_future_timesteps
         for percentile in ("p50", "p90", "p95"):
@@ -1122,32 +1354,90 @@ class TrainingLoop:
             row[f"dev_enemy_future_loss_distance_{name}"] = (
                 metrics.dev_future_distance.get(name, "")
             )
-        write_header = self._prepare_epoch_metrics_file(fieldnames)
-        with self.epoch_metrics_path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            if write_header:
-                writer.writeheader()
-            writer.writerow(row)
+        _append_csv_row(self.epoch_metrics_path, fieldnames, row)
 
-    def _prepare_epoch_metrics_file(self, fieldnames: list[str]) -> bool:
-        if self.epoch_metrics_path is None:
-            return False
-        if not self.epoch_metrics_path.exists() or self.epoch_metrics_path.stat().st_size == 0:
-            return True
-        with self.epoch_metrics_path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            if reader.fieldnames == fieldnames:
-                return False
-            existing_rows = list(reader)
-        migration_path = self.epoch_metrics_path.with_suffix(
-            f"{self.epoch_metrics_path.suffix}.schema-migration"
+    def _write_interval_metrics(self, metrics: IntervalMetrics) -> None:
+        """Append one intra-epoch diagnostic row to the interval CSV.
+
+        Emits INTERVAL_REPORTS_PER_EPOCH rows per epoch (see that constant for
+        why). Every loss column is scoped to the slice of the epoch since the
+        previous row, so reading a column top-to-bottom shows that sub-class's
+        loss actually moving -- including within a single epoch, which is the
+        case a per-epoch CSV cannot report on at all.
+
+        Columns mirror the epoch CSV's loss columns exactly (same class taxonomy
+        helper, same t-bucket / perspective / canvas-state name tuples), so the
+        two files are directly comparable. No-op when no interval metrics path
+        was configured.
+
+        Args:
+            metrics: the assembled row. Empty breakdown keys become blank cells,
+                matching the epoch CSV's convention.
+
+        Calls: active_class_id_to_name, _metric_class_name, _append_csv_row.
+        """
+
+        if self.interval_metrics_path is None:
+            return
+        active_class_map = active_class_id_to_name(self.config)
+        class_names = [_metric_class_name(name) for name in active_class_map.values()]
+        fieldnames = [
+            "epoch",
+            "interval",
+            "epoch_fraction",
+            "global_step",
+            "epoch_batch_index",
+            "batches_in_epoch",
+            "train_loss",
+            "dev_loss",
+            *(f"train_{name}_loss" for name in class_names),
+            *(f"dev_{name}_loss" for name in class_names),
+            *(f"train_t_bucket_loss_{name}" for name in T_BUCKET_NAMES),
+            *(f"dev_t_bucket_loss_{name}" for name in T_BUCKET_NAMES),
+            *(f"train_canvas_state_loss_{name}" for name in CANVAS_STATE_NAMES),
+            *(f"dev_canvas_state_loss_{name}" for name in CANVAS_STATE_NAMES),
+            *(f"train_perspective_loss_{name}" for name in PERSPECTIVE_NAMES),
+            *(f"dev_perspective_loss_{name}" for name in PERSPECTIVE_NAMES),
+            "lr",
+            "wall_clock_elapsed_seconds",
+        ]
+        row: dict[str, object] = {
+            "epoch": metrics.epoch,
+            "interval": metrics.interval,
+            "epoch_fraction": metrics.epoch_fraction,
+            "global_step": metrics.global_step,
+            "epoch_batch_index": metrics.epoch_batch_index,
+            "batches_in_epoch": metrics.batches_in_epoch,
+            "train_loss": metrics.train_loss,
+            "dev_loss": "" if metrics.dev_loss is None else metrics.dev_loss,
+            "lr": metrics.lr,
+            "wall_clock_elapsed_seconds": metrics.wall_clock_elapsed_seconds,
+        }
+        for source_name in active_class_map.values():
+            name = _metric_class_name(source_name)
+            row[f"train_{name}_loss"] = metrics.train_per_class.get(source_name, "")
+            row[f"dev_{name}_loss"] = metrics.dev_per_class.get(source_name, "")
+        for name in T_BUCKET_NAMES:
+            row[f"train_t_bucket_loss_{name}"] = metrics.train_t_bucket_loss.get(name, "")
+            row[f"dev_t_bucket_loss_{name}"] = metrics.dev_t_bucket_loss.get(name, "")
+        for name in CANVAS_STATE_NAMES:
+            row[f"train_canvas_state_loss_{name}"] = metrics.train_canvas_state_loss.get(name, "")
+            row[f"dev_canvas_state_loss_{name}"] = metrics.dev_canvas_state_loss.get(name, "")
+        for name in PERSPECTIVE_NAMES:
+            row[f"train_perspective_loss_{name}"] = metrics.train_perspective_loss.get(name, "")
+            row[f"dev_perspective_loss_{name}"] = metrics.dev_perspective_loss.get(name, "")
+        _append_csv_row(self.interval_metrics_path, fieldnames, row)
+        print(
+            f"interval_report epoch={metrics.epoch} "
+            f"interval={metrics.interval}/{INTERVAL_REPORTS_PER_EPOCH} "
+            f"step={metrics.global_step} train_loss={metrics.train_loss:.6f} "
+            + (
+                "dev_loss=none"
+                if metrics.dev_loss is None
+                else f"dev_loss={metrics.dev_loss:.6f}"
+            ),
+            flush=True,
         )
-        with migration_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(existing_rows)
-        migration_path.replace(self.epoch_metrics_path)
-        return False
 
     def _record_training_batch_metrics(self, batch: DiffusionBatch) -> int:
         input_tokens = batch.input_token_ids[batch.input_attention_mask]
@@ -1266,6 +1556,8 @@ class TrainingLoop:
         t_bucket_counts: dict[str, int] = {}
         perspective_sums: dict[str, float] = {}
         perspective_counts: dict[str, int] = {}
+        canvas_state_sums: dict[str, float] = {}
+        canvas_state_counts: dict[str, int] = {}
         for batch in dataloader:
             batch_loss = self.compute_batch_loss(batch, fixed_t=fixed_t, model=self.ema_model)
             loss_sum += float(batch_loss.loss.detach().cpu())
@@ -1284,6 +1576,11 @@ class TrainingLoop:
             for name, value in batch_loss.loss_output.perspective.items():
                 perspective_sums[name] = perspective_sums.get(name, 0.0) + float(value.detach().cpu())
                 perspective_counts[name] = perspective_counts.get(name, 0) + 1
+            for name, value in batch_loss.loss_output.canvas_state.items():
+                canvas_state_sums[name] = (
+                    canvas_state_sums.get(name, 0.0) + float(value.detach().cpu())
+                )
+                canvas_state_counts[name] = canvas_state_counts.get(name, 0) + 1
         if was_training:
             self.ema_model.train()
         if loss_count == 0:
@@ -1307,6 +1604,10 @@ class TrainingLoop:
                 name: perspective_sums[name] / perspective_counts[name]
                 for name in sorted(perspective_sums)
             },
+            canvas_state={
+                name: canvas_state_sums[name] / canvas_state_counts[name]
+                for name in sorted(canvas_state_sums)
+            },
         )
 
 
@@ -1329,6 +1630,76 @@ def auxiliary_confidence_loss(
 
 def _metric_class_name(name: str) -> str:
     return name.strip("[]").replace("-", "_").lower()
+
+
+def _append_csv_row(
+    path: Path,
+    fieldnames: list[str],
+    row: dict[str, object],
+) -> None:
+    """Append one row to a metrics CSV, migrating the file if columns changed.
+
+    A run whose CSV was written by an older column schema (e.g. before the
+    canvas-state breakdown existed) would otherwise raise on the first append.
+    Instead the existing rows are rewritten under the CURRENT header -- dropping
+    columns that no longer exist and leaving newly added ones blank -- so a run
+    resumed after a schema change keeps its history in one readable file.
+
+    Args:
+        path: destination CSV; parent directories must already exist.
+        fieldnames: the current column schema, in emission order.
+        row: values keyed by ``fieldnames``; missing keys become blank cells.
+
+    Called by: TrainingLoop._write_epoch_metrics and
+        TrainingLoop._write_interval_metrics.
+    """
+
+    write_header = True
+    if path.exists() and path.stat().st_size > 0:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames == fieldnames:
+                write_header = False
+                existing_rows = None
+            else:
+                existing_rows = list(reader)
+        if existing_rows is not None:
+            # Rewrite the whole file under the new header, then swap it in.
+            migration_path = path.with_suffix(f"{path.suffix}.schema-migration")
+            with migration_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(existing_rows)
+            migration_path.replace(path)
+            write_header = False
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _mean_of_lists(accumulated: dict[str, list[float]]) -> dict[str, float]:
+    """Simple-average each named list of per-microbatch means, key-sorted.
+
+    Used for every loss breakdown that accumulates one mean per microbatch
+    (per-class, t-bucket, perspective, canvas-state). Names that accumulated no
+    values never appear as keys in the input and so are absent from the output,
+    which is the empty-key convention the CSV writers turn into a blank cell.
+
+    Args:
+        accumulated: name -> list of per-microbatch mean losses.
+
+    Returns:
+        name -> mean of that list, iterated in sorted key order so emitted rows
+        are byte-stable.
+    """
+
+    return {
+        name: sum(values) / len(values)
+        for name, values in sorted(accumulated.items())
+        if values
+    }
 
 
 def _timestep_percentiles(values: list[int]) -> dict[str, float]:
@@ -1368,6 +1739,12 @@ def move_batch_to_device(batch: DiffusionBatch, device: torch.device) -> Diffusi
     features = batch.input_features
     moved_features = InputFeatures(
         continuous_values=features.continuous_values.to(device, non_blocking=non_blocking),
+        continuous_validity=features.continuous_validity.to(
+            device, non_blocking=non_blocking
+        ),
+        categorical_values=features.categorical_values.to(
+            device, non_blocking=non_blocking
+        ),
         allegiance_values=features.allegiance_values.to(device, non_blocking=non_blocking),
         feature_mask=features.feature_mask.to(device, non_blocking=non_blocking),
     )

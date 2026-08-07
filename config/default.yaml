@@ -80,6 +80,10 @@ pipeline:
   train_replay_count: 0
   replay_subset_size: 0
   validation_replay_count: 0
+  # Explicit named replay selection (comma-separated replay file stems). Empty
+  # keeps the seeded-shuffle split; see PipelineConfig.train_replay_ids.
+  train_replay_ids: ""
+  dev_replay_ids: ""
   preprocess_if_missing: true
   rebuild_manifest: false
   # Explicit one-shot preprocessing control. Normal train/eval leaves this
@@ -103,6 +107,10 @@ train:
   early_stopping_patience_epochs: 0
   early_stopping_min_relative_improvement: 0.001
   val_interval: 1000
+  # Run a full dev pass at each of the ten per-epoch interval reports. Default
+  # true so a single-epoch run still gets ten dev observations; set false when
+  # the dev pass costs more than the training it interleaves with.
+  interval_dev_evaluation: true
   checkpoint_interval: 1000
   checkpoint_dir: checkpoints
   keep_step_checkpoints: false

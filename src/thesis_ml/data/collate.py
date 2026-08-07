@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from thesis_ml.data.dataset import CLASS_ENEMY_FUTURE, CLASS_PAD, DatasetExample
-from thesis_ml.data.feature_stats import CONTINUOUS_FEATURE_NAMES
+from thesis_ml.data.features import CATEGORICAL_FEATURE_WIDTH, CONTINUOUS_FEATURE_NAMES
 from thesis_ml.model.embedding import InputFeatures, build_input_features
 from thesis_ml.vocab.special_tokens import PAD_ID
 
@@ -78,6 +78,8 @@ class DiffusionBatch:
             canvas_prediction_distances=self.canvas_prediction_distances.pin_memory(),
             input_features=InputFeatures(
                 continuous_values=features.continuous_values.pin_memory(),
+                continuous_validity=features.continuous_validity.pin_memory(),
+                categorical_values=features.categorical_values.pin_memory(),
                 allegiance_values=features.allegiance_values.pin_memory(),
                 feature_mask=features.feature_mask.pin_memory(),
             ),
@@ -143,6 +145,12 @@ def collate_diffusion_examples(
         input_features = InputFeatures(
             continuous_values=torch.zeros(
                 (len(examples), 0, len(CONTINUOUS_FEATURE_NAMES)), dtype=torch.float32
+            ),
+            continuous_validity=torch.zeros(
+                (len(examples), 0, len(CONTINUOUS_FEATURE_NAMES)), dtype=torch.bool
+            ),
+            categorical_values=torch.zeros(
+                (len(examples), 0, CATEGORICAL_FEATURE_WIDTH), dtype=torch.float32
             ),
             allegiance_values=torch.zeros((len(examples), 0, 1), dtype=torch.float32),
             feature_mask=torch.zeros((len(examples), 0), dtype=torch.bool),

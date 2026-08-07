@@ -64,6 +64,7 @@ from thesis_ml.pipeline.train_pipeline import (
     _metrics_publisher,
     _publish_checkpoint,
     _select_eval_examples,
+    _explicit_replay_selection,
     _select_replays,
 )
 from thesis_ml.train.loop import TrainingLoop
@@ -145,19 +146,23 @@ def run_finetune_pipeline(
     replay_paths = _materialize_replay_paths(config, resolver)
     _ensure_window_manifest(replay_paths, config, vocabulary)
 
-    # Identical split + selection logic (same seeds) as pre-training, imported
-    # directly rather than re-implemented, so fine-tuning trains/evaluates on
-    # the SAME 25 train + 3 dev replays that produced the checkpoint we are
-    # warm-starting from.
-    split = split_replays(
-        replay_paths,
-        seed=config.pipeline.split_seed,
-        test_fraction=config.pipeline.test_fraction,
-        dev_fraction=config.pipeline.dev_fraction,
-        train_count=config.pipeline.train_replay_count,
-        dev_count=config.pipeline.validation_replay_count,
-    )
-    train_replays, dev_replays = _select_replays(list(split.train), list(split.dev), config)
+    # Identical split + selection logic (same seeds, same explicit-id override)
+    # as pre-training, imported directly rather than re-implemented, so
+    # fine-tuning trains/evaluates on the SAME replays that produced the
+    # checkpoint we are warm-starting from.
+    explicit = _explicit_replay_selection(replay_paths, config)
+    if explicit is not None:
+        train_replays, dev_replays, _ = explicit
+    else:
+        split = split_replays(
+            replay_paths,
+            seed=config.pipeline.split_seed,
+            test_fraction=config.pipeline.test_fraction,
+            dev_fraction=config.pipeline.dev_fraction,
+            train_count=config.pipeline.train_replay_count,
+            dev_count=config.pipeline.validation_replay_count,
+        )
+        train_replays, dev_replays = _select_replays(list(split.train), list(split.dev), config)
 
     train_windows = load_window_manifest(
         config.data.window_manifest_path, config=config, replay_paths=train_replays
@@ -210,6 +215,9 @@ def run_finetune_pipeline(
     metrics_dir = _local_metrics_dir(config, resolver)
     metrics_path = metrics_dir / "finetune_step_metrics.jsonl"
     epoch_metrics_path = metrics_dir / "finetune_epoch_metrics.csv"
+    # Same ten-reports-per-epoch diagnostics the pre-training pipeline writes,
+    # under the finetune_ prefix so the two pathways never share a file.
+    interval_metrics_path = metrics_dir / "finetune_interval_metrics.csv"
 
     loop = TrainingLoop(
         model=model,
@@ -218,6 +226,7 @@ def run_finetune_pipeline(
         seed=config.pipeline.seed,
         metrics_path=metrics_path,
         epoch_metrics_path=epoch_metrics_path,
+        interval_metrics_path=interval_metrics_path,
         checkpoint_publisher=_checkpoint_publisher(config, resolver),
         metrics_publisher=_metrics_publisher(config, resolver),
     )

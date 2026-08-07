@@ -13,19 +13,28 @@ import numpy as np
 import pandas as pd
 
 from thesis_ml.config import ProjectConfig
-from thesis_ml.data.feature_stats import STAT_KEYS
-from thesis_ml.model.embedding import _numeric_feature, _parse_position
+from thesis_ml.data.features import (
+    CONTINUOUS_FEATURE_NAMES,
+    POSITION_KEY,
+    encode_entity_features,
+    pack_continuous_validity,
+    parse_position,
+)
 from thesis_ml.serialize import parse_entity_columns, parse_upgrades
 from thesis_ml.vocab.content_vocab import ContentVocabulary
 
 
-TOKENIZED_ARTIFACT_VERSION = 1
-MANIFEST_VERSION = 3
+TOKENIZED_ARTIFACT_VERSION = 4
+MANIFEST_VERSION = 6
+# v6 binds the corpus-verified raw buff-ID range through 302. Artifact v4
+# invalidates the earlier PySC2-enum-capped categorical width.
+# v5 binds the sentinel-aware, validity-preserving feature schema. Artifact v3
+# adds packed continuous validity, categorical cloak state, and sparse buff IDs.
 # v3: the pre-training canvas now leads with the win/loss outcome token at
 # position 0 (folded in from the debut task). The window geometry is unchanged,
 # but the target contract is not, so bump the semantics string to force any
 # pre-outcome-token pretraining manifest to be rebuilt rather than silently reused.
-PRETRAIN_TARGET_SEMANTICS = "clamped-fogged-input-plus-outcome-reconstruction-future-v4"
+PRETRAIN_TARGET_SEMANTICS = "clamped-fogged-input-plus-outcome-reconstruction-future-v5"
 DEBUT_TARGET_SEMANTICS = "input-tiled-debut-to-replay-end-or-canvas-budget-v1"
 P1_CODE = 1
 P2_CODE = 2
@@ -71,6 +80,13 @@ class TokenizedReplay:
         self.owners = np.load(self.path / "owners.npy", mmap_mode="r")
         self.kinds = np.load(self.path / "kinds.npy", mmap_mode="r")
         self.features = np.load(self.path / "features.npy", mmap_mode="r")
+        self.feature_validity = np.load(self.path / "feature_validity.npy", mmap_mode="r")
+        self.cloak_states = np.load(self.path / "cloak_states.npy", mmap_mode="r")
+        self.buff_counts = np.load(self.path / "buff_counts.npy", mmap_mode="r")
+        self.buff_timestep_offsets = np.load(
+            self.path / "buff_timestep_offsets.npy", mmap_mode="r"
+        )
+        self.buff_ids = np.load(self.path / "buff_ids.npy", mmap_mode="r")
         self.game_loops = np.load(self.path / "game_loops.npy", mmap_mode="r")
         self.timestamps = np.load(self.path / "timestamps.npy", mmap_mode="r")
         self.metadata = json.loads((self.path / "metadata.json").read_text(encoding="utf-8"))
@@ -130,6 +146,8 @@ def preprocess_replays(
         "manifest_version": MANIFEST_VERSION,
         "tokenized_artifact_version": TOKENIZED_ARTIFACT_VERSION,
         "config_stamp": manifest_config_stamp(config),
+        "replay_source_stamp": replay_source_stamp(replay_paths),
+        "vocabulary_stamp": vocabulary_stamp(vocabulary),
         "target_semantics": _target_semantics(config),
         "sampling_interval_s": config.data.sampling_interval_s,
         "input_budget_tokens": config.data.input_budget_tokens,
@@ -168,7 +186,7 @@ def _preprocess_one_replay(
     replay_path = Path(replay_path_value)
     replay_id = _replay_id(replay_path)
     artifact_path = Path(artifact_root_value) / replay_id
-    if force or not _artifact_is_current(artifact_path, replay_path):
+    if force or not _artifact_is_current(artifact_path, replay_path, vocabulary):
         _write_tokenized_replay(replay_path, artifact_path, config, vocabulary)
     replay = TokenizedReplay(artifact_path)
     entries = build_replay_windows(
@@ -258,6 +276,10 @@ def load_window_manifest(
             f"stale window manifest version: expected {MANIFEST_VERSION}, "
             f"got {metadata.get('manifest_version')!r}; rebuild preprocessing"
         )
+    if metadata.get("tokenized_artifact_version") != TOKENIZED_ARTIFACT_VERSION:
+        raise ValueError(
+            "stale tokenized artifact version recorded by window manifest; rebuild preprocessing"
+        )
     if metadata.get("config_stamp") != expected_stamp:
         raise ValueError(
             "stale window manifest config stamp; budgets, reconstruction fraction, "
@@ -302,6 +324,7 @@ def validate_manifest_budgets(entries: Iterable[WindowManifestEntry], config: Pr
 def manifest_config_stamp(config: ProjectConfig) -> str:
     stamp_fields = {
         "manifest_version": MANIFEST_VERSION,
+        "tokenized_artifact_version": TOKENIZED_ARTIFACT_VERSION,
         "target_semantics": _target_semantics(config),
         "sampling_interval_s": config.data.sampling_interval_s,
         "input_budget_tokens": config.data.input_budget_tokens,
@@ -310,6 +333,29 @@ def manifest_config_stamp(config: ProjectConfig) -> str:
         "within_type_tiebreak": config.data.within_type_tiebreak,
     }
     encoded = json.dumps(stamp_fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def replay_source_stamp(replay_paths: Iterable[str | Path]) -> str:
+    """Fingerprint source identities cheaply enough to check on every run."""
+
+    sources = []
+    for path_value in replay_paths:
+        path = Path(path_value)
+        stat = path.stat()
+        sources.append((_normalized_path(path), stat.st_size, stat.st_mtime_ns))
+    encoded = json.dumps(sorted(sources), separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def vocabulary_stamp(vocabulary: ContentVocabulary) -> str:
+    """Bind persisted token IDs to the vocabulary that wrote them."""
+
+    tokens = [
+        (token.name, token.token_id, token.source_id, token.kind)
+        for token in vocabulary.tokens
+    ]
+    encoded = json.dumps(tokens, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -365,6 +411,11 @@ def _write_tokenized_replay(
     owners: list[int] = []
     kinds: list[int] = []
     features: list[list[float]] = []
+    feature_validity: list[int] = []
+    cloak_states: list[int] = []
+    buff_counts: list[int] = []
+    buff_timestep_offsets = [0]
+    buff_ids: list[int] = []
     game_loops: list[int] = []
     timestamps: list[float] = []
     column_indexes = {name: index for index, name in enumerate(frame.columns)}
@@ -391,13 +442,22 @@ def _write_tokenized_replay(
                 for attribute, column in group.attributes.items()
                 if not pd.isna(row[column_indexes[column]])
             }
-            if not raw:
+            if parse_position(raw.get(POSITION_KEY)) is None:
                 continue
+            encoded = encode_entity_features(raw.get(POSITION_KEY), raw)
             token_ids.append(token_id)
             owners.append(P1_CODE if owner == "p1" else P2_CODE)
             kinds.append(ENTITY_CODE)
-            position = _parse_position(raw.get("pos_(X,Y,Z)")) or (0.0, 0.0, 0.0)
-            features.append([position[0], position[1], *(_numeric_feature(raw.get(key)) for key in STAT_KEYS)])
+            features.append(list(encoded.continuous_values))
+            feature_validity.append(pack_continuous_validity(encoded.continuous_validity))
+            cloak_states.append(255 if encoded.cloak_state is None else encoded.cloak_state)
+            if encoded.buff_ids is None:
+                buff_counts.append(255)
+            else:
+                if len(encoded.buff_ids) >= 255:
+                    raise ValueError("one entity token cannot carry 255 or more buff IDs")
+                buff_counts.append(len(encoded.buff_ids))
+                buff_ids.extend(encoded.buff_ids)
 
         upgrades: list[tuple[int, str, int]] = []
         for owner, column_index in upgrade_indexes.items():
@@ -410,8 +470,12 @@ def _write_tokenized_replay(
             token_ids.append(vocabulary.token_id_for(upgrade))
             owners.append(owner_code)
             kinds.append(UPGRADE_CODE)
-            features.append([0.0] * (2 + len(STAT_KEYS)))
+            features.append([0.0] * len(CONTINUOUS_FEATURE_NAMES))
+            feature_validity.append(0)
+            cloak_states.append(255)
+            buff_counts.append(255)
         offsets.append(len(token_ids))
+        buff_timestep_offsets.append(len(buff_ids))
         game_loops.append(int(row[column_indexes["game_loop"]]))
         timestamp_index = column_indexes.get("timestamp_seconds")
         timestamp = row[timestamp_index] if timestamp_index is not None else None
@@ -424,8 +488,16 @@ def _write_tokenized_replay(
     np.save(artifact_path / "kinds.npy", np.asarray(kinds, dtype=np.uint8))
     np.save(
         artifact_path / "features.npy",
-        np.asarray(features, dtype=np.float32).reshape((-1, 2 + len(STAT_KEYS))),
+        np.asarray(features, dtype=np.float32).reshape((-1, len(CONTINUOUS_FEATURE_NAMES))),
     )
+    np.save(artifact_path / "feature_validity.npy", np.asarray(feature_validity, dtype=np.uint32))
+    np.save(artifact_path / "cloak_states.npy", np.asarray(cloak_states, dtype=np.uint8))
+    np.save(artifact_path / "buff_counts.npy", np.asarray(buff_counts, dtype=np.uint8))
+    np.save(
+        artifact_path / "buff_timestep_offsets.npy",
+        np.asarray(buff_timestep_offsets, dtype=np.int64),
+    )
+    np.save(artifact_path / "buff_ids.npy", np.asarray(buff_ids, dtype=np.uint16))
     np.save(artifact_path / "game_loops.npy", np.asarray(game_loops, dtype=np.int64))
     np.save(artifact_path / "timestamps.npy", np.asarray(timestamps, dtype=np.float64))
     stat = replay_path.stat()
@@ -434,13 +506,18 @@ def _write_tokenized_replay(
         "source_path": str(replay_path),
         "source_size": stat.st_size,
         "source_mtime_ns": stat.st_mtime_ns,
+        "vocabulary_stamp": vocabulary_stamp(vocabulary),
         "timestep_count": len(frame),
         "token_count": len(token_ids),
     }
     (artifact_path / "metadata.json").write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
 
 
-def _artifact_is_current(artifact_path: Path, replay_path: Path) -> bool:
+def _artifact_is_current(
+    artifact_path: Path,
+    replay_path: Path,
+    vocabulary: ContentVocabulary,
+) -> bool:
     metadata_path = artifact_path / "metadata.json"
     if not metadata_path.exists():
         return False
@@ -449,11 +526,25 @@ def _artifact_is_current(artifact_path: Path, replay_path: Path) -> bool:
     except (OSError, json.JSONDecodeError):
         return False
     stat = replay_path.stat()
-    required = ("offsets.npy", "token_ids.npy", "owners.npy", "kinds.npy", "features.npy")
+    required = (
+        "offsets.npy",
+        "token_ids.npy",
+        "owners.npy",
+        "kinds.npy",
+        "features.npy",
+        "feature_validity.npy",
+        "cloak_states.npy",
+        "buff_counts.npy",
+        "buff_timestep_offsets.npy",
+        "buff_ids.npy",
+        "game_loops.npy",
+        "timestamps.npy",
+    )
     return (
         metadata.get("artifact_version") == TOKENIZED_ARTIFACT_VERSION
         and metadata.get("source_size") == stat.st_size
         and metadata.get("source_mtime_ns") == stat.st_mtime_ns
+        and metadata.get("vocabulary_stamp") == vocabulary_stamp(vocabulary)
         and all((artifact_path / name).exists() for name in required)
     )
 

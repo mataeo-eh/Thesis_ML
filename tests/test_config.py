@@ -119,14 +119,35 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     overfit = load_config(root / "configs" / "local_overfit.yaml")
     overfit_v2 = load_config(root / "configs" / "local_overfit_v2.yaml")
     full = load_config(root / "configs" / "local_full.yaml")
-    assert overfit.pipeline.replay_subset_size == 25
-    assert overfit.pipeline.validation_replay_count == 3
+    # The overfit profile names its replays explicitly (10 train + 3 dev chosen
+    # at the corpus median token count) instead of drawing a seeded subset, so
+    # the seeded-subset knobs must be OFF -- leaving either non-zero would mean
+    # two selection mechanisms fighting over the same run.
+    assert overfit.pipeline.replay_subset_size == 0
+    assert overfit.pipeline.validation_replay_count == 0
+    assert len(overfit.pipeline.train_replay_ids.split(",")) == 10
+    assert len(overfit.pipeline.dev_replay_ids.split(",")) == 3
+    # Feature statistics are keyed to that exact train list, so this profile
+    # rebuilds them rather than loading a stale frozen artifact.
+    assert overfit.pipeline.prepare_feature_statistics is True
     assert overfit.pipeline.batch_size == 10
     assert overfit.pipeline.num_workers == 4
     assert overfit.pipeline.prefetch_factor == 4
     assert overfit.pipeline.persistent_workers is True
-    assert overfit.train.epochs == 200
-    assert overfit.train.early_stopping_patience_epochs == 5
+    assert overfit.train.epochs == 30
+    # Overfitting is the point; early stopping must never cut the run short.
+    assert overfit.train.early_stopping_patience_epochs == 0
+    # 34 steps/epoch x 30 epochs = 1020 steps. Warmup must stay far below that
+    # or the run ends while still ramping and never trains at the configured lr.
+    assert overfit.train.warmup == 40
+    assert overfit.train.warmup < 34 * overfit.train.epochs
+    # This profile evaluates dev once per epoch, not at each of the ten interval
+    # reports: a dev pass costs more than the training slice it follows here.
+    # The DEFAULT stays true, for runs that converge in a single epoch.
+    assert overfit.train.interval_dev_evaluation is False
+    assert overfit_v2.train.interval_dev_evaluation is False
+    assert load_config(DEFAULT_CONFIG).train.interval_dev_evaluation is True
+    assert full.train.interval_dev_evaluation is True
     # overfit / overfit_v2 are PRE-TRAINING profiles (data.debut_mode=false,
     # inherited from config/default.yaml): class_loss_weights is a
     # fine-tuning-only section and must be None here, not populated.
@@ -134,8 +155,11 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert overfit.fog is not None
     assert overfit.train.max_cuda_reserved_gb == 7.5
     assert overfit.model.gradient_checkpointing is True
-    assert overfit_v2.train.epochs == 200
+    assert overfit_v2.train.epochs == 30
     assert overfit_v2.train.early_stopping_patience_epochs == 0
+    # V2 inherits the explicit selection unchanged; only output paths differ.
+    assert overfit_v2.pipeline.train_replay_ids == overfit.pipeline.train_replay_ids
+    assert overfit_v2.pipeline.dev_replay_ids == overfit.pipeline.dev_replay_ids
     assert overfit_v2.loss.class_loss_weights is None
     assert overfit_v2.fog is not None
     assert overfit_v2.storage.checkpoint_uri == "checkpoints/local-overfitV2"

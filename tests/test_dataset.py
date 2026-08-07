@@ -13,6 +13,7 @@ from thesis_ml.config import (
     load_config,
 )
 from thesis_ml.data.collate import collate_diffusion_examples
+from thesis_ml.data.features import CONTINUOUS_FEATURE_NAMES
 from thesis_ml.data.dataset import (
     CLASS_CONTENT,
     CLASS_DELIMITER,
@@ -35,7 +36,6 @@ from thesis_ml.data.windowing import (
     load_window_manifest,
     preprocess_replays,
 )
-from thesis_ml.model.embedding import STAT_KEYS
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.serialize import serialize_snapshot
 from thesis_ml.vocab.content_vocab import load_content_vocabulary
@@ -459,7 +459,14 @@ class _FakeReplayWithEnemyUpgrade:
         self.owners = np.asarray(owners, dtype=np.uint8)
         self.kinds = np.asarray(kinds, dtype=np.uint8)
         self.offsets = np.asarray([0, 3, 6], dtype=np.int64)
-        self.features = np.zeros((len(token_ids), 2 + len(STAT_KEYS)), dtype=np.float32)
+        self.features = np.zeros(
+            (len(token_ids), len(CONTINUOUS_FEATURE_NAMES)), dtype=np.float32
+        )
+        self.feature_validity = np.zeros(len(token_ids), dtype=np.uint32)
+        self.cloak_states = np.full(len(token_ids), 255, dtype=np.uint8)
+        self.buff_counts = np.full(len(token_ids), 255, dtype=np.uint8)
+        self.buff_timestep_offsets = np.zeros(3, dtype=np.int64)
+        self.buff_ids = np.asarray([], dtype=np.uint16)
         self.game_loops = np.asarray([0, 1], dtype=np.int64)
         self.timestamps = np.asarray([0.0, 1.0], dtype=np.float64)
 

@@ -2,10 +2,12 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from thesis_ml.config import load_config
 from thesis_ml.serialize import (
     deserialize_counts,
+    parse_entity_columns,
     parse_upgrades,
     records_to_plain,
     serialize_snapshot,
@@ -107,3 +109,46 @@ def test_upgrade_parser_accepts_current_and_legacy_storage_shapes() -> None:
     assert parse_upgrades("['Stimpack']") == ("stimpack",)
     assert parse_upgrades({"Stimpack": True, "CombatShield": False}) == ("stimpack",)
     assert parse_upgrades(float("nan")) == ()
+
+
+def test_entity_column_parser_accepts_instance_ids_wider_than_three_digits() -> None:
+    groups = parse_entity_columns(
+        [
+            "p1_chito_zergling_999_health",
+            "p1_chito_zergling_1000_health",
+            "p1_chito_zergling_1664_pos_(X,Y,Z)",
+        ]
+    )
+
+    assert sorted((group.entity_type, int(group.instance_id)) for group in groups) == [
+        ("zergling", 999),
+        ("zergling", 1000),
+        ("zergling", 1664),
+    ]
+
+
+@pytest.mark.parametrize(
+    "position_sentinel",
+    ["building_started", "completed", "destroyed", "cancelled", "future_sentinel"],
+)
+def test_non_position_sentinels_do_not_create_entity_tokens(position_sentinel: str) -> None:
+    config = load_config(CONFIG)
+    vocab = load_content_vocabulary(TOKEN_DICTIONARY)
+    snapshot = pd.Series(
+        {
+            "game_loop": 10,
+            "timestamp_seconds": 1.0,
+            "p1_bot_scv_001_pos_(X,Y,Z)": position_sentinel,
+            "p1_bot_scv_001_health": position_sentinel,
+            "p1_bot_marine_001_pos_(X,Y,Z)": "(0.0, 0.0, 8.0)",
+            "p1_bot_marine_001_health": "inside bunker",
+        }
+    )
+
+    records = serialize_snapshot(snapshot, config, vocab, perspective_player="p1")
+    entities = [record for record in records if record.token_kind == "entity"]
+
+    assert [record.token_name for record in entities] == ["marine"]
+    assert entities[0].raw_position == "(0.0, 0.0, 8.0)"
+    assert entities[0].raw_attributes["health"] == "inside bunker"
+    assert snapshot_content_counts(snapshot) == {"marine": 1}

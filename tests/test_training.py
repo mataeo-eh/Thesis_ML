@@ -30,7 +30,12 @@ from thesis_ml.data.dataset import (
 )
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.train.corruption import corrupt_batch, inverse_t_weights
-from thesis_ml.train.loop import TrainingLoop, auxiliary_confidence_loss
+from thesis_ml.train.loop import (
+    INTERVAL_REPORTS_PER_EPOCH,
+    TrainingLoop,
+    auxiliary_confidence_loss,
+    interval_boundaries,
+)
 from thesis_ml.train.train import _synthetic_input_records, make_synthetic_examples, run_smoke_train
 from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID, WIN_ID
 
@@ -488,13 +493,22 @@ def test_epoch_metrics_csv_contains_train_dev_classes_and_throughput(tmp_path: P
     assert "enemy_future_timestep_p50" in fieldnames
     assert "train_enemy_future_loss_distance_1" in fieldnames
     assert "dev_enemy_future_loss_distance_1" in fieldnames
-    # t-bucket / perspective breakdown columns (Worker 3): with fixed_t=1.0
-    # every example lands in the exact-t==1 bucket; the other four bucket
-    # columns exist but are written as "" (the empty-bucket convention).
+    # t-bucket / perspective breakdown columns: with fixed_t=1.0 every example
+    # lands in the exact-t==1 bucket; the other three bucket columns exist but
+    # are written as "" (the empty-bucket convention).
     assert all(float(row["train_t_bucket_loss_t_eq_1"]) > 0 for row in rows)
     assert all(float(row["dev_t_bucket_loss_t_eq_1"]) > 0 for row in rows)
-    assert all(row["train_t_bucket_loss_t_0_7_to_1_0"] == "" for row in rows)
-    assert all(row["train_t_bucket_loss_t_0_0_to_0_3"] == "" for row in rows)
+    assert all(row["train_t_bucket_loss_t_0_75_to_1_0"] == "" for row in rows)
+    assert all(row["train_t_bucket_loss_t_0_0_to_0_25"] == "" for row in rows)
+    # Canvas-state columns. At fixed_t=1.0 every position takes the corruption
+    # branch, but uniform diffusion re-draws replacements from the whole
+    # vocabulary, so a few positions land back on their own target token and the
+    # preserved bucket is NOT guaranteed to be populated. The noised bucket
+    # always is, and both columns must exist either way.
+    assert "train_canvas_state_loss_ground_truth_preserved" in fieldnames
+    assert "dev_canvas_state_loss_ground_truth_preserved" in fieldnames
+    assert all(float(row["train_canvas_state_loss_noised"]) > 0 for row in rows)
+    assert all(float(row["dev_canvas_state_loss_noised"]) > 0 for row in rows)
     # The fixtures alternate p1/p2 perspectives, so both perspective columns
     # are populated in train and dev.
     assert all(float(row["train_perspective_loss_p1"]) > 0 for row in rows)
@@ -510,6 +524,163 @@ def test_epoch_metrics_csv_contains_train_dev_classes_and_throughput(tmp_path: P
     assert "dev_pad_loss" in fieldnames
     assert "train_enemy_fogged_loss" in fieldnames
     assert "train_enemy_future_loss" in fieldnames
+
+
+def test_interval_boundaries_are_evenly_spaced_and_end_on_the_epoch(tmp_path: Path) -> None:
+    """Report boundaries tile the epoch and always close on its final batch.
+
+    The last boundary MUST equal batches_per_epoch so the tenth interval row and
+    the epoch row cover the same point in training and can be read together. An
+    epoch with fewer batches than reports simply reports once per batch rather
+    than emitting duplicate boundaries.
+    """
+
+    assert interval_boundaries(34) == [4, 7, 11, 14, 17, 21, 24, 28, 31, 34]
+    assert interval_boundaries(100) == [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    # Fewer batches than reports: one boundary per batch, no duplicates.
+    assert interval_boundaries(4) == [1, 2, 3, 4]
+    assert interval_boundaries(1) == [1]
+    # Degenerate inputs produce no reports rather than raising.
+    assert interval_boundaries(0) == []
+    for batches in (1, 3, 7, 34, 101, 999):
+        boundaries = interval_boundaries(batches)
+        assert boundaries[-1] == batches
+        assert boundaries == sorted(set(boundaries))
+        assert len(boundaries) <= INTERVAL_REPORTS_PER_EPOCH
+
+
+def test_interval_metrics_csv_reports_ten_times_per_epoch_with_train_and_dev(
+    tmp_path: Path,
+) -> None:
+    """The intra-epoch CSV carries every loss sub-class, for train AND dev.
+
+    Ten batches per epoch means one report per batch boundary, so two epochs
+    produce 2 x 10 rows. Each row must carry a dev value too, because the dev
+    pass is what makes these rows comparable across a run that only trains for a
+    single epoch.
+    """
+
+    config = _small_config(tmp_path)
+    examples = make_synthetic_examples(config, count=24)
+    train_loader = DataLoader(examples[:20], batch_size=2, collate_fn=_collate_pretrain)
+    dev_loader = DataLoader(examples[20:], batch_size=2, collate_fn=_collate_pretrain)
+    csv_path = tmp_path / "interval_metrics.csv"
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(
+        model=model, config=config, seed=73, interval_metrics_path=csv_path
+    )
+
+    loop.fit(train_loader, val_dataloader=dev_loader, max_steps=20, epochs=2, fixed_t=1.0)
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = set(reader.fieldnames or [])
+        rows = list(reader)
+
+    assert len(rows) == 2 * INTERVAL_REPORTS_PER_EPOCH
+    assert [int(row["epoch"]) for row in rows] == [1] * 10 + [2] * 10
+    assert [int(row["interval"]) for row in rows[:10]] == list(range(1, 11))
+    # epoch_fraction walks 0.1 -> 1.0 within each epoch.
+    assert float(rows[0]["epoch_fraction"]) == pytest.approx(0.1)
+    assert float(rows[9]["epoch_fraction"]) == pytest.approx(1.0)
+    # global_step advances monotonically across rows.
+    steps = [int(row["global_step"]) for row in rows]
+    assert steps == sorted(steps)
+    assert all(float(row["train_loss"]) > 0 for row in rows)
+    assert all(float(row["dev_loss"]) > 0 for row in rows)
+
+    # Every diagnostic the overfit run is meant to surface has a column here,
+    # for both splits.
+    for split in ("train", "dev"):
+        for name in ("pad", "delimiter", "end", "win_loss", "enemy_observed",
+                     "enemy_fogged", "enemy_future"):
+            assert f"{split}_{name}_loss" in fieldnames
+        for name in ("t_eq_1", "t_0_75_to_1_0", "t_0_25_to_0_75", "t_0_0_to_0_25"):
+            assert f"{split}_t_bucket_loss_{name}" in fieldnames
+        for name in ("ground_truth_preserved", "noised"):
+            assert f"{split}_canvas_state_loss_{name}" in fieldnames
+
+
+def test_interval_rows_are_scoped_to_their_slice_not_the_epoch_so_far(
+    tmp_path: Path,
+) -> None:
+    """Each row averages only its own slice, so rows are independent samples.
+
+    If rows accumulated across the whole epoch instead, later rows would be
+    dominated by earlier batches and the column would flatten out -- exactly the
+    trend-hiding behavior these rows exist to avoid. Proven by giving the loop a
+    dataset whose two halves differ and checking the rows differ too.
+    """
+
+    config = _small_config(tmp_path)
+    examples = make_synthetic_examples(config, count=12)
+    train_loader = DataLoader(examples[:10], batch_size=1, collate_fn=_collate_pretrain)
+    csv_path = tmp_path / "interval_metrics.csv"
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(
+        model=model, config=config, seed=74, interval_metrics_path=csv_path
+    )
+
+    loop.fit(train_loader, max_steps=10, epochs=1, fixed_t=1.0)
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == INTERVAL_REPORTS_PER_EPOCH
+    # 10 batches / 10 reports = one batch per row, so each row's train_loss is
+    # exactly that batch's loss. A running average would instead force the
+    # values to converge; assert they stay distinct.
+    losses = [float(row["train_loss"]) for row in rows]
+    assert len(set(losses)) > 1
+    # No dev loader configured -> the dev column is blank, never fabricated.
+    assert all(row["dev_loss"] == "" for row in rows)
+
+
+def test_interval_dev_evaluation_can_be_disabled_without_losing_train_rows(
+    tmp_path: Path,
+) -> None:
+    """`train.interval_dev_evaluation: false` drops only the interval dev pass.
+
+    The train-side breakdown must still be reported ten times per epoch -- that
+    is the part a run keeps regardless of cost. Only the dev columns go blank,
+    with dev instead reported once per epoch in the epoch CSV.
+    """
+
+    config = _small_config(tmp_path)
+    config = replace(config, train=replace(config.train, interval_dev_evaluation=False))
+    examples = make_synthetic_examples(config, count=24)
+    train_loader = DataLoader(examples[:20], batch_size=2, collate_fn=_collate_pretrain)
+    dev_loader = DataLoader(examples[20:], batch_size=2, collate_fn=_collate_pretrain)
+    interval_path = tmp_path / "interval_metrics.csv"
+    epoch_path = tmp_path / "epoch_metrics.csv"
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(
+        model=model,
+        config=config,
+        seed=76,
+        interval_metrics_path=interval_path,
+        epoch_metrics_path=epoch_path,
+    )
+
+    loop.fit(train_loader, val_dataloader=dev_loader, max_steps=10, epochs=1, fixed_t=1.0)
+
+    with interval_path.open(newline="", encoding="utf-8") as handle:
+        interval_rows = list(csv.DictReader(handle))
+    # Still ten rows, still fully populated on the train side.
+    assert len(interval_rows) == INTERVAL_REPORTS_PER_EPOCH
+    assert all(float(row["train_loss"]) > 0 for row in interval_rows)
+    assert all(float(row["train_pad_loss"]) > 0 for row in interval_rows)
+    assert all(float(row["train_canvas_state_loss_noised"]) > 0 for row in interval_rows)
+    # Dev columns blank despite a dev loader being configured.
+    assert all(row["dev_loss"] == "" for row in interval_rows)
+    assert all(row["dev_pad_loss"] == "" for row in interval_rows)
+
+    # Dev is not lost -- it is reported once, at the epoch end.
+    with epoch_path.open(newline="", encoding="utf-8") as handle:
+        epoch_rows = list(csv.DictReader(handle))
+    assert len(epoch_rows) == 1
+    assert float(epoch_rows[0]["dev_loss"]) > 0
+    assert float(epoch_rows[0]["dev_pad_loss"]) > 0
 
 
 def test_epoch_metrics_migrates_an_existing_narrower_schema(tmp_path: Path) -> None:
@@ -564,13 +735,17 @@ def test_pretraining_epoch_metrics_has_all_seven_classes_including_winloss(tmp_p
         )
     }
     present_class_columns = {name for name in fieldnames if name.endswith("_loss") and name not in {"train_loss", "dev_loss"}}
-    # Exclude the t-bucket / perspective breakdown columns, which also end in a
-    # bucket name but use the distinct "t_bucket_loss_"/"perspective_loss_"
-    # naming scheme (they are not per-class columns).
+    # Exclude the t-bucket / perspective / canvas-state breakdown columns, which
+    # also end in a bucket name but use distinct "t_bucket_loss_",
+    # "perspective_loss_", and "canvas_state_loss_" naming schemes (they are not
+    # per-class columns).
     present_class_columns = {
         name
         for name in present_class_columns
-        if "t_bucket_loss" not in name and "perspective_loss" not in name
+        if not any(
+            marker in name
+            for marker in ("t_bucket_loss", "perspective_loss", "canvas_state_loss")
+        )
     }
     assert present_class_columns == expected_class_columns
     assert "train_win_loss_loss" in fieldnames

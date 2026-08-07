@@ -6,6 +6,7 @@
 
 ## Ownership
 
+- `Model_Architecture/` owns the exact current implementation/configuration reference for every learnable component and model-facing pipeline stage, plus the reusable update prompt that keeps the reference synchronized with source.
 - `src/thesis_ml/data/windowing.py` owns tokenized replay artifacts and timestep-aligned window manifests.
 - `src/thesis_ml/data/dataset.py` owns lazy per-window example construction and per-serving fog for both training modes.
 - `src/thesis_ml/data/feature_stats.py` owns train-split-only normalization statistics, deterministic artifact identity, and strict loading.
@@ -18,6 +19,7 @@
 ## Local Contracts
 
 - Read the root `AGENTS.md`, this file, `CLAUDE.md`, and the current task-specific prompt before editing.
+- Any change to model-facing data, vocabulary, features, sequence grammar, configuration, learnable modules, parameterization, corruption/loss, optimization/EMA, checkpoint compatibility, or sampling must update every affected section in `Model_Architecture/MODEL_ARCHITECTURE.md`, update `MODEL_ARCHITECTURE_DIAGRAM.mmd`, and regenerate its SVG/PNG in the same change. Use `Model_Architecture/UPDATE_PROMPT.md`, recompute derived values from live source, and remove superseded text; Git owns historical versions.
 - Run Python only through `.venv\Scripts\python.exe` after confirming the venv exists.
 - PyTorch is pinned through uv to the explicit official `pytorch-cu130` index. Preserve the `tool.uv.sources` mapping and regenerate `uv.lock` with uv when changing Torch.
 - Local replay data is consumed at its native one-second cadence. Timing recovery must use the same configured cadence.
@@ -26,22 +28,26 @@
 - Each batch row contains exactly one replay window. Do not pack sequences or add document masks.
 - Fog is sampled while serving every example. Persisted artifacts and manifests must remain clean.
 - Both training modes serve a clamped input region with per-timestep `[self records][fog-filtered enemy records][ONE DELIMITER]`. Input fog and canvas diffusion are independent. Canvas corruption samples one `t` per example; default uniform diffusion independently replaces positions with uniformly drawn non-`[MASK]` states at probability `t`, while the config-selected absorbing ablation replaces them with `[MASK]`. Intentional exact-`t=1` oversampling defaults to zero.
-- Static conditioning is learned jointly with token identity from allowlisted standardized `(map_x, map_y, unit stats)` values plus numeric allegiance. Statistics are computed only from selected training replays, persisted with a content identity, and must match resumes, warm starts, diagnostics, exports, and sampling checkpoints.
+- Static conditioning is learned jointly with token identity from allowlisted standardized continuous values, explicit continuous-validity bits, categorical cloak/buff values, and numeric allegiance. Statistics use valid observations only, are computed from selected training replays, persisted with a content identity, and must match resumes, warm starts, diagnostics, exports, and sampling checkpoints.
 - Pretraining and fine-tuning both expand every replay into exactly two perspective-specific sample streams: `p1` as self/`p2` as enemy and `p2` as self/`p1` as enemy. Replay splitting happens before this expansion so both perspectives remain in the same train/dev/test split.
 - Batch padding is dynamic. Padding masks must exclude batch-shape padding from attention and loss.
 - CUDA attention prefers fused Flash SDPA and falls back only to memory-efficient SDPA with a broadcast boolean key mask; math fallback is forbidden.
 - The overfit profile fails when CUDA reserved memory reaches its configured ceiling and logs timing, throughput, PyTorch allocator memory, device-wide VRAM use, and the device-minus-reserved gap every step.
 - The overfit profile enables config-gated block activation checkpointing because full-size fused-attention training was measured above the VRAM ceiling; other profiles retain the default-off path.
 - The overfit profile uses batch size 10, validated for 20 real-data steps at 5.885 GiB peak reserved memory on the RTX 3070.
-- The V1 overfit profile remains the baseline. V2 weights `[PAD]` loss at 0.2, disables early stopping, and runs the full 200-epoch cosine schedule unless manually stopped.
+- The overfit profiles train on an explicitly named 10-train/3-dev replay subset selected at the corpus median input-token count, for 30 epochs with early stopping disabled. Named selection (`pipeline.train_replay_ids`/`dev_replay_ids`) replaces the seeded split entirely; every unnamed replay becomes test.
 - The local-full pretraining run uses an exact 870-train/50-dev/remainder-test replay split and full reconstruction/future targets with perspective-relative `[WIN]`/`[LOSS]` at canvas index 0. Sampling has no outcome-last or other position-dependent constraint.
 - The local-full run keeps workers persistent, trims unused CUDA cache after completed epochs, does not retain ignored step-log objects, and records current allocation, peak allocation, reservation, inactive-split allocator telemetry, device-wide memory use, and the device-minus-reserved gap.
 - The overfit loader uses four persistent workers with four batches prefetched per worker; training batches drop raw metadata after worker-side feature construction, pin their custom batch tensors, and use non-blocking CUDA copies.
 - Model scale, token budgets, paths, subset selection, epochs, and checkpoint intervals remain config-owned.
-- Local runs write epoch CSV metrics and replay selections under their configured `tests/output/<run_name>/` log directory. In both modes, epoch metrics include mean and p50/p90/p95 input/future timestep counts, future-token loss bucketed at 1, 2-5, 6-10, 11-30, and 31+ prediction timesteps, cumulative attention-valid training tokens, cumulative distinct token IDs, average device-wide VRAM use, and average device-minus-PyTorch-reserved gap; batch-shape padding is excluded.
+- Local runs write epoch CSV metrics, ten-per-epoch interval CSV metrics, and replay selections under their configured `tests/output/<run_name>/` log directory. In both modes, epoch metrics include mean and p50/p90/p95 input/future timestep counts, future-token loss bucketed at 1, 2-5, 6-10, 11-30, and 31+ prediction timesteps, cumulative attention-valid training tokens, cumulative distinct token IDs, average device-wide VRAM use, and average device-minus-PyTorch-reserved gap; batch-shape padding is excluded.
+- Canvas loss reports five read-only decompositions in both pipelines: seven per-class losses, four corruption buckets (`t_eq_1`, `[0.75,1)`, `[0.25,0.75)`, `[0,0.25)`), a ground-truth-preserved vs noised split keyed on token inequality rather than the corruption flag, p1/p2 perspective, and future-distance buckets. `interval_metrics.csv` emits all of them ten times per epoch, each row scoped to its own slice; `epoch_metrics.csv` emits the same loss columns once per epoch. `train.interval_dev_evaluation` gates the interval dev pass and defaults to true; when false the interval rows keep every train column and leave the dev columns blank, and dev is reported only per epoch. The overfit profiles set it false.
 - Debut-mode full training also writes the same `finetune_report.json` metric schema as the overfitV2 fine-tune, using the true held-out test split.
 - Epoch patience compares noisy resampled train loss against the best loss using the configured relative minimum improvement; a single flat epoch never stops a run.
 - Absolute time and frame-derived values remain metadata only and must not enter model features.
+- Entity instance IDs are variable-width digit strings used only for deterministic ordering. Slash-form current/maximum unit stats are encoded as current/max fractions before train-split standardization.
+- Entity presence requires a finite `pos_(X,Y,Z)` tuple; lifecycle/non-position sentinels are treated as null and emit no entity token, while valid `(0,0,Z)` positions remain present. Individual nonnumeric feature sentinels are missing, never coerced into valid numeric zero.
+- Tokenized artifacts and manifests are versioned and bound to source-file and vocabulary identities. Source or vocabulary drift must force preprocessing instead of silently reusing stale arrays.
 - `thesis_ml.viz.diagnostics` always writes high-contrast, aligned ground-truth/prediction/error count figures. `--n-windows` is interpreted per selected replay. First-appearance timelines require `--first-appearance`; comparison CSV, input text, and final-canvas top-10 logit JSON exports consolidate multiple windows into one labelled artifact per export type and output-noise directory.
 - `thesis_ml.viz.diagnostics --bypass-sampler` keeps those outputs unchanged while replacing iterative sampling with exactly one denoising forward pass from the selected process's terminal prior (uniform random non-`[MASK]` canvas by default; all-`[MASK]` only for the absorbing ablation).
 - Uniform diffusion, dense GeGLU/sandwich-RMSNorm architecture, and process-stamped checkpoints form one compatibility boundary. Loaders must reject retired checkpoints before partial loading; repository-local retired checkpoints are removed only after the migration and verification complete.
@@ -49,6 +55,7 @@
 ## Work Guidance
 
 - Extend the existing serializer, model, loss, and training loop instead of creating parallel implementations.
+- Treat `Model_Architecture/MODEL_ARCHITECTURE.md` as the exact implemented-state companion to normative `SPEC.md`. Resolve conflicts among source, merged config, `SPEC.md`, and the architecture reference in the same task.
 - Keep preprocessing incremental and bounded to one replay per worker; memory-map persisted arrays during training.
 - Split train/dev/test by replay before selecting local subsets to prevent window leakage.
 - Preserve the full pretraining target grammar: leading perspective-relative `[WIN]`/`[LOSS]`, bounded in-window reconstruction, whole-timestep future continuation, then `[END] [PAD]*` for game end or direct `[PAD]*` for a boundary-truncated horizon.
@@ -63,6 +70,7 @@
 
 ## Child DOX Index
 
+- `Model_Architecture/AGENTS.md`: Exact current model reference, canonical Mermaid source, rendered SVG/PNG visual, deterministic renderer, source/impact map, freshness contract, and reusable GPT-5.6-sol update prompt.
 - `src/thesis_ml/AGENTS.md`: the importable package contract; owns config loading and tokenization/serialization and indexes the `data`, `vocab`, `model`, `train`, `inference`, `eval`, and `pipeline` subpackages.
 - `config/AGENTS.md`: canonical `default.yaml` base configuration validated by `src/thesis_ml/config.py`.
 - `configs/AGENTS.md`: local proof-of-life run profiles that override `default.yaml`.

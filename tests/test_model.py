@@ -22,12 +22,123 @@ from thesis_ml.data.dataset import (
     CLASS_WINLOSS,
     PRETRAIN_CLASS_ID_TO_NAME,
 )
+from thesis_ml.data.features import (
+    BUFF_ID_MAX,
+    BUFF_VALIDITY_INDEX,
+    BUFF_VALUE_OFFSET,
+    CLOAK_STATE_COUNT,
+    CONTINUOUS_FEATURE_NAMES,
+    parse_buff_ids,
+)
 from thesis_ml.model.loss import CanvasCrossEntropyLoss
 from thesis_ml.model import backbone as backbone_module
 from thesis_ml.model.backbone import GeGLU, MultiHeadSelfAttention, RotaryEmbedding, TransformerBlock
-from thesis_ml.model.embedding import InputFeatures, build_input_features
+from thesis_ml.model.embedding import InputFeatures, _numeric_feature, build_input_features
 from thesis_ml.model.model import SC2StrategyDiffusionModel, canvas_self_conditioning_from_logits
 from thesis_ml.serialize import TokenRecord
+
+
+def test_slash_form_numeric_features_are_encoded_as_fractions() -> None:
+    assert _numeric_feature("6.0/45.0") == pytest.approx(6.0 / 45.0)
+    assert _numeric_feature("51.23046875/200.0") == pytest.approx(51.23046875 / 200.0)
+    assert _numeric_feature("0.0/0.0") == 0.0
+    assert _numeric_feature("sentinel-with-123") == 0.0
+
+
+def test_approved_features_preserve_valid_zero_and_encode_categories() -> None:
+    records = []
+    for cloak_state in range(CLOAK_STATE_COUNT):
+        records.append(
+            TokenRecord(
+                token_id=6,
+                token_name="scv",
+                token_kind="entity",
+                owner="p1",
+                allegiance="self",
+                game_loop=0,
+                timestamp_seconds=0.0,
+                raw_position="(0.0, 0.0, 12.0)",
+                raw_attributes={
+                    "health": "0.0/45.0",
+                    "facing": "0.0",
+                    "ideal_harvesters": "16",
+                    "buff_duration_remain": "0",
+                    "buff_duration_max": "1440",
+                    "detect_range": "0.0",
+                    "cloak": str(cloak_state),
+                    "buff_ids": "[7, 27, 289, 294, 298, 299, 302]" if cloak_state == 0 else "[]",
+                    # Explicitly rejected fields must not affect the encoding.
+                    "assigned_harvesters": "12",
+                    "radar_range": "30.0",
+                },
+            )
+        )
+
+    features = build_input_features([records], len(records))
+    for name in (
+        "map_x",
+        "map_y",
+        "health",
+        "facing_sin",
+        "facing_cos",
+        "ideal_harvesters",
+        "buff_duration_remain",
+        "buff_duration_max",
+        "detect_range",
+    ):
+        assert features.continuous_validity[0, 0, CONTINUOUS_FEATURE_NAMES.index(name)]
+    assert not features.continuous_validity[
+        0, 0, CONTINUOUS_FEATURE_NAMES.index("energy")
+    ]
+    assert features.continuous_values[0, 0, CONTINUOUS_FEATURE_NAMES.index("map_x")] == 0
+    assert features.continuous_values[0, 0, CONTINUOUS_FEATURE_NAMES.index("facing_sin")] == 0
+    assert features.continuous_values[0, 0, CONTINUOUS_FEATURE_NAMES.index("facing_cos")] == 1
+    assert "assigned_harvesters" not in CONTINUOUS_FEATURE_NAMES
+    assert "radar_range" not in CONTINUOUS_FEATURE_NAMES
+
+    for cloak_state in range(CLOAK_STATE_COUNT):
+        assert features.categorical_values[0, cloak_state, cloak_state] == 1
+        assert features.categorical_values[
+            0, cloak_state, :CLOAK_STATE_COUNT
+        ].sum() == 1
+        assert features.categorical_values[0, cloak_state, BUFF_VALIDITY_INDEX] == 1
+    for buff_id in (7, 27, 289, 294, 298, 299, 302):
+        assert features.categorical_values[0, 0, BUFF_VALUE_OFFSET + buff_id] == 1
+
+
+def test_nonnumeric_stat_sentinels_are_missing_not_valid_zero() -> None:
+    record = TokenRecord(
+        token_id=6,
+        token_name="scv",
+        token_kind="entity",
+        owner="p1",
+        allegiance="self",
+        game_loop=0,
+        timestamp_seconds=0.0,
+        raw_position="(1.0, 2.0, 3.0)",
+        raw_attributes={
+            "health": "inside refinery",
+            "is_active": "destroyed",
+            "cloak": "completed",
+            "buff_ids": "inside refinery",
+        },
+    )
+
+    features = build_input_features([[record]], 1)
+
+    assert not features.continuous_validity[
+        0, 0, CONTINUOUS_FEATURE_NAMES.index("health")
+    ]
+    assert not features.continuous_validity[
+        0, 0, CONTINUOUS_FEATURE_NAMES.index("is_active")
+    ]
+    assert features.categorical_values[0, 0].sum() == 0
+
+
+def test_buff_ids_preserve_corpus_range_and_reject_unseen_schema_drift() -> None:
+    assert parse_buff_ids("[302, 299, 302]") == (299, 302)
+    with pytest.raises(ValueError, match=rf"0\.\.{BUFF_ID_MAX}"):
+        parse_buff_ids(f"[{BUFF_ID_MAX + 1}]")
 
 
 def _small_config(
@@ -227,12 +338,17 @@ def test_joint_static_embedding_zero_init_staged_gradients_and_locality() -> Non
     changed_continuous[0, 1, 0] += 10.0
     changed = InputFeatures(
         continuous_values=changed_continuous,
+        continuous_validity=features.continuous_validity,
+        categorical_values=features.categorical_values,
         allegiance_values=features.allegiance_values,
         feature_mask=features.feature_mask,
     )
     base_output = embedding.embed_input(input_ids, input_features=features)
     changed_output = embedding.embed_input(input_ids, input_features=changed)
-    assert not torch.allclose(base_output[:, 1], changed_output[:, 1])
+    # The staged branch has only taken one update and is intentionally still
+    # tiny; require a real feature-local change without imposing an arbitrary
+    # allclose magnitude threshold on random initialization.
+    assert not torch.equal(base_output[:, 1], changed_output[:, 1])
     assert torch.equal(base_output[:, 0], changed_output[:, 0])
     assert torch.equal(base_output[:, 2], changed_output[:, 2])
 
@@ -511,10 +627,12 @@ def test_pretraining_loss_emits_future_distance() -> None:
 def test_t_bucket_edges_are_contiguous_exhaustive_and_perspectives_emit_both_keys() -> None:
     """Every t in [0, 1] lands in EXACTLY one t-bucket, with the documented edges.
 
-    The five buckets partition [0, 1]: exact t==1.0 -> t_eq_1; [0.7, 1.0) ->
-    t_0_7_to_1_0 (so t=0.995 goes there, NOT in t_eq_1); then [0.5, 0.7),
-    [0.3, 0.5), and [0.0, 0.3). Also proves the perspective breakdown emits
-    both `p1` and `p2` keys for a batch containing both perspectives.
+    The four buckets partition [0, 1]: exact t==1.0 -> t_eq_1; [0.75, 1.0) ->
+    t_0_75_to_1_0 (so t=0.995 goes there, NOT in t_eq_1 -- keeping full
+    corruption separable from near-full corruption is the whole reason t_eq_1 is
+    its own bucket); then [0.25, 0.75) and [0.0, 0.25). Also proves the
+    perspective breakdown emits both `p1` and `p2` keys for a batch containing
+    both perspectives.
     """
 
     loss_fn = CanvasCrossEntropyLoss(_small_config())
@@ -534,20 +652,18 @@ def test_t_bucket_edges_are_contiguous_exhaustive_and_perspectives_emit_both_key
     def expected_bucket(t_value: float) -> str:
         if t_value == 1.0:
             return "t_eq_1"
-        if t_value >= 0.7:
-            return "t_0_7_to_1_0"
-        if t_value >= 0.5:
-            return "t_0_5_to_0_7"
-        if t_value >= 0.3:
-            return "t_0_3_to_0_5"
-        return "t_0_0_to_0_3"
+        if t_value >= 0.75:
+            return "t_0_75_to_1_0"
+        if t_value >= 0.25:
+            return "t_0_25_to_0_75"
+        return "t_0_0_to_0_25"
 
     grid = [index / 100.0 for index in range(101)]
-    for t_value in [*grid, 0.995, 0.2999, 0.3, 0.5, 0.7, 0.9999]:
+    for t_value in [*grid, 0.995, 0.2499, 0.25, 0.75, 0.7499, 0.9999]:
         assert bucket_for(t_value) == expected_bucket(t_value), f"t={t_value}"
 
     # The two spelled-out cases from the metric contract.
-    assert bucket_for(0.995) == "t_0_7_to_1_0"
+    assert bucket_for(0.995) == "t_0_75_to_1_0"
     assert bucket_for(1.0) == "t_eq_1"
 
     # Perspective split: a two-example batch built from p1 and p2 perspectives
@@ -564,7 +680,78 @@ def test_t_bucket_edges_are_contiguous_exhaustive_and_perspectives_emit_both_key
     )
     assert set(result.perspective) == {"p1", "p2"}
     # And the two different sampled ts populate their two different buckets.
-    assert set(result.t_bucket) == {"t_0_3_to_0_5", "t_0_7_to_1_0"}
+    assert set(result.t_bucket) == {"t_0_25_to_0_75", "t_0_75_to_1_0"}
+
+
+def test_canvas_state_splits_preserved_ground_truth_from_actually_noised() -> None:
+    """The canvas-state breakdown keys on TOKEN INEQUALITY, not the noise flag.
+
+    Four scored positions: two the model saw already-correct
+    (``changed_positions`` False) and two it saw corrupted. Their per-position
+    cross entropies must land in the matching bucket, and neither bucket may
+    borrow from the other -- that separation is what makes
+    "ground_truth_preserved" readable as "has the model learned to recognize a
+    valid sequence and leave it alone".
+    """
+
+    loss_fn = CanvasCrossEntropyLoss(_small_config())
+    # Row of 4 positions. Logits are shaped so the two preserved positions are
+    # predicted confidently (low CE) and the two noised ones are not (high CE),
+    # giving the two buckets clearly different means.
+    logits = torch.zeros(1, 4, 8)
+    logits[0, 0, 1] = 10.0
+    logits[0, 1, 2] = 10.0
+    target = torch.tensor([[1, 2, 3, 4]])
+    labels = torch.full((1, 4), CLASS_CONTENT)
+    changed = torch.tensor([[False, False, True, True]])
+
+    result = loss_fn(logits, target, labels, changed_positions=changed)
+
+    assert set(result.canvas_state) == {"ground_truth_preserved", "noised"}
+    preserved = float(result.canvas_state["ground_truth_preserved"])
+    noised = float(result.canvas_state["noised"])
+    assert preserved < noised
+
+    # A batch with nothing corrupted omits the "noised" key entirely rather than
+    # reporting a sentinel (the same convention per_class uses).
+    all_clean = loss_fn(
+        logits,
+        target,
+        labels,
+        changed_positions=torch.zeros(1, 4, dtype=torch.bool),
+    )
+    assert set(all_clean.canvas_state) == {"ground_truth_preserved"}
+
+    # Omitting changed_positions omits the breakdown; it is never fabricated.
+    assert loss_fn(logits, target, labels).canvas_state == {}
+
+
+def test_canvas_state_ignores_positions_excluded_by_the_scored_mask() -> None:
+    """Batch-shape padding must not leak into either canvas-state bucket.
+
+    ``scored_mask`` excludes padded positions from the aggregate loss, so it must
+    exclude them here too -- otherwise the preserved bucket would be diluted by
+    padding, which is trivially "already correct" and would make the model look
+    better at recognizing ground truth than it is.
+    """
+
+    loss_fn = CanvasCrossEntropyLoss(_small_config())
+    logits = torch.zeros(1, 4, 8)
+    target = torch.tensor([[1, 2, 3, 4]])
+    labels = torch.full((1, 4), CLASS_CONTENT)
+    # Positions 2 and 3 are batch-shape padding: unscored, and "unchanged".
+    scored = torch.tensor([[True, True, False, False]])
+    changed = torch.tensor([[True, True, False, False]])
+
+    result = loss_fn(
+        logits,
+        target,
+        labels,
+        scored_mask=scored,
+        changed_positions=changed,
+    )
+
+    assert set(result.canvas_state) == {"noised"}
 
 
 def test_pretraining_loss_weights_are_uniform_including_semantic_pad() -> None:

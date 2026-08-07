@@ -493,6 +493,8 @@ def _move_input_features(
         return None
     return InputFeatures(
         continuous_values=features.continuous_values.to(device),
+        continuous_validity=features.continuous_validity.to(device),
+        categorical_values=features.categorical_values.to(device),
         allegiance_values=features.allegiance_values.to(device),
         feature_mask=features.feature_mask.to(device),
     )

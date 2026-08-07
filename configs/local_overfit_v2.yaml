@@ -1,22 +1,53 @@
 extends: local_overfit.yaml
 
+# V2 overfit profile -- the learnability probe. Its question is narrow: on a
+# small, deliberately median-sized subset, does the full current pipeline
+# (uniform diffusion, dense GeGLU/sandwich-RMSNorm backbone, joint static
+# conditioning, clamped fogged input) drive the loss down at all? A run that
+# cannot overfit 10 replays will not learn 870.
+#
+# Everything about the data subset, model scale, and schedule is inherited from
+# local_overfit.yaml; this file only redirects the output paths so V2 runs never
+# mix with V1 artifacts, and pins the diffusion process.
+
 storage:
   checkpoint_uri: checkpoints/local-overfitV2
   log_uri: tests/output/overfitV2
   local_cache_dir: .pipeline_cache/local-overfitV2
 
-train:
-  epochs: 200
-  early_stopping_patience_epochs: 0
-
 diffusion:
   process: uniform
   schedule:
+    # No exact-t=1 oversampling. t is drawn uniformly on [0, 1], so the
+    # "t_eq_1" loss bucket is populated only by the measure-zero-in-theory but
+    # occasionally-drawn exact 1.0, and mostly stays empty. The near-full
+    # corruption regime is instead read from the "t_0_75_to_1_0" bucket. Raise
+    # this above 0 if the exact-100%-corruption column needs to be dense.
     t_one_fraction: 0.0
 
 # NOTE: this profile is PRE-TRAINING (data.debut_mode=false, inherited from
-# local_overfit.yaml -> config/default.yaml). Pre-training loss is now
-# uniform (no per-class weighting), so the `loss.class_loss_weights.pad: 0.2`
-# override that used to live here has been REMOVED -- that knob must not
-# exist in a pre-training config. The equivalent override is preserved,
-# fine-tuning-only, in configs/local_overfit_v2_finetune.yaml.
+# local_overfit.yaml -> config/default.yaml). Pre-training loss is uniform (no
+# per-class weighting), so a `loss.class_loss_weights.pad` override must not
+# exist here -- that knob is fine-tuning-only and lives in
+# configs/local_overfit_v2_finetune.yaml.
+#
+# Diagnostics this run writes to tests/output/overfitV2/ (see
+# TrainingLoop._write_interval_metrics for the full column list):
+#   - interval_metrics.csv : ten rows per epoch (~every 10% of the epoch), each
+#     scoped to that slice, carrying train AND dev values for every loss
+#     sub-class below. 30 epochs x 10 = 300 rows.
+#   - epoch_metrics.csv    : one row per epoch, same loss columns plus timestep
+#     percentiles, future-distance buckets, and memory/throughput telemetry.
+#   - step_metrics.jsonl   : one line per optimizer step.
+#
+# Loss sub-classes reported in both CSVs:
+#   per-class    : [PAD], [DELIMITER], [END], win-loss, enemy-observed
+#                  (copying observed enemy tokens onto the canvas),
+#                  enemy-fogged (reconstructing fogged enemy tokens), and
+#                  enemy-future (predicting the future canvas region).
+#   canvas-state : ground_truth_preserved (does the model recognize an
+#                  already-correct token and keep it?) vs noised (does it repair
+#                  a corrupted one?).
+#   t-bucket     : overall loss at 0-25%, 25-75%, 75-<100%, and exactly 100%
+#                  canvas corruption.
+#   perspective  : p1 vs p2.

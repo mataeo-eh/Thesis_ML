@@ -1,9 +1,9 @@
 # Debut-mode fine-tune profile (Worker 5).
 #
 # This config extends the pre-training overfit profile (local_overfit_v2.yaml)
-# so it inherits the SAME replay selection seeds (pipeline.seed=1729,
-# pipeline.split_seed=1729, replay_subset_size=25, validation_replay_count=3)
-# and the SAME data.* token budgets. Fine-tuning owns a separate window
+# so it inherits the SAME explicitly named replay selection (10 train + 3 dev
+# median-sized replays via pipeline.train_replay_ids / dev_replay_ids) and the
+# SAME data.* token budgets. Fine-tuning owns a separate window
 # manifest because its non-overlapping input windows are bounded only by input
 # length; each debut target may overlap neighboring targets as it extends from
 # the input-window start to replay end or the canvas token budget.
@@ -21,7 +21,21 @@ extends: local_overfit_v2.yaml
 train:
   lr: 1.0e-6
   epochs: 150
+  # Pinned explicitly so this fine-tune keeps its own schedule regardless of
+  # what the pre-training profile it extends chooses. local_overfit.yaml sets a
+  # short warmup and a per-epoch checkpoint cadence sized for its 1020-step run;
+  # neither is appropriate for a 150-epoch fine-tune, and inheriting them would
+  # change this pathway as a side effect of tuning the other one.
+  warmup: 2000
+  checkpoint_interval: 100
   init_from_checkpoint: checkpoints/local-overfitV2/last.pt
+
+pipeline:
+  # The warm-start checkpoint is bound to the feature-statistics artifact the
+  # PRE-TRAINING run froze (TrainingLoop._validate_feature_statistics_identity
+  # rejects any mismatch). Load that artifact; never recompute and overwrite it
+  # from this pathway.
+  prepare_feature_statistics: false
 
 data:
   debut_mode: true
@@ -52,7 +66,7 @@ loss:
     win_loss: 1.0
 
 eval:
-  # The 25 memorized + 3 dev replays expand into well over a thousand overlapping
+  # The 10 memorized + 3 dev replays expand into many overlapping
   # windows. Scoring every one would sample the diffusion model thousands of
   # times and hold every example in host RAM. Cap each report section to an
   # evenly-strided sample that still spans early->late input reach (so the

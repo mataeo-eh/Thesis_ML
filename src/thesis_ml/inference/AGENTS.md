@@ -29,6 +29,7 @@
 
 - Keep the sampler's self-conditioning reuse identical to the training interface. Extra forward work must remain explicit and diagnostics-only.
 - Grammar validation is the contract boundary between sampling and evaluation; decode only validated canvases.
+- When priors, allowed states, temperature shaping, entropy selection, adaptive stopping, self-conditioning reuse, forward-call count, returned tensors, or grammar constraints change, update every affected inference section in `../../../Model_Architecture/MODEL_ARCHITECTURE.md`, update canonical `.mmd` edges, and regenerate its SVG/PNG using `UPDATE_PROMPT.md`.
 
 ## Verification
 

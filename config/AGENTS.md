@@ -11,6 +11,7 @@
 ## Local Contracts
 
 - This is the single source of default values. Run profiles in `configs/` are overrides layered on top of it, not replacements.
+- Any default that affects model scale, feature/input/canvas widths, sequence budgets, diffusion, loss, optimizer, precision, EMA, checkpoint compatibility, or sampling must update every affected section in `../Model_Architecture/MODEL_ARCHITECTURE.md`, update its canonical `.mmd`, and regenerate its SVG/PNG in the same change using `../Model_Architecture/UPDATE_PROMPT.md`.
 - Every parameter here is validated into a dataclass by `config.py`; adding a field requires updating both together.
 - Values follow `SPEC.md` §11 (provisional defaults) — treat none as load-bearing, and never hardcode a value that belongs here into code.
 - No secrets or machine-specific absolute paths: storage locations are URIs (local or `s3://`) and credentials come from the environment.

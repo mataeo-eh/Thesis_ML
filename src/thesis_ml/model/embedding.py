@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
-import ast
 from dataclasses import dataclass
-import re
 from typing import Any, Sequence
 
 import torch
 from torch import nn
 
-from thesis_ml.data.feature_stats import (
+from thesis_ml.data.features import (
+    BUFF_VALIDITY_INDEX,
+    BUFF_VALUE_OFFSET,
+    CATEGORICAL_FEATURE_WIDTH,
+    CLOAK_STATE_COUNT,
     CONTINUOUS_FEATURE_NAMES,
     STAT_KEYS,
+    encode_entity_features,
+    parse_numeric_feature,
+    parse_position,
+)
+from thesis_ml.data.feature_stats import (
     FeatureStatistics,
 )
 from thesis_ml.model.backbone import GeGLU, RMSNorm
@@ -27,7 +34,9 @@ class InputFeatures:
     extracted once per batch in the DataLoader workers (see
     ``thesis_ml.data.collate``), instead of re-parsing TokenRecord objects in a
     Python loop on every forward pass. Shapes are ``[batch, seq_len, ...]``:
-      - continuous_values: [B, L, F] map X/Y followed by STAT_KEYS
+      - continuous_values: [B, L, F] approved scalar features
+      - continuous_validity: [B, L, F] distinguishes valid zero from missing
+      - categorical_values: [B, L, C] cloak one-hot plus sparse buff multi-hot
       - allegiance_values: [B, L, 1] self +1, enemy -1, structural/pad 0
       - feature_mask: [B, L] true only for self/enemy content records
 
@@ -37,6 +46,8 @@ class InputFeatures:
     """
 
     continuous_values: torch.Tensor
+    continuous_validity: torch.Tensor
+    categorical_values: torch.Tensor
     allegiance_values: torch.Tensor
     feature_mask: torch.Tensor
 
@@ -62,7 +73,13 @@ def build_input_features(
     """
 
     batch = len(records)
-    continuous_values, allegiance_values, feature_mask = _records_to_tensors(
+    (
+        continuous_values,
+        continuous_validity,
+        categorical_values,
+        allegiance_values,
+        feature_mask,
+    ) = _records_to_tensors(
         records,
         torch.Size((batch, seq_len)),
         device=torch.device("cpu"),
@@ -71,6 +88,8 @@ def build_input_features(
     )
     return InputFeatures(
         continuous_values=continuous_values,
+        continuous_validity=continuous_validity,
+        categorical_values=categorical_values,
         allegiance_values=allegiance_values,
         feature_mask=feature_mask,
     )
@@ -100,7 +119,9 @@ class InputContextEmbedding(nn.Module):
             "feature_stds",
             torch.tensor(feature_statistics.stds, dtype=torch.float32),
         )
-        feature_width = len(CONTINUOUS_FEATURE_NAMES) + 1
+        feature_width = (
+            2 * len(CONTINUOUS_FEATURE_NAMES) + CATEGORICAL_FEATURE_WIDTH + 1
+        )
         self.feature_mlp = nn.Sequential(
             nn.Linear(feature_width, 32),
             nn.ReLU(),
@@ -160,6 +181,12 @@ class InputContextEmbedding(nn.Module):
         continuous = input_features.continuous_values.to(
             device=device, dtype=type_embeddings.dtype
         )
+        continuous_validity = input_features.continuous_validity.to(
+            device=device, dtype=torch.bool
+        )
+        categorical = input_features.categorical_values.to(
+            device=device, dtype=type_embeddings.dtype
+        )
         allegiance = input_features.allegiance_values.to(
             device=device, dtype=type_embeddings.dtype
         )
@@ -168,10 +195,29 @@ class InputContextEmbedding(nn.Module):
             raise ValueError(
                 f"continuous input feature width must be {len(CONTINUOUS_FEATURE_NAMES)}"
             )
+        if continuous_validity.shape != continuous.shape:
+            raise ValueError("continuous feature validity must match continuous values")
+        if categorical.shape[-1] != CATEGORICAL_FEATURE_WIDTH:
+            raise ValueError(
+                f"categorical input feature width must be {CATEGORICAL_FEATURE_WIDTH}"
+            )
         standardized = (
             continuous - self.feature_means.to(dtype=type_embeddings.dtype)
         ) / self.feature_stds.to(dtype=type_embeddings.dtype)
-        branch_input = torch.cat([standardized, allegiance], dim=-1)
+        standardized = torch.where(
+            continuous_validity,
+            standardized,
+            torch.zeros_like(standardized),
+        )
+        branch_input = torch.cat(
+            [
+                standardized,
+                continuous_validity.to(dtype=type_embeddings.dtype),
+                categorical,
+                allegiance,
+            ],
+            dim=-1,
+        )
         hidden_features = self.feature_mlp(branch_input)
         residual = self.joint_mixer(torch.cat([type_embeddings, hidden_features], dim=-1))
         residual = residual * feature_mask.unsqueeze(-1).to(dtype=residual.dtype)
@@ -206,10 +252,16 @@ def _records_to_tensors(
     device: torch.device,
     dtype: torch.dtype,
     left_pad: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, seq_len = shape
     continuous_values = torch.zeros(
         batch, seq_len, len(CONTINUOUS_FEATURE_NAMES), device=device, dtype=dtype
+    )
+    continuous_validity = torch.zeros(
+        batch, seq_len, len(CONTINUOUS_FEATURE_NAMES), device=device, dtype=torch.bool
+    )
+    categorical_values = torch.zeros(
+        batch, seq_len, CATEGORICAL_FEATURE_WIDTH, device=device, dtype=dtype
     )
     allegiance_values = torch.zeros(batch, seq_len, 1, device=device, dtype=dtype)
     feature_mask = torch.zeros(batch, seq_len, device=device, dtype=torch.bool)
@@ -224,55 +276,42 @@ def _records_to_tensors(
             elif record.allegiance == "enemy":
                 allegiance_values[batch_index, token_index, 0] = -1.0
                 feature_mask[batch_index, token_index] = True
-            position = _parse_position(record.raw_position)
-            if position is not None:
-                continuous_values[batch_index, token_index, :2] = torch.tensor(
-                    position[:2], device=device, dtype=dtype
-                )
             raw = record.raw_attributes or {}
-            for stat_index, key in enumerate(STAT_KEYS):
-                continuous_values[batch_index, token_index, 2 + stat_index] = _numeric_feature(
-                    raw.get(key)
-                )
+            encoded = encode_entity_features(record.raw_position, raw)
+            continuous_values[batch_index, token_index] = torch.tensor(
+                encoded.continuous_values, device=device, dtype=dtype
+            )
+            continuous_validity[batch_index, token_index] = torch.tensor(
+                encoded.continuous_validity, device=device, dtype=torch.bool
+            )
+            if encoded.cloak_state is not None:
+                categorical_values[
+                    batch_index, token_index, encoded.cloak_state
+                ] = 1.0
+            if encoded.buff_ids is not None:
+                categorical_values[
+                    batch_index, token_index, BUFF_VALIDITY_INDEX
+                ] = 1.0
+                if encoded.buff_ids:
+                    buff_indexes = torch.tensor(
+                        [BUFF_VALUE_OFFSET + buff_id for buff_id in encoded.buff_ids],
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    categorical_values[batch_index, token_index, buff_indexes] = 1.0
 
-    return continuous_values, allegiance_values, feature_mask
+    return (
+        continuous_values,
+        continuous_validity,
+        categorical_values,
+        allegiance_values,
+        feature_mask,
+    )
 
 
 def _parse_position(value: Any) -> tuple[float, float, float] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-        if not text.startswith("("):
-            return None
-        try:
-            parsed = ast.literal_eval(text)
-        except (SyntaxError, ValueError):
-            return None
-        if isinstance(parsed, tuple) and len(parsed) >= 3:
-            return float(parsed[0]), float(parsed[1]), float(parsed[2])
-        return None
-    if isinstance(value, (tuple, list)) and len(value) >= 3:
-        return float(value[0]), float(value[1]), float(value[2])
-    return None
+    return parse_position(value)
 
 
 def _numeric_feature(value: Any) -> float:
-    if value is None:
-        return 0.0
-    if isinstance(value, bool):
-        return 1.0 if value else 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip().lower()
-    if text == "true":
-        return 1.0
-    if text == "false":
-        return 0.0
-    if "/" in text:
-        numerator = text.split("/", 1)[0]
-        return _numeric_feature(numerator)
-    match = re.search(r"-?\d+(?:\.\d+)?", text)
-    if match is None:
-        return 0.0
-    return float(match.group(0))
+    return parse_numeric_feature(value)[0]

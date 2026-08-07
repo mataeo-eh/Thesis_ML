@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+import pandas as pd
 import torch
 
 from thesis_ml.config import (
@@ -14,6 +15,8 @@ from thesis_ml.data.dataset import (
     CLASS_ENEMY_FUTURE,
     PRETRAIN_CLASS_ID_TO_NAME,
     SC2DiffusionDataset,
+    _artifact_delimiter,
+    _artifact_timestep_records,
     _build_debut_target,
 )
 from thesis_ml.data.feature_stats import (
@@ -23,19 +26,25 @@ from thesis_ml.data.feature_stats import (
     load_feature_statistics,
     write_feature_statistics,
 )
+from thesis_ml.data.features import continuous_feature_is_valid
 from thesis_ml.data.windowing import (
     MANIFEST_VERSION,
+    _artifact_is_current,
     TokenizedReplay,
     load_window_manifest,
     manifest_config_stamp,
     preprocess_replays,
+    read_manifest_metadata,
+    replay_source_stamp,
     validate_manifest_budgets,
     validate_manifest_integrity,
 )
 from thesis_ml.inference.timing import attach_absolute_times
+from thesis_ml.model.embedding import build_input_features
 from thesis_ml.model.model import SC2StrategyDiffusionModel
+from thesis_ml.serialize import serialize_snapshot
 from thesis_ml.train.train import run_smoke_train
-from thesis_ml.vocab.content_vocab import load_content_vocabulary
+from thesis_ml.vocab.content_vocab import ContentVocabulary, load_content_vocabulary
 from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID, WIN_ID
 
 
@@ -74,6 +83,9 @@ def test_feature_statistics_are_deterministic_frozen_and_strict(tmp_path: Path) 
     assert statistics.feature_names == CONTINUOUS_FEATURE_NAMES
     assert all(count > 0 for count in statistics.counts)
     assert all(std > 0 for std in statistics.stds)
+    assert statistics.counts[CONTINUOUS_FEATURE_NAMES.index("map_x")] > statistics.counts[
+        CONTINUOUS_FEATURE_NAMES.index("energy")
+    ]
     for feature_name in statistics.zero_variance_features:
         assert statistics.stds[statistics.feature_names.index(feature_name)] == 1.0
 
@@ -105,6 +117,134 @@ def test_feature_statistics_are_deterministic_frozen_and_strict(tmp_path: Path) 
     malformed_path.write_text(json.dumps(malformed), encoding="utf-8")
     with pytest.raises(FeatureStatisticsError, match="malformed"):
         load_feature_statistics(malformed_path)
+
+
+def test_artifact_preserves_wide_instance_ids_and_fraction_features(tmp_path: Path) -> None:
+    source = tmp_path / "wide-instance.parquet"
+    pd.DataFrame(
+        {
+            "game_loop": [0],
+            "timestamp_seconds": [0.0],
+            "p1_chito_zergling_1000_pos_(X,Y,Z)": ["(1.25, 2.5, 3.75)"],
+            "p1_chito_zergling_1000_health": ["6.0/45.0"],
+            "p1_chito_zergling_1000_facing": ["1.5707963267948966"],
+            "p1_chito_zergling_1000_ideal_harvesters": ["16"],
+            "p1_chito_zergling_1000_cloak": ["4"],
+            "p1_chito_zergling_1000_buff_ids": ["[7, 27]"],
+            "p1_chito_scv_1001_pos_(X,Y,Z)": ["destroyed"],
+            "p1_chito_scv_1001_health": ["destroyed"],
+        }
+    ).to_parquet(source)
+    base = load_config(ROOT / "config" / "default.yaml")
+    config = replace(
+        base,
+        data=replace(
+            base.data,
+            tokenized_replay_dir=str(tmp_path / "tokenized"),
+            window_manifest_path=str(tmp_path / "manifest.jsonl"),
+        ),
+        pipeline=replace(base.pipeline, num_workers=0),
+    )
+    vocabulary = load_content_vocabulary(ROOT / "data" / "Token_Dictionary.json")
+
+    preprocess_replays([source], config, vocabulary)
+    entries = load_window_manifest(
+        config.data.window_manifest_path,
+        config=config,
+        replay_paths=[source],
+    )
+    replay = TokenizedReplay(entries[0].artifact_path)
+    health_index = CONTINUOUS_FEATURE_NAMES.index("health")
+    facing_sin_index = CONTINUOUS_FEATURE_NAMES.index("facing_sin")
+    facing_cos_index = CONTINUOUS_FEATURE_NAMES.index("facing_cos")
+
+    assert replay.token_ids.tolist() == [vocabulary.token_id_for("zergling")]
+    assert replay.features[0, :2].tolist() == pytest.approx([1.25, 2.5])
+    assert float(replay.features[0, health_index]) == pytest.approx(6.0 / 45.0)
+    assert float(replay.features[0, facing_sin_index]) == pytest.approx(1.0)
+    assert float(replay.features[0, facing_cos_index]) == pytest.approx(0.0, abs=1e-7)
+    assert continuous_feature_is_valid(int(replay.feature_validity[0]), health_index)
+    assert int(replay.cloak_states[0]) == 4
+    assert replay.buff_counts.tolist() == [2]
+    assert replay.buff_ids.tolist() == [7, 27]
+    assert _artifact_is_current(Path(entries[0].artifact_path), source, vocabulary)
+    reduced_vocabulary = ContentVocabulary(tokens=vocabulary.tokens[:-1])
+    assert not _artifact_is_current(
+        Path(entries[0].artifact_path),
+        source,
+        reduced_vocabulary,
+    )
+
+    original_source_stamp = read_manifest_metadata(config.data.window_manifest_path)[
+        "replay_source_stamp"
+    ]
+    source.write_bytes(source.read_bytes() + b"source-drift")
+    assert not _artifact_is_current(Path(entries[0].artifact_path), source, vocabulary)
+    assert original_source_stamp != replay_source_stamp([source])
+
+
+def test_artifact_and_rich_serializers_have_model_input_parity(tmp_path: Path) -> None:
+    """Keep the optimized artifact path equivalent to the source oracle."""
+
+    config, vocabulary, entries = _prepared(tmp_path)
+    replay = TokenizedReplay(entries[0].artifact_path)
+    frame = pd.read_parquet(FIXTURE).sort_values("game_loop").reset_index(drop=True)
+    timesteps = sorted({0, len(frame) // 2, len(frame) - 1})
+
+    for perspective_player in ("p1", "p2"):
+        for timestep in timesteps:
+            rich_records = serialize_snapshot(
+                frame.iloc[timestep],
+                config,
+                vocabulary,
+                perspective_player=perspective_player,
+            )
+            artifact_records = [
+                record
+                for _owner_code, record in _artifact_timestep_records(
+                    replay,
+                    timestep,
+                    vocabulary,
+                    perspective_player,
+                )
+            ]
+            artifact_records.append(_artifact_delimiter(replay, timestep))
+
+            def model_semantics(records):
+                return [
+                    (
+                        record.token_id,
+                        record.token_name,
+                        record.token_kind,
+                        record.owner,
+                        record.allegiance,
+                        record.game_loop,
+                        record.timestamp_seconds,
+                    )
+                    for record in records
+                ]
+
+            assert model_semantics(artifact_records) == model_semantics(rich_records)
+
+            rich_features = build_input_features([rich_records], len(rich_records))
+            artifact_features = build_input_features([artifact_records], len(artifact_records))
+            assert torch.equal(
+                artifact_features.continuous_values,
+                rich_features.continuous_values,
+            )
+            assert torch.equal(
+                artifact_features.continuous_validity,
+                rich_features.continuous_validity,
+            )
+            assert torch.equal(
+                artifact_features.categorical_values,
+                rich_features.categorical_values,
+            )
+            assert torch.equal(
+                artifact_features.allegiance_values,
+                rich_features.allegiance_values,
+            )
+            assert torch.equal(artifact_features.feature_mask, rich_features.feature_mask)
 
 
 def test_debut_windows_tile_inputs_by_input_budget_and_allow_overlapping_targets(

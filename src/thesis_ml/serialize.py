@@ -11,10 +11,13 @@ from typing import Any, Iterable
 import pandas as pd
 
 from thesis_ml.config import ProjectConfig
+from thesis_ml.data.features import POSITION_KEY, parse_position
 from thesis_ml.vocab.content_vocab import ContentVocabulary, normalize_content_name
 from thesis_ml.vocab.special_tokens import DELIMITER_ID, DELIMITER_TOKEN
 
-ENTITY_COLUMN_RE = re.compile(r"^(p[12])_(.+)_(\d{3})_(.+)$")
+# Instance identifiers are zero-padded to three digits only while they remain
+# below 1000. Long/high-entity-count replays legitimately contain wider IDs.
+ENTITY_COLUMN_RE = re.compile(r"^(p[12])_(.+)_(\d+)_(.+)$")
 UPGRADE_COLUMNS = ("p1_upgrades", "p2_upgrades")
 
 
@@ -82,7 +85,7 @@ def serialize_snapshot(
     records: list[TokenRecord] = []
     for group in groups:
         raw_attributes = _non_null_attributes(snapshot, group)
-        if not raw_attributes:
+        if not _entity_is_present(raw_attributes):
             continue
         records.append(_entity_record(snapshot, group, raw_attributes, vocabulary, perspective_player))
 
@@ -130,7 +133,7 @@ def deserialize_counts(records: Iterable[TokenRecord], vocabulary: ContentVocabu
 def snapshot_content_counts(snapshot: pd.Series) -> dict[str, int]:
     counts: dict[str, int] = {}
     for group in parse_entity_columns(snapshot.index):
-        if _non_null_attributes(snapshot, group):
+        if _entity_is_present(_non_null_attributes(snapshot, group)):
             counts[group.entity_type] = counts.get(group.entity_type, 0) + 1
     for owner in ("p1", "p2"):
         for upgrade in parse_upgrades(snapshot.get(f"{owner}_upgrades")):
@@ -196,6 +199,12 @@ def _non_null_attributes(snapshot: pd.Series, group: EntityColumnGroup) -> dict[
             continue
         raw[attribute] = value
     return raw
+
+
+def _entity_is_present(raw_attributes: dict[str, Any]) -> bool:
+    """Model presence requires a real position, not a lifecycle sentinel."""
+
+    return parse_position(raw_attributes.get(POSITION_KEY)) is not None
 
 
 def _entity_record(

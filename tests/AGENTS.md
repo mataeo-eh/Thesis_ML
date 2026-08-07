@@ -14,9 +14,10 @@
 ## Local Contracts
 
 - Run tests through `.venv\Scripts\python.exe -m pytest -q` after confirming the venv exists.
-- `overfit.bat` launches `configs/local_overfit_v2.yaml` and mirrors flushed progress to its terminal and `tests/output/overfitV2/console.log`.
+- `overfit.bat` launches `configs/local_overfit_v2.yaml`, mirrors flushed progress to its terminal and `tests/output/overfitV2/console.log`, and archives each finished run's log as `console-<timestamp>.log` because Tee-Object truncates `console.log` at every launch.
 - Launchers forward extra CLI args, so `--max-steps N` gives a bounded launch check. CUDA-required profiles must fail before preprocessing when CUDA is unavailable.
 - Fixtures are the schema authority for tests; do not hardcode field names that contradict them or `SCHEMA.md`.
+- Serialization coverage must include variable-width instance IDs, slash-form fractions, sentinel-null entity presence, valid-zero masks, facing sine/cosine, cloak/buff categorical values, direct model-input parity between rich and optimized paths, and artifact/manifest invalidation when source or vocabulary identity changes.
 - GPU/VRAM claims require an environment where CUDA is visible; never infer VRAM from a CPU run.
 - Diffusion coverage must exercise both process values without mixing their semantics: uniform corruption/all-valid loss/nonmonotonic full-renoising EB by default, and absorbing corruption/masked inverse-time loss/monotonic EB as the ablation. Tests must prove exact EB prefix math, categorical RNG reproducibility, adaptive stop conjunction, unrestricted outcome-token placement, and checkpoint incompatibility.
 

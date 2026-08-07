@@ -140,6 +140,25 @@ class PipelineConfig:
     train_replay_count: int
     replay_subset_size: int
     validation_replay_count: int
+    # Explicit, named replay selection. Comma-separated replay FILE STEMS (e.g.
+    # "match_4746821_game_state,match_4746300_game_state"), NOT the hashed
+    # tokenized-artifact ids. When train_replay_ids is non-empty it REPLACES the
+    # seeded shuffle in split_replays/_select_replays entirely: the named
+    # replays become train, dev_replay_ids become dev, and every other replay in
+    # the corpus becomes test.
+    #
+    # WHY this exists: the seeded split answers "give me N arbitrary replays",
+    # which is right for a real run but wrong for a diagnostic overfit run where
+    # the subset must be a KNOWN, reproducible, deliberately-chosen sample (for
+    # example replays whose token counts sit at the corpus median, so the run is
+    # neither trivially short nor unrepresentatively long). Naming the replays
+    # also makes the subset survive changes to seeds, corpus size, or split
+    # fractions, none of which should silently re-roll an overfit subset.
+    #
+    # Both default to "" (empty), which preserves the seeded-split behavior
+    # exactly for every profile that does not opt in.
+    train_replay_ids: str
+    dev_replay_ids: str
     preprocess_if_missing: bool
     rebuild_manifest: bool
     # Explicit preprocessing switch. False makes every normal consumer load
@@ -165,6 +184,24 @@ class TrainConfig:
     early_stopping_patience_epochs: int
     early_stopping_min_relative_improvement: float
     val_interval: int
+    # Whether the ten-per-epoch interval reports each run a full dev pass.
+    #
+    # True (default): every interval row carries dev values alongside its train
+    # values, giving ten dev observations per epoch. This is what makes the
+    # diagnostics usable on a corpus large enough to converge in ONE epoch,
+    # where epoch-end validation would yield a single dev point and no trend.
+    #
+    # False: interval rows carry train values only and their dev columns stay
+    # blank; dev is evaluated once per epoch and lands in the epoch CSV. Choose
+    # this when the dev pass costs more than the training it is interleaved with
+    # -- on a small memorization run a full dev pass can take longer than the
+    # ~10% slice of training that preceded it, so ten of them per epoch can more
+    # than double wall-clock time for signal that a per-epoch dev point already
+    # provides on a run measured in tens of epochs.
+    #
+    # Independent of `val_interval`, which drives the separate step-cadence
+    # validation written into the per-step JSONL.
+    interval_dev_evaluation: bool
     checkpoint_interval: int
     checkpoint_dir: str
     # When False (default), each periodic checkpoint overwrites a single

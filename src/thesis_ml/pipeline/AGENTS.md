@@ -28,6 +28,7 @@
 ## Work Guidance
 
 - Extend this orchestration rather than adding a parallel entry point; it drives the `data`, `train`, and (for fine-tuning) `eval` subpackages.
+- When model construction, active profile resolution, vocabulary/statistics loading, DataLoader batch shape, planned-step calculation, warm start/resume behavior, or pretraining/fine-tuning routing changes, update every affected current-profile/provenance section in `../../../Model_Architecture/MODEL_ARCHITECTURE.md`, update the canonical `.mmd`, and regenerate its SVG/PNG using `UPDATE_PROMPT.md`.
 - Keep the real DataLoader path memory-mapped and bounded to one replay per worker; drop raw metadata before worker IPC and use pinned, non-blocking CUDA transfers.
 - Keep worker persistence config-owned. Both local overfit and full-corpus profiles retain workers to avoid repeated Windows process startup; worker-exit messages after manually terminating a run are expected teardown fallout.
 - Keep the `metrics.jsonl` / epoch-CSV fields and CLI flags aligned with `RUN.md`.

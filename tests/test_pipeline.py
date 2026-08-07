@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -7,7 +8,12 @@ import yaml
 from thesis_ml.pipeline.acquire_data import CredentialError, run_acquisition
 from thesis_ml.pipeline.storage import StorageResolver, parse_s3_uri
 from thesis_ml.config import load_config
-from thesis_ml.pipeline.train_pipeline import _perspectives, _select_replays, run_training_pipeline
+from thesis_ml.pipeline.train_pipeline import (
+    _explicit_replay_selection,
+    _perspectives,
+    _select_replays,
+    run_training_pipeline,
+)
 
 
 def test_training_and_finetune_perspectives_require_both_players() -> None:
@@ -31,8 +37,21 @@ def test_master_pipeline_smoke_run_writes_checkpoint_and_resumes(tmp_path: Path)
     assert second.steps == first.steps
 
 
-def test_overfit_selection_is_seeded_exact_and_disjoint() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs" / "local_overfit.yaml")
+def test_seeded_subset_selection_is_exact_reproducible_and_disjoint() -> None:
+    """The seeded subset path (profiles that do NOT name replays explicitly).
+
+    Uses local_full.yaml, which still draws its replays from the seeded split.
+    Two calls with the same config must return the identical selection, of the
+    configured sizes, with no replay in both groups.
+    """
+
+    config = load_config(Path(__file__).resolve().parents[1] / "configs" / "local_full.yaml")
+    config = replace(
+        config,
+        pipeline=replace(
+            config.pipeline, replay_subset_size=25, validation_replay_count=3
+        ),
+    )
     train_candidates = [f"train_{index}.parquet" for index in range(100)]
     dev_candidates = [f"dev_{index}.parquet" for index in range(20)]
 
@@ -43,6 +62,76 @@ def test_overfit_selection_is_seeded_exact_and_disjoint() -> None:
     assert len(first[0]) == 25
     assert len(first[1]) == 3
     assert set(first[0]).isdisjoint(first[1])
+
+
+def test_overfit_profile_selects_its_named_replays_and_tests_on_the_rest() -> None:
+    """The explicit path: named replays win, everything else becomes test.
+
+    The overfit profile must train on EXACTLY the replays it names, in the order
+    it names them, regardless of seeds or corpus size -- that reproducibility is
+    the whole reason the named list exists. Every unnamed replay falls through
+    to test, so each replay still lands in exactly one group.
+    """
+
+    config = load_config(Path(__file__).resolve().parents[1] / "configs" / "local_overfit.yaml")
+    train_ids = config.pipeline.train_replay_ids.split(",")
+    dev_ids = config.pipeline.dev_replay_ids.split(",")
+    # A corpus containing every named replay plus unrelated ones.
+    corpus = [f"/corpus/{stem}.parquet" for stem in (*train_ids, *dev_ids)]
+    corpus += [f"/corpus/other_{index}.parquet" for index in range(5)]
+
+    train, dev, test = _explicit_replay_selection(corpus, config)
+
+    assert [Path(path).stem for path in train] == train_ids
+    assert [Path(path).stem for path in dev] == dev_ids
+    assert len(test) == 5
+    assert set(train).isdisjoint(dev)
+    assert set(train + dev).isdisjoint(test)
+    assert len(train) + len(dev) + len(test) == len(corpus)
+
+
+def test_explicit_selection_is_off_by_default_and_fails_loudly_when_misconfigured() -> None:
+    """No named ids -> seeded split; bad named ids -> an error, never a silent shrink.
+
+    Training on fewer replays than intended because a name was misspelled would
+    quietly change what the run measures, so every failure mode raises.
+    """
+
+    root = Path(__file__).resolve().parents[1]
+    default_config = load_config(root / "config" / "default.yaml")
+    corpus = ["/corpus/a.parquet", "/corpus/b.parquet"]
+
+    # Default profiles opt out entirely: None tells the caller to use the split.
+    assert _explicit_replay_selection(corpus, default_config) is None
+
+    def with_ids(train_ids: str, dev_ids: str = ""):
+        return replace(
+            default_config,
+            pipeline=replace(
+                default_config.pipeline,
+                train_replay_ids=train_ids,
+                dev_replay_ids=dev_ids,
+            ),
+        )
+
+    # A name that is not in the corpus.
+    with pytest.raises(ValueError, match="not found in the corpus"):
+        _explicit_replay_selection(corpus, with_ids("a,missing"))
+    # The same replay in both groups would leak train data into dev.
+    with pytest.raises(ValueError, match="both train and dev"):
+        _explicit_replay_selection(corpus, with_ids("a,b", "b"))
+    # A repeated name silently shrinks the intended selection.
+    with pytest.raises(ValueError, match="duplicate replay ids"):
+        _explicit_replay_selection(corpus, with_ids("a,a"))
+    # Naming dev replays without train replays is a half-configured selection.
+    with pytest.raises(ValueError, match="train_replay_ids is empty"):
+        _explicit_replay_selection(corpus, with_ids("", "a"))
+
+    # Whitespace and trailing commas are tolerated so the YAML can be readable.
+    train, dev, test = _explicit_replay_selection(corpus, with_ids(" a , ", "b"))
+    assert [Path(path).stem for path in train] == ["a"]
+    assert [Path(path).stem for path in dev] == ["b"]
+    assert test == []
 
 
 def test_real_manifest_pipeline_uses_workers_and_resumes(tmp_path: Path) -> None:

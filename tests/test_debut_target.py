@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from thesis_ml.config import load_config
+from thesis_ml.data.features import CONTINUOUS_FEATURE_NAMES
 from thesis_ml.data.dataset import (
     CLASS_DELIMITER,
     CLASS_END,
@@ -29,7 +30,6 @@ from thesis_ml.data.dataset import (
     resolve_replay_outcome,
 )
 from thesis_ml.data.windowing import ENTITY_CODE, P1_CODE, P2_CODE, UPGRADE_CODE, WindowManifestEntry
-from thesis_ml.model.embedding import STAT_KEYS
 from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, LOSS_ID, PAD_ID, WIN_ID
 
 
@@ -82,8 +82,13 @@ class _FakeReplay:
         self.kinds = np.full(len(token_ids), ENTITY_CODE, dtype=np.uint8)
         # offsets partition the 7 token positions into 5 timesteps.
         self.offsets = np.asarray([0, 2, 3, 4, 6, 7], dtype=np.int64)
-        feature_width = 2 + len(STAT_KEYS)
+        feature_width = len(CONTINUOUS_FEATURE_NAMES)
         self.features = np.zeros((len(token_ids), feature_width), dtype=np.float32)
+        self.feature_validity = np.zeros(len(token_ids), dtype=np.uint32)
+        self.cloak_states = np.full(len(token_ids), 255, dtype=np.uint8)
+        self.buff_counts = np.full(len(token_ids), 255, dtype=np.uint8)
+        self.buff_timestep_offsets = np.zeros(len(self.offsets), dtype=np.int64)
+        self.buff_ids = np.asarray([], dtype=np.uint16)
         self.game_loops = np.asarray([0, 1, 2, 3, 4], dtype=np.int64)
         self.timestamps = np.asarray([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float64)
 
@@ -266,8 +271,13 @@ class _FakeReplayWithUpgrade:
         self.owners = np.full(len(token_ids), P2_CODE, dtype=np.uint8)
         self.kinds = np.asarray(kinds, dtype=np.uint8)
         self.offsets = np.asarray([0, 1, 3, 5, 7, 9], dtype=np.int64)
-        feature_width = 2 + len(STAT_KEYS)
+        feature_width = len(CONTINUOUS_FEATURE_NAMES)
         self.features = np.zeros((len(token_ids), feature_width), dtype=np.float32)
+        self.feature_validity = np.zeros(len(token_ids), dtype=np.uint32)
+        self.cloak_states = np.full(len(token_ids), 255, dtype=np.uint8)
+        self.buff_counts = np.full(len(token_ids), 255, dtype=np.uint8)
+        self.buff_timestep_offsets = np.zeros(len(self.offsets), dtype=np.int64)
+        self.buff_ids = np.asarray([], dtype=np.uint16)
         self.game_loops = np.asarray([0, 1, 2, 3, 4], dtype=np.int64)
         self.timestamps = np.asarray([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float64)
 

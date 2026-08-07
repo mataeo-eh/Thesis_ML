@@ -30,6 +30,7 @@
 
 - Extend the existing loop rather than forking a parallel trainer; the real pipeline (`pipeline/train_pipeline.py`) drives this loop.
 - Keep metric definitions aligned with the epoch CSV / `metrics.jsonl` fields documented in `RUN.md`.
+- When corruption, scored positions, class weighting, auxiliary objectives, self-conditioning, optimizer/scheduler, accumulation, precision, gradient handling, EMA, or checkpoint state changes, update every affected training/model-flow section in `../../../Model_Architecture/MODEL_ARCHITECTURE.md`, update the canonical `.mmd`, and regenerate its SVG/PNG using `UPDATE_PROMPT.md`.
 
 ## Verification
 

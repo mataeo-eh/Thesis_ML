@@ -20,6 +20,7 @@
 ## Work Guidance
 
 - Add new special tokens by extending `special_tokens.py` and reserving IDs, not by overloading existing tokens.
+- Any vocabulary-ID, content-token, state-space, or maximum-ID change must update `../../../Model_Architecture/MODEL_ARCHITECTURE.md` in the same change, including embedding/head shapes, parameter totals, logits, corruption/sampler state space, memory arithmetic, and caveats; then update the canonical `.mmd` labels and regenerate its SVG/PNG. Use `UPDATE_PROMPT.md` and recompute rather than editing one number in isolation.
 
 ## Verification
 

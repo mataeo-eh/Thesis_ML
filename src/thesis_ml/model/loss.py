@@ -65,21 +65,54 @@ FUTURE_DISTANCE_BUCKETS = {
 }
 
 # t-bucket loss-breakdown names, in the canonical order used for CSV columns.
-# Each training/eval example's sampled noise level t (from the corruption
-# step) lands in EXACTLY ONE of these contiguous, exhaustive buckets over [0, 1]:
-#   t == 1.0            -> "t_eq_1"
-#   0.7 <= t < 1.0      -> "t_0_7_to_1_0"
-#   0.5 <= t < 0.7      -> "t_0_5_to_0_7"
-#   0.3 <= t < 0.5      -> "t_0_3_to_0_5"
-#   0.0 <= t < 0.3      -> "t_0_0_to_0_3"
+# Each training/eval example's sampled noise level t (from the corruption step)
+# is that example's CORRUPTION LEVEL: the probability each canvas position was
+# independently replaced. Every example lands in EXACTLY ONE of these
+# contiguous, exhaustive buckets over [0, 1]:
+#   t == 1.0             -> "t_eq_1"          (fully corrupted: pure generation)
+#   0.75 <= t < 1.0      -> "t_0_75_to_1_0"   (nearly fully corrupted)
+#   0.25 <= t < 0.75     -> "t_0_25_to_0_75"  (mid corruption)
+#   0.00 <= t < 0.25     -> "t_0_0_to_0_25"   (lightly corrupted: mostly clean)
+#
+# WHY these boundaries: t == 1.0 is separated from "almost 1.0" on purpose. At
+# exactly t=1 the model sees NO surviving ground-truth canvas token and must
+# generate the sequence from the input alone, which is the hardest and most
+# diagnostic regime; at t=0.99 a handful of true tokens survive and can anchor
+# the rest, so averaging the two would hide how the model actually does at full
+# corruption. Read these together with the CANVAS_STATE_NAMES split below:
+# t-buckets say "how corrupted was the example", the canvas-state split says
+# "how well did the model handle the clean vs corrupted positions inside it".
+#
 # Emitted in BOTH pre-training and fine-tuning.
 T_BUCKET_NAMES = (
     "t_eq_1",
-    "t_0_7_to_1_0",
-    "t_0_5_to_0_7",
-    "t_0_3_to_0_5",
-    "t_0_0_to_0_3",
+    "t_0_75_to_1_0",
+    "t_0_25_to_0_75",
+    "t_0_0_to_0_25",
 )
+
+# Canvas-state loss-breakdown names. This splits every scored canvas position by
+# whether the token the MODEL ACTUALLY SAW at that position was already the
+# correct one:
+#   "ground_truth_preserved" -> the noised canvas token equals the target, so the
+#       model's job is to RECOGNIZE it as already-correct and keep it. A falling
+#       loss here means the model has learned what a valid sequence looks like
+#       well enough to leave true tokens alone.
+#   "noised"                 -> the noised canvas token differs from the target,
+#       so the model must REPAIR it. This is the denoising work proper.
+#
+# WHY this is keyed on actual token inequality rather than on the corruption
+# coin-flip: under uniform diffusion a "corrupted" position can be re-drawn as
+# the very same token it already held. From the model's point of view that
+# position is indistinguishable from an untouched one, so scoring it as "noised"
+# would blur exactly the distinction this breakdown exists to measure. The
+# caller therefore passes ``CorruptionOutput.changed_positions`` (token
+# inequality), not ``corrupted_positions`` (the Bernoulli branch).
+#
+# Under the absorbing ablation only corrupted positions are scored at all, so
+# "ground_truth_preserved" is legitimately empty there and is simply omitted
+# (the same empty-key convention ``per_class`` uses).
+CANVAS_STATE_NAMES = ("ground_truth_preserved", "noised")
 
 # Perspective-split loss-breakdown names. Each example is built from one player's
 # perspective (``DatasetExample.perspective_player``); "p1" means p1 is the
@@ -97,12 +130,15 @@ class LossOutput:
     per_class: dict[str, torch.Tensor]
     future_distance: dict[str, torch.Tensor]
     future_distance_counts: dict[str, int]
-    # Clean-state CE broken down by the example's sampled t-bucket and by the
-    # example's player perspective. Both follow the SAME emptiness convention as
-    # ``per_class``: a bucket/perspective with zero scored tokens is simply
-    # ABSENT from the dict (no key), rather than present-with-a-sentinel.
+    # Clean-state CE broken down by the example's sampled t-bucket, by the
+    # example's player perspective, and by per-position canvas state
+    # (ground-truth-preserved vs actually-noised). All three follow the SAME
+    # emptiness convention as ``per_class``: a bucket/perspective/state with zero
+    # scored tokens is simply ABSENT from the dict (no key), rather than
+    # present-with-a-sentinel.
     t_bucket: dict[str, torch.Tensor]
     perspective: dict[str, torch.Tensor]
+    canvas_state: dict[str, torch.Tensor]
 
 
 class CanvasCrossEntropyLoss(nn.Module):
@@ -155,6 +191,7 @@ class CanvasCrossEntropyLoss(nn.Module):
         prediction_distances: torch.Tensor | None = None,
         sampled_t: torch.Tensor | None = None,
         perspective_ids: torch.Tensor | None = None,
+        changed_positions: torch.Tensor | None = None,
     ) -> LossOutput:
         ce = F.cross_entropy(
             canvas_logits.transpose(1, 2),
@@ -199,10 +236,9 @@ class CanvasCrossEntropyLoss(nn.Module):
             t_row = sampled_t.to(ce.device)
             bucket_row_masks = {
                 "t_eq_1": t_row == 1.0,
-                "t_0_7_to_1_0": (t_row >= 0.7) & (t_row < 1.0),
-                "t_0_5_to_0_7": (t_row >= 0.5) & (t_row < 0.7),
-                "t_0_3_to_0_5": (t_row >= 0.3) & (t_row < 0.5),
-                "t_0_0_to_0_3": t_row < 0.3,
+                "t_0_75_to_1_0": (t_row >= 0.75) & (t_row < 1.0),
+                "t_0_25_to_0_75": (t_row >= 0.25) & (t_row < 0.75),
+                "t_0_0_to_0_25": t_row < 0.25,
             }
             for name in T_BUCKET_NAMES:
                 bucket_mask = active & bucket_row_masks[name].unsqueeze(1)
@@ -224,6 +260,23 @@ class CanvasCrossEntropyLoss(nn.Module):
                 if perspective_mask.any():
                     perspective[name] = ce[perspective_mask].mean()
 
+        # Canvas-state breakdown (BOTH pipelines). Unlike the t-bucket split,
+        # which partitions whole EXAMPLES by their sampled corruption level, this
+        # partitions individual POSITIONS by whether the token the model was shown
+        # there already matched the target. See CANVAS_STATE_NAMES for why this
+        # uses token inequality rather than the corruption coin-flip.
+        canvas_state: dict[str, torch.Tensor] = {}
+        if changed_positions is not None:
+            changed = changed_positions.to(device=ce.device, dtype=torch.bool)
+            state_masks = {
+                "ground_truth_preserved": active & ~changed,
+                "noised": active & changed,
+            }
+            for name in CANVAS_STATE_NAMES:
+                state_mask = state_masks[name]
+                if state_mask.any():
+                    canvas_state[name] = ce[state_mask].mean()
+
         return LossOutput(
             loss=aggregate,
             per_class=per_class,
@@ -231,4 +284,5 @@ class CanvasCrossEntropyLoss(nn.Module):
             future_distance_counts=future_distance_counts,
             t_bucket=t_bucket,
             perspective=perspective,
+            canvas_state=canvas_state,
         )
