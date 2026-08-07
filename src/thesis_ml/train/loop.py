@@ -1118,6 +1118,11 @@ class TrainingLoop:
                         input_attention_mask=batch.input_attention_mask,
                         canvas_attention_mask=batch.canvas_attention_mask,
                         input_features=batch.input_features,
+                        # Real (non-pad) input token counts, needed by the
+                        # per-segment RoPE position ablation. Passed explicitly
+                        # because the batch already carries it; the model would
+                        # otherwise re-derive the same values from the mask.
+                        input_lengths=batch.input_lengths,
                     )
                     canvas_self_conditioning = canvas_self_conditioning_from_logits(
                         estimate.logits[:, input_len:, :],
@@ -1132,6 +1137,9 @@ class TrainingLoop:
                 "input_attention_mask": batch.input_attention_mask,
                 "canvas_attention_mask": batch.canvas_attention_mask,
                 "input_features": batch.input_features,
+                # See the self-conditioning estimate above: the per-segment RoPE
+                # position ablation needs the real input token count per row.
+                "input_lengths": batch.input_lengths,
             }
             if self.config.model.self_conditioning:
                 forward_kwargs["canvas_self_conditioning"] = canvas_self_conditioning

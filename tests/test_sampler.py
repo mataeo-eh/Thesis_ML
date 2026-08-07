@@ -14,6 +14,7 @@ from thesis_ml.inference.sampler import (
     sample_canvas,
 )
 from thesis_ml.inference.timing import attach_absolute_times
+from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.train.train import make_synthetic_examples
 from thesis_ml.vocab.content_vocab import build_content_vocabulary
 from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, MASK_ID, PAD_ID, WIN_ID
@@ -171,6 +172,51 @@ def test_mask_is_excluded_but_outcome_tokens_are_not_position_restricted() -> No
     assert output.canvas[0, 2] == WIN_ID
 
 
+def test_sample_canvas_frozen_input_kv_cache_flags_and_reproducibility() -> None:
+    """Sampler-level integration test of the `frozen_input_kv` cache-reuse
+    contract described in `sample_canvas`'s docstring: step 1 asks for the
+    cache back (it is the step that BUILDS it, so it reports
+    `used_cached_input_kv=False`), and every later step hands the cache back
+    in (`used_cached_input_kv=True`).
+
+    Also proves the cache substitution introduces no nondeterminism: running
+    the exact same sampling twice from the same seed is bit-for-bit
+    reproducible. The underlying numerical claim -- that a cached forward
+    equals a freshly recomputed one -- is proven directly (and more
+    precisely) at the model level in
+    `tests/test_model.py::test_frozen_input_kv_cached_forward_matches_recomputed_forward`;
+    this test instead proves the SAMPLER wires that mechanism correctly across
+    its multi-step loop, which a model-level test cannot see.
+    """
+
+    base = load_config("config/default.yaml")
+    config = replace(
+        base,
+        data=replace(base.data, input_budget_tokens=64, canvas_budget_tokens=6),
+        model=replace(
+            base.model,
+            d_model=16,
+            layers=1,
+            heads=2,
+            ffn=32,
+            frozen_input_kv=True,
+            self_conditioning=False,
+        ),
+        sampler=replace(base.sampler, max_steps=3, entropy_bound=100.0, adaptive_stop=False),
+    )
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    batch = _batch(config)
+
+    first = sample_canvas(model, batch, config)
+    second = sample_canvas(model, batch, config)
+
+    assert first.steps == 3
+    assert [step.used_cached_input_kv for step in first.trace] == [False, True, True]
+    assert torch.equal(first.canvas, second.canvas)
+    for left, right in zip(first.trace, second.trace, strict=True):
+        assert torch.equal(left.canvas, right.canvas)
+
+
 def test_sampling_checkpoint_validates_architecture_and_process_before_loading(tmp_path) -> None:
     config = _small_config(canvas_budget=3, max_steps=1)
     model = FixedCanvasModel(torch.tensor([WIN_ID, END_ID, PAD_ID]), config=config)
@@ -199,6 +245,77 @@ def test_sampling_checkpoint_validates_architecture_and_process_before_loading(t
     torch.save(payload, cross_process)
     with pytest.raises(ValueError, match="diffusion process mismatch"):
         load_sampling_checkpoint(model, cross_process)
+
+
+def _real_model_config(**toggles: bool) -> ProjectConfig:
+    """A tiny REAL-model config for the toggle-gating tests below.
+
+    The rest of this file's tests use `FixedCanvasModel`, a lightweight stub
+    that never touches the real backbone/embedding, so it cannot exercise the
+    architecture ablation toggles at all. These tests need an actual
+    `SC2StrategyDiffusionModel` (whose `architecture_identity` genuinely
+    reflects `**toggles`) instead.
+    """
+
+    config = load_config("config/default.yaml")
+    return replace(config, model=replace(config.model, d_model=16, layers=1, heads=2, ffn=32, **toggles))
+
+
+def _save_sampling_checkpoint(model: SC2StrategyDiffusionModel, path) -> None:
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "ema_model": model.state_dict(),
+            "feature_statistics_identity": model.feature_statistics_identity,
+            "architecture_identity": model.architecture_identity,
+            "diffusion_process": model.diffusion_process,
+        },
+        path,
+    )
+
+
+def test_inference_load_rejects_a_checkpoint_from_a_different_ablation_toggle_set(tmp_path) -> None:
+    """`load_sampling_checkpoint` (the inference load path) must reject a
+    checkpoint written under a DIFFERENT architecture ablation toggle set --
+    the third and last of the three load paths this rejection must hold for
+    (full resume and warm start are covered in `tests/test_training.py` and
+    `tests/test_finetune_pipeline.py`).
+
+    Covers the user's explicit minimum case: a
+    `{frozen_input_kv, segment_embeddings, per_segment_positions}` model must
+    NOT load a `{frozen_input_kv}`-only checkpoint. `frozen_input_kv` and
+    `per_segment_positions` add zero parameters, so `load_state_dict` alone
+    would not catch this -- only `architecture_identity` can.
+    """
+
+    source_model = SC2StrategyDiffusionModel(_real_model_config(frozen_input_kv=True), vocab_size=32)
+    checkpoint_path = tmp_path / "frozen_kv_only.pt"
+    _save_sampling_checkpoint(source_model, checkpoint_path)
+
+    mismatched_model = SC2StrategyDiffusionModel(
+        _real_model_config(frozen_input_kv=True, segment_embeddings=True, per_segment_positions=True),
+        vocab_size=32,
+    )
+    with pytest.raises(ValueError, match="architecture identity mismatch"):
+        load_sampling_checkpoint(mismatched_model, checkpoint_path)
+
+
+def test_inference_load_accepts_a_checkpoint_from_the_matching_ablation_toggle_set(tmp_path) -> None:
+    """The positive counterpart: a `{segment_embeddings}` model MUST load a
+    `{segment_embeddings}` checkpoint (the user's other explicitly named
+    minimum case).
+    """
+
+    config = _real_model_config(segment_embeddings=True)
+    source_model = SC2StrategyDiffusionModel(config, vocab_size=32)
+    checkpoint_path = tmp_path / "segment_embeddings.pt"
+    _save_sampling_checkpoint(source_model, checkpoint_path)
+
+    target_model = SC2StrategyDiffusionModel(config, vocab_size=32)
+    load_sampling_checkpoint(target_model, checkpoint_path)  # must not raise
+
+    for restored, saved in zip(target_model.parameters(), source_model.parameters(), strict=True):
+        assert torch.equal(restored, saved)
 
 
 def test_decoder_and_time_recovery_contracts() -> None:

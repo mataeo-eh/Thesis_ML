@@ -22,6 +22,7 @@ Unless a section explicitly says otherwise, exact run-profile values refer to th
 - Output: one untied, bias-free **256 → 383** token head at every concatenated position; training slices and scores only the canvas region.
 - Position encoding: parameter-free Llama 3.1-style frequency-scaled RoPE.
 - No encoder-decoder split, cross-attention, causal mask, learned positional embedding, region/segment embedding, copy head, classification head, or explicit diffusion-time embedding.
+- Three config-gated architecture ablation toggles exist and are all `false` in every committed profile. The bullet above and every shape, count, and behavior in this document describe that all-off state, which is the architecture as it has always been. See "Architecture ablation toggles".
 
 ## End-to-end data flow
 
@@ -42,6 +43,10 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 | `model.qk_norm` | true |
 | `model.self_conditioning` | true |
 | `model.gradient_checkpointing` | true |
+| `model.frozen_input_kv` | false |
+| `model.segment_embeddings` | false |
+| `model.per_segment_positions` | false |
+| Derived `architecture_identity` | `uniform-gemma4-dense-v1` |
 | `model.rope_theta` | 500,000 |
 | RoPE type | `llama3` |
 | RoPE factor | 8.0 |
@@ -277,7 +282,7 @@ X_0 \in \mathbb{R}^{9 \times 8192 \times 256}.
 
 The combined boolean mask is `[input_attention_mask; canvas_attention_mask]`. Attention is fully bidirectional and non-causal. The mask is a broadcast key mask shaped internally as `[B, 1, 1, L]`; it masks invalid keys, not query computation. Input logits and padded-query hidden states may be computed, but only canvas positions enter the loss.
 
-There is no learned input/canvas region embedding. Region identity is expressed indirectly through feature residual availability, self-conditioning on the canvas, token grammar, and concatenated position.
+There is no learned input/canvas region embedding. Region identity is expressed indirectly through feature residual availability, self-conditioning on the canvas, token grammar, and concatenated position. The `model.segment_embeddings` toggle exists to make that identity explicit and is `false` in every committed profile; see "Architecture ablation toggles".
 
 ## Transformer backbone
 
@@ -293,6 +298,8 @@ Each attention layer owns a parameter-free Llama 3.1-style frequency-scaled rota
 - original context 8,192.
 
 The 32-element inverse-frequency tensor is a non-persistent FP32 buffer in each of the 10 layers. RoPE can evaluate arbitrary sequence lengths and contains no learned position parameters; 8,192 is the configured scaling reference and current maximum budget-derived length, not a hard implementation cap.
+
+Positions are `arange(L_i + 4096)` over the concatenated sequence, shared by every batch row, producing `cos`/`sin` of shape `[L, 64]`. Rotary phases therefore encode only relative offsets `i - j`; the model receives no absolute index. The `model.per_segment_positions` toggle replaces the shared `arange` with explicit per-example position ids and is `false` in every committed profile; see "Architecture ablation toggles".
 
 ### One transformer block
 
@@ -343,6 +350,70 @@ where gate and up project `256 → 1024` and down projects `1024 → 256`.
 ### Gradient checkpointing
 
 The local-full profile checkpoints each transformer block while training. This changes activation storage and recomputation, but does not change model outputs, parameter shapes, or parameter counts.
+
+## Architecture ablation toggles
+
+Three independent boolean fields on `ModelConfig` control how the input region and the canvas region relate to each other. They exist so an ablation can isolate why the position-pinned rare classes fail to fit; the motivating failure analysis is `diagnostics/009-rare-class-position-blindness.md` and the implementation interface is `diagnostics/009-ablation-toggle-interface-map.md`.
+
+**All three are `false` in `config/default.yaml` and in every profile under `configs/`.** With all three false the model is bit-identical to the architecture this document otherwise describes: identical module tree, identical `state_dict` keys, identical tensor operations, identical `architecture_identity`, 11,042,880 trainable parameters. Every other section of this document describes that all-off state.
+
+`configs/local_overfit_v2.yaml` is the ablation control surface: exactly one flag is flipped there per arm.
+
+Each toggle is read once in `SC2StrategyDiffusionModel.__init__` and handed to the subsystem that owns it: `segment_embeddings` to `InputContextEmbedding`, `frozen_input_kv` to `BidirectionalTransformer`, and `per_segment_positions` to a plain `self.per_segment_positions` attribute so `forward` never reaches back into the config object at step time.
+
+### `model.frozen_input_kv`
+
+Splits the single joint bidirectional forward into two passes.
+
+1. Pass 1 runs the input region alone through all 10 blocks, attending only to itself, capturing each layer's post-RoPE, post-QK-norm input `K` and `V` as `[B, 4, L_i, 64]` pairs.
+2. Pass 2 runs the canvas region through all 10 blocks, where at layer `l` canvas queries attend to `concat(cached_input_K[l], canvas_K)` and the matching `V`. The key mask is the full combined `[B, 1, 1, L_i + 4096]` broadcast key mask already built today; the query axis is 4,096.
+
+This is a real semantic change: input hidden states stop depending on the canvas, which they do in the joint stack. The payoff is inference cost — the input KV is computed once and reused across the remaining denoising passes rather than recomputed per pass. See "Sampling machinery" for how the sampler exploits it and for the measured per-step speedup.
+
+`SC2StrategyDiffusionModel.forward` exposes the cache through three additions, all defaulted so every historical call site is unchanged: `cached_input_kv: FrozenInputKV | None`, `return_cached_input_kv: bool`, and a `cached_input_kv` field on `ModelOutput` populated only when the cache was requested. `FrozenInputKV` carries one `(K, V)` pair per block plus the input region's own pre-`final_norm` hidden states, so a cache-reusing forward still emits full-length output rather than padding the input half with zeros.
+
+Requesting or supplying a cache while the ablation is off, or with an empty input region, raises `ValueError` in the backbone; it never silently degrades to the joint path.
+
+Adds **zero parameters** and zero `state_dict` keys. The backbone still returns a full-length `[B, L_i + 4096, 256]` hidden state; the input half is concatenated back on before the final RMSNorm so every downstream `logits[:, L_i:, :]` slice stays valid.
+
+### `model.segment_embeddings`
+
+Adds a learned `nn.Embedding(2, 256)` — row `0` = input segment, row `1` = canvas segment — to the **final** per-region embedding inside `InputContextEmbedding`, after the joint feature residual on the input side and after the scale-less self-conditioning post-norm on the canvas side, so the term is not renormalized away.
+
+The table is zero-initialized by `InputContextEmbedding.reset_segment_embeddings()`, which `SC2StrategyDiffusionModel.__init__` calls immediately after `reset_joint_output()` and for the same reason: the generic `_init_weights` sweep re-initializes every `nn.Embedding` at `std = 0.02` and would otherwise leave the table non-zero. At zero the segment term adds nothing, so day-0 behavior with the toggle enabled matches the baseline exactly and any later divergence is attributable to learning rather than to initialization noise. The reset is unconditional and is a no-op when the toggle is off.
+
+When the toggle is off the module is not constructed at all — the attribute holds a plain `None`, which `nn.Module` does not register — so **no extra `state_dict` keys appear** and existing checkpoints load under strict `load_state_dict`.
+
+This is the only one of the three that adds parameters. When enabled it adds `2 × 256 = 512` trainable parameters to the embedding subsystem, taking the whole-model total from 11,042,880 to 11,043,392.
+
+### `model.per_segment_positions`
+
+Computes RoPE position ids **per segment** instead of as one `arange` over the concatenated sequence. The module-level helper `_build_per_segment_position_ids` in `src/thesis_ml/model/model.py` returns a `[B, L_i + 4096]` long tensor in which:
+
+- input real content receives `0 … L-1` in its left-padded slots, by subtracting the row's `input_len - input_lengths[i]` offset from an `arange`; the left-pad slots go negative and are `clamp_min(0)`-ed. Pinning them to `0` is deliberate rather than incidental — those slots are excluded from attention as keys and their logits are never scored, so their rotation is unobservable, but it must still be defined;
+- the canvas restarts at `0` at canvas index 0.
+
+`input_lengths` reaches `forward` by either of two routes that are identically equal by construction: a caller holding `batch.input_lengths` passes it explicitly, and a caller that does not gets it derived as `attention_mask[:, :input_len].sum(dim=1)`. The collater sets exactly `input_lengths` mask entries True per row, so the choice is a micro-optimization and cannot change an output value.
+
+Positions therefore become **per-example**, so `RotaryEmbedding.forward` returns `cos`/`sin` of shape `[B, L, 64]` instead of `[L, 64]`, and `apply_rope` dispatches on that rank difference. The baseline branch is retained verbatim (`torch.arange` + `torch.outer`), and the batched broadcast multiply on the new branch was verified bitwise-identical to `torch.outer` on the 1-D case, so the toggle-off numerics are unchanged.
+
+Adds **zero parameters** and zero `state_dict` keys. RoPE remains parameter-free.
+
+Note that per-segment positions **alias** the two regions onto the same relative offsets, so this toggle is designed to compose with `model.segment_embeddings`, which is what re-disambiguates them.
+
+### Derived `architecture_identity` and checkpoint compatibility
+
+`toggle_fingerprint(model_config)` in `src/thesis_ml/config.py` returns the empty string when all three toggles are false, otherwise an alphabetically sorted `+`-joined suffix of the enabled field names, for example `+frozen_input_kv+per_segment_positions`. `SC2StrategyDiffusionModel.__init__` stamps:
+
+```python
+self.architecture_identity = ARCHITECTURE_ID + toggle_fingerprint(model_config)
+```
+
+With all toggles off this is the unchanged `uniform-gemma4-dense-v1`, so every existing checkpoint remains loadable. `validate_checkpoint_compatibility` compares the stamp on load and raises before any weights are read, so a checkpoint from one ablation arm cannot resume from, warm-start, sample from, or feed diagnostics for a model built with a different toggle set.
+
+**This gating is necessary rather than defensive.** `frozen_input_kv` and `per_segment_positions` add no parameters and no keys, so a strict `load_state_dict` across mismatched arms would otherwise succeed silently and quietly corrupt the comparison with no error anywhere. Only `segment_embeddings` would be caught by key mismatch alone.
+
+Practical consequence: each enabled arm needs its own `storage.checkpoint_uri`, or its first save will collide with a baseline `last.pt` that it can no longer load.
 
 ## Output head and loss
 
@@ -444,6 +515,8 @@ Setting both false writes no interval row at all rather than an all-blank one, a
 | Scale-less post RMSNorm | no learned scale | 0 |
 | **Embedding subsystem total** |  | **447,296** |
 
+The optional segment table is absent from this inventory because `model.segment_embeddings` is `false` in every committed profile and the module is then not constructed. Enabling it would add one `2 × 256` table, `512` parameters, to this subsystem. `model.frozen_input_kv` and `model.per_segment_positions` add no parameters in either state.
+
 ### One transformer block
 
 | Parameter group | Shape/count derivation | Parameters |
@@ -473,6 +546,8 @@ Ten blocks contain `10 × 1,049,728 = 10,497,280` parameters. The final RMSNorm 
 
 Every model parameter currently has `requires_grad=True`.
 
+This total is confirmed against live construction by `tests/test_windowing.py::test_local_model_parameter_count_is_near_ten_million`, which passes on the current source with all three ablation toggles `false`. The full suite stands at 230 passed, 0 failed. Adding the toggles changed no parameter count in the all-off state.
+
 ### Non-trainable model buffers
 
 | Buffer group | Elements |
@@ -492,7 +567,7 @@ All embeddings and linear weights normally initialize from `Normal(0, 0.02)`. At
 \sigma_{residual} = \frac{0.02}{\sqrt{2 \times 10}} \approx 0.0044721.
 \]
 
-Linear biases initialize to zero and learned RMSNorm scales initialize to one. After generic initialization, the joint mixer's final weight and bias are reset to zero.
+Linear biases initialize to zero and learned RMSNorm scales initialize to one. After generic initialization, the joint mixer's final weight and bias are reset to zero, and the optional segment table is reset to zero by the same post-sweep mechanism. That second reset is a no-op in every committed profile, where the table does not exist.
 
 ## Optimizer, scheduler, EMA, and precision
 
@@ -556,6 +631,43 @@ Acceptance is transient and recomputed on every pass; a previously plausible pos
 
 Normal sampling returns a canvas `[B, 4096]`. Optional diagnostic final logits require one explicitly requested extra forward pass and have shape `[B, 4096, 383]`. The diagnostics-only one-pass path starts from the selected process's terminal prior and performs exactly one denoiser call.
 
+### Forward-call count is exactly one per pass
+
+Normal sampling performs exactly one model call per denoising pass and no post-sampling call. This is a contract, not an incidental property, and `tests/test_sampler.py` asserts it directly as `model.calls == output.steps` (`steps + 1` only when diagnostic final logits are requested).
+
+### Frozen input-KV reuse during sampling
+
+When the sampled model has `model.frozen_input_kv` enabled, the sampler reuses the input region's per-layer K/V across passes instead of recomputing it:
+
+- the **first** pass passes `return_cached_input_kv=True` and captures the returned `FrozenInputKV`;
+- **every subsequent** pass passes `cached_input_kv=cache`, which skips all 10 backbone blocks over the input region entirely;
+- the optional diagnostic final-logits call reuses the same cache.
+
+There is deliberately **no separate cache-priming forward before the loop**. Priming would add a whole extra full-length model call and would violate the one-call-per-pass contract above. The consequence is that the first pass is the expensive one and every later pass is cheap, rather than all passes being uniformly cheap after a hidden setup cost.
+
+Measured on CPU at `input_len = 1536`: the cache-building pass takes 0.0693 s against a 0.0097 s mean for cache-reusing passes, a **7.1× per-step speedup**. The saving grows with input length and is zero when the toggle is off.
+
+Eligibility is decided by a sampler-side predicate that mirrors the backbone's own condition exactly — `frozen_input_kv and input_len > 0` — read off the **model**, not off `ProjectConfig`, because the model is what the call actually reaches. The `ValueError` the backbone raises on an illegal cache request is therefore unreachable from the sampler. With the toggle off the model call is argument-for-argument identical to its historical form.
+
+### Per-segment position ids during sampling
+
+`input_lengths=` is passed at the three sampler forward call sites only when **both** conditions hold: the model declares `per_segment_positions` truthy, and the batch actually exposes an `input_lengths` tensor. Either failing omits the kwarg, and the model's documented mask-derived fallback produces the identical value.
+
+Both halves of that guard are load-bearing and must not be "simplified" away. The sampler helpers are also invoked with duck-typed stand-in models and `SimpleNamespace` batches by `tests/test_eval.py`, `tests/test_viz.py`, and `tests/test_finetune_report.py`, whose `forward` signatures accept only the historical arguments; passing the kwarg unconditionally breaks eight tests. The length tensor is moved onto the active device, because a `DiffusionBatch` always arrives on CPU and building CUDA position ids from a CPU length tensor would fail.
+
+### Per-pass trace telemetry
+
+`SamplerStep` carries two defaulted fields beyond the acceptance/entropy/stopping record:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `forward_wall_seconds` | `float`, default `0.0` | Wall time of that pass's single model forward call. |
+| `used_cached_input_kv` | `bool`, default `False` | Whether the pass reused a `FrozenInputKV` instead of re-running the input region. |
+
+`used_cached_input_kv` is `False` on the cache-building first pass of a frozen-KV run, `True` on every later pass, and `False` on every pass of a toggle-off run. Comparing the two groups' `forward_wall_seconds` is what makes the frozen-KV payoff observable rather than merely asserted.
+
+Timing follows the convention `train/loop.py` already established: `time.perf_counter` on CPU, and `torch.cuda.Event` pairs with a synchronizing read on GPU, because CUDA launches asynchronously and a bare host-side timer around a GPU forward would report a fictional speedup. Both fields are defaulted, so existing trace consumers are unaffected. This is performance instrumentation and is unrelated to `src/thesis_ml/inference/timing.py`, which owns in-game absolute-clock recovery per `SPEC.md` §7 and is correctly untouched by it.
+
 ## Pretraining versus debut/outcome fine-tuning
 
 Fine-tuning reuses the same model, embeddings, backbone, 383-way token head, and parameter count. It does not add a classification head.
@@ -576,15 +688,18 @@ The stable numeric class IDs remain the same, but IDs 0–2 are interpreted as v
 These are high-consequence implementation facts that must remain explicit in future updates:
 
 1. **No explicit diffusion-time input.** Training samples `t`, but the model forward signature does not receive it.
-2. **One joint bidirectional stack.** Input and canvas are concatenated; there is no encoder-decoder split or cross-attention.
+2. **One joint bidirectional stack.** Input and canvas are concatenated; there is no encoder-decoder split or cross-attention. The `model.frozen_input_kv` toggle would split this into two passes and is `false` everywhere.
 3. **Input logits are computed but unsupervised.** The output head runs over the whole sequence, then training slices away `Li` positions.
 4. **Output weights are untied.** Token embedding and output head have equal shapes but are separate parameter tensors.
-5. **No region embedding.** There is no learned input-versus-canvas segment ID.
+5. **No region embedding.** There is no learned input-versus-canvas segment ID. The `model.segment_embeddings` toggle would add one and is `false` everywhere; when off, its table is not constructed and contributes no `state_dict` keys.
 6. **Semantic padding is learned.** `[PAD]` inside the canvas is an attended target; batch-shape padding is excluded.
 7. **Tensor IDs 6–99 participate in uniform noise and inference.** Only `[MASK]` is explicitly excluded, even though 6–99 are unnamed.
 8. **Null self-conditioning still normalizes canvas embeddings.** With a zero conditioning signal, canvas token embeddings pass through the scale-less post RMSNorm.
 9. **Q/K norm scales are shared across heads within a layer.** Each Q or K norm owns 64 values, not `4 × 64` independent values.
 10. **Gradient checkpointing is not architecture capacity.** It changes compute/memory tradeoffs only.
+11. **RoPE is the only positional signal and it is purely relative.** Attention scores depend on `i - j` alone; no absolute index reaches the model. The input region is left-padded and the canvas right-padded, so the last real input token always sits at relative offset `-1` from canvas index 0, but nothing marks that key as the last input token.
+12. **All three ablation toggles default to `false` and the all-off model is bit-identical to the pre-toggle architecture.** Two of them add no parameters and no `state_dict` keys, which is precisely why enabling any toggle changes `architecture_identity`: without that stamp, checkpoints would load silently across mismatched ablation arms.
+13. **Frozen-KV sampling adds no forward call.** The cache is captured from the first denoising pass rather than from a dedicated priming pass, so normal sampling still makes exactly one model call per pass. A priming forward would be the obvious-looking optimization and would break that contract.
 
 ## Provenance boundary
 
@@ -603,6 +718,8 @@ The last recorded `local_full` console log predates the current feature-conditio
 | Embedding and conditioning | `src/thesis_ml/model/embedding.py` |
 | Transformer/RoPE | `src/thesis_ml/model/backbone.py` |
 | Model assembly/output | `src/thesis_ml/model/model.py` |
+| Ablation toggle fields and `toggle_fingerprint` | `src/thesis_ml/config.py`, `config/default.yaml`, `configs/local_overfit_v2.yaml` |
+| `architecture_identity` stamping and checkpoint gating | `src/thesis_ml/model/model.py` (`ARCHITECTURE_ID`, `validate_checkpoint_compatibility`) |
 | Canvas loss | `src/thesis_ml/model/loss.py` |
 | Corruption | `src/thesis_ml/train/corruption.py` |
 | Optimizer, scheduler, self-conditioning, EMA | `src/thesis_ml/train/loop.py` |
@@ -613,3 +730,5 @@ The last recorded `local_full` console log predates the current feature-conditio
 ## Required freshness check
 
 When any source above or any model-facing config changes, use `UPDATE_PROMPT.md`, recompute the live values, update every affected section here, edit the canonical `.mmd`, regenerate the SVG/PNG, run the owning focused tests, and refresh the semantic indexes. Do not append a new architecture version; replace stale content in place.
+
+**Diagram scope.** `MODEL_ARCHITECTURE_DIAGRAM.mmd` depicts the training-time forward path only: embeddings, corruption, self-conditioning, region concatenation, the block stack, the head, the canvas slice, and the loss decompositions. It contains no sampling nodes, no denoising-loop edge, no forward-call-count node, and no input-KV node. It also depicts the all-toggles-off path, which is what every committed profile executes. The three ablation toggles and the sampler's frozen-KV reuse, per-pass trace fields, and `input_lengths` guard therefore changed no node, label, or edge in that graph, and the `.mmd`/SVG/PNG were correctly left unregenerated in that change. A future change that enables a toggle by default, or that alters the depicted training path, does require the full diagram pass.

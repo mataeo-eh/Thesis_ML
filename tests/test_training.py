@@ -395,6 +395,65 @@ def test_checkpoint_roundtrip_restores_model_optimizer_and_step(tmp_path: Path) 
     assert logs
 
 
+def test_full_resume_rejects_a_checkpoint_from_a_different_ablation_toggle_set(tmp_path: Path) -> None:
+    """`load_checkpoint` (full resume) must reject a checkpoint written under a
+    DIFFERENT architecture ablation toggle set, via
+    `validate_checkpoint_compatibility`.
+
+    `frozen_input_kv` and `per_segment_positions` add ZERO parameters, so
+    without this gate `load_state_dict` would silently SUCCEED across
+    mismatched arms and quietly corrupt the ablation study -- the
+    `architecture_identity` string is the only thing that can catch it. Covers
+    the user's explicit minimum case: a
+    `{frozen_input_kv, segment_embeddings, per_segment_positions}` run must
+    NOT resume a `{frozen_input_kv}`-only run's checkpoint. The rejection must
+    be a raised error, not a warning or silent no-op.
+    """
+
+    source_config = _small_config(tmp_path, frozen_input_kv=True)
+    source_loop = TrainingLoop(
+        model=SC2StrategyDiffusionModel(source_config, vocab_size=128), config=source_config, seed=41
+    )
+    checkpoint_path = source_loop.save_checkpoint(tmp_path / "checkpoints" / "frozen_kv_only.pt")
+
+    mismatched_config = _small_config(
+        tmp_path, frozen_input_kv=True, segment_embeddings=True, per_segment_positions=True
+    )
+    mismatched_loop = TrainingLoop(
+        model=SC2StrategyDiffusionModel(mismatched_config, vocab_size=128),
+        config=mismatched_config,
+        seed=41,
+    )
+
+    with pytest.raises(ValueError, match="architecture identity mismatch"):
+        mismatched_loop.load_checkpoint(checkpoint_path)
+
+
+def test_full_resume_accepts_a_checkpoint_from_the_matching_ablation_toggle_set(tmp_path: Path) -> None:
+    """The positive counterpart of the rejection test above: a
+    `{segment_embeddings}` run MUST resume a `{segment_embeddings}` run's
+    checkpoint (the user's other explicitly named minimum case) -- the gate
+    must accept a genuine match, not just reject mismatches.
+    """
+
+    config = _small_config(tmp_path, segment_embeddings=True)
+    source_loop = TrainingLoop(
+        model=SC2StrategyDiffusionModel(config, vocab_size=128), config=config, seed=42
+    )
+    checkpoint_path = source_loop.save_checkpoint(tmp_path / "checkpoints" / "segment_embeddings.pt")
+
+    target_loop = TrainingLoop(
+        model=SC2StrategyDiffusionModel(config, vocab_size=128), config=config, seed=42
+    )
+    target_loop.load_checkpoint(checkpoint_path)  # must not raise
+
+    assert target_loop.global_step == source_loop.global_step
+    for restored, saved in zip(
+        target_loop.model.parameters(), source_loop.model.parameters(), strict=True
+    ):
+        assert torch.allclose(restored, saved)
+
+
 def test_ema_tracks_training_and_validation_uses_ema_weights(tmp_path: Path) -> None:
     config = _small_config(tmp_path)
     loop, batch = _loop_and_batch(config, seed=31)
@@ -1340,12 +1399,12 @@ def test_relative_early_stopping_requires_consecutive_subthreshold_epochs(tmp_pa
     assert loop.epochs_without_improvement == 2
 
 
-def _small_config(tmp_path: Path | None = None) -> ProjectConfig:
+def _small_config(tmp_path: Path | None = None, **model_overrides: bool) -> ProjectConfig:
     config = load_config("config/default.yaml")
     return replace(
         config,
         data=replace(config.data, input_budget_tokens=64, canvas_budget_tokens=12),
-        model=replace(config.model, d_model=32, layers=2, heads=4, ffn=64),
+        model=replace(config.model, d_model=32, layers=2, heads=4, ffn=64, **model_overrides),
         train=replace(
             config.train,
             lr=0.01,

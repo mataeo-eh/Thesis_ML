@@ -15,6 +15,42 @@ storage:
   log_uri: tests/output/overfitV2
   local_cache_dir: .pipeline_cache/local-overfitV2
 
+# ============================================================================
+# THIS IS THE ABLATION CONTROL SURFACE.
+#
+# Flip ONE flag here to true and run `tests\overfit.bat` to measure that
+# ablation against the all-false baseline run. Everything else about this
+# profile (subset, model scale, schedule, output paths) stays fixed, so the
+# resulting loss curves in tests/output/overfitV2/epoch_metrics.csv differ only
+# by the toggle you changed.
+#
+# All three are false here, matching config/default.yaml: false is the BASELINE
+# and the model behaves exactly as it does today. Enabling any of them changes
+# the model's stored architecture identity (see `toggle_fingerprint` in
+# src/thesis_ml/config.py), so a checkpoint trained with a toggle on will refuse
+# to load into a baseline model and vice versa -- that is deliberate. Point
+# `storage.checkpoint_uri` somewhere new before running an enabled ablation if
+# you want to keep the baseline `checkpoints/local-overfitV2/last.pt`.
+#
+#   frozen_input_kv       -- two-pass forward: the input region alone through
+#                            all L blocks caching each layer's K/V, then the
+#                            canvas attending to concat(cached_input_K,
+#                            canvas_K). At inference the input KV is computed
+#                            once and reused across every denoising step.
+#   segment_embeddings    -- learned 2-row embedding (0 = input, 1 = canvas)
+#                            added to the final per-region embedding, so the
+#                            same token id in the input and in the canvas is
+#                            genuinely different to the model.
+#   per_segment_positions -- RoPE position ids per segment: input real content
+#                            gets 0..L_i-1 in its left-padded slots, canvas
+#                            restarts at 0 at canvas index 0, so canvas
+#                            positions no longer move with the batch's padding.
+# ============================================================================
+model:
+  frozen_input_kv: false
+  segment_embeddings: false
+  per_segment_positions: false
+
 diffusion:
   process: uniform
   schedule:

@@ -25,6 +25,14 @@ from thesis_ml.data.feature_stats import (
 from thesis_ml.model.backbone import GeGLU, RMSNorm
 from thesis_ml.serialize import TokenRecord
 
+# Row indexes into the optional segment-embedding table. The ordering is part of
+# the public contract of this module (downstream tests assert it), so it is named
+# here rather than written as bare 0/1 literals at the two use sites.
+INPUT_SEGMENT_INDEX = 0
+CANVAS_SEGMENT_INDEX = 1
+# Number of distinct regions the model sees: the input region and the canvas.
+SEGMENT_COUNT = 2
+
 
 @dataclass(frozen=True)
 class InputFeatures:
@@ -105,10 +113,36 @@ class InputContextEmbedding(nn.Module):
         *,
         feature_statistics: FeatureStatistics,
         self_conditioning: bool = True,
+        segment_embeddings: bool = False,
     ) -> None:
+        """Build the shared token table plus the optional per-region extras.
+
+        Parameters:
+            vocab_size: number of token ids the shared type embedding covers.
+            d_model: model width; every embedding this module emits has it.
+            feature_statistics: train-split standardization statistics for the
+                input-only joint static-feature branch. Its means/stds are held
+                as buffers so they travel with the checkpoint.
+            self_conditioning: when true, build the canvas self-conditioning
+                branch (pre-norm, GeGLU, post-norm). When false the three
+                submodules are left as plain ``None`` attributes, which keeps
+                them out of the ``state_dict`` entirely.
+            segment_embeddings: when true, build a learned two-row table whose
+                row 0 is added to every input-region embedding and row 1 to
+                every canvas-region embedding. Defaults false, which is the
+                baseline: the table is not created, so no new ``state_dict``
+                keys appear and existing checkpoints keep loading strictly.
+        Returns:
+            None; this is a constructor.
+        Calls: nn.Embedding/nn.Linear/nn.Sequential construction plus RMSNorm
+            and GeGLU from thesis_ml.model.backbone. Zero-initialization of the
+            segment table is delegated to self.reset_segment_embeddings.
+        """
+
         super().__init__()
         self.vocab_size = vocab_size
         self.self_conditioning = self_conditioning
+        self.segment_embeddings = segment_embeddings
         self.feature_statistics_identity = feature_statistics.identity
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.register_buffer(
@@ -141,6 +175,17 @@ class InputContextEmbedding(nn.Module):
             self.self_cond_norm = None
             self.self_cond_ffn = None
             self.self_cond_post_norm = None
+        if segment_embeddings:
+            self.segment_embedding = nn.Embedding(SEGMENT_COUNT, d_model)
+            self.reset_segment_embeddings()
+        else:
+            # Assigning a plain ``None`` (rather than an nn.Embedding that is
+            # then ignored) is what keeps the toggle-off state_dict key-for-key
+            # identical to the pre-toggle model, so old checkpoints still load
+            # under strict load_state_dict. nn.Module only registers a submodule
+            # when the assigned value is an nn.Module, so this adds no keys.
+            # Same pattern as the self-conditioning branch directly above.
+            self.segment_embedding = None
 
     def reset_joint_output(self) -> None:
         """Make the initialized joint branch exactly zero, preserving E."""
@@ -148,6 +193,76 @@ class InputContextEmbedding(nn.Module):
         output = self.joint_mixer[-1]
         nn.init.zeros_(output.weight)
         nn.init.zeros_(output.bias)
+
+    def reset_segment_embeddings(self) -> None:
+        """Make the segment table exactly zero; no-op when the toggle is off.
+
+        Zero is the deliberate starting point: at zero the segment term adds
+        nothing, so day-0 behavior with the toggle on is identical to the
+        baseline and any later divergence is attributable to LEARNING rather
+        than to initialization noise.
+
+        This exists as a separate method for the same reason
+        ``reset_joint_output`` does: ``SC2StrategyDiffusionModel._init_weights``
+        sweeps every ``nn.Embedding`` in the model and re-initializes it at
+        ``std=0.02``, which would clobber the zeros set in ``__init__``. The
+        model calls this again after that sweep. It is safe to call
+        unconditionally because the table does not exist when the toggle is off.
+
+        Parameters:
+            None.
+        Returns:
+            None; mutates self.segment_embedding.weight in place.
+        Calls: nn.init.zeros_.
+        """
+
+        if self.segment_embedding is None:
+            return
+        nn.init.zeros_(self.segment_embedding.weight)
+
+    def _add_segment_embedding(
+        self,
+        embeddings: torch.Tensor,
+        segment_index: int,
+    ) -> torch.Tensor:
+        """Add one segment vector to every position of a region's embeddings.
+
+        Applied to the FINAL per-region embedding — after the joint feature
+        residual in ``embed_input`` and after the self-conditioning post-norm in
+        ``embed_canvas``. That placement is load-bearing: adding the signal
+        earlier would let a downstream normalization wash it out, and washing it
+        out is exactly the failure this ablation is meant to rule out.
+
+        The vector is added to EVERY position in the region, padded slots
+        included. Padded positions are excluded from attention as keys and are
+        never scored by the loss, so their embedding value cannot affect either
+        the forward result or the gradient; skipping them would cost a mask
+        multiply and buy nothing. Uniform application is also the point of the
+        toggle — the signal must mean "this position is canvas" at every index,
+        not only at content indexes.
+
+        Parameters:
+            embeddings: [batch, seq_len, d_model] final embeddings of one region.
+            segment_index: INPUT_SEGMENT_INDEX or CANVAS_SEGMENT_INDEX.
+        Returns:
+            [batch, seq_len, d_model]; the input tensor unchanged (same object)
+            when the toggle is off, otherwise a new tensor with the segment
+            vector broadcast-added over batch and sequence.
+        Calls: nothing beyond torch primitives. Called by embed_input and
+            embed_canvas.
+        """
+
+        if self.segment_embedding is None:
+            return embeddings
+        # Indexing the weight table directly is exactly an nn.Embedding lookup
+        # for a constant id, and keeps the gradient path, but avoids allocating
+        # a [batch, seq_len] index tensor on every forward pass just to look up
+        # the same row repeatedly. The result is [d_model] and broadcasts over
+        # the batch and sequence axes.
+        segment_vector = self.segment_embedding.weight[segment_index]
+        return embeddings + segment_vector.to(
+            device=embeddings.device, dtype=embeddings.dtype
+        )
 
     def forward(
         self,
@@ -221,7 +336,12 @@ class InputContextEmbedding(nn.Module):
         hidden_features = self.feature_mlp(branch_input)
         residual = self.joint_mixer(torch.cat([type_embeddings, hidden_features], dim=-1))
         residual = residual * feature_mask.unsqueeze(-1).to(dtype=residual.dtype)
-        return type_embeddings + residual
+        # Segment row 0 marks the input region. Added last, on top of the joint
+        # residual, so no later transform inside this module can renormalize it
+        # away. A no-op when the segment_embeddings toggle is off.
+        return self._add_segment_embedding(
+            type_embeddings + residual, INPUT_SEGMENT_INDEX
+        )
 
     def embed_canvas(
         self,
@@ -231,7 +351,10 @@ class InputContextEmbedding(nn.Module):
     ) -> torch.Tensor:
         embeddings = self.token_embedding(canvas_token_ids)
         if not self.self_conditioning:
-            return embeddings
+            # Segment row 1 marks the canvas region. Both of this method's exit
+            # paths must apply it, or the signal would silently disappear
+            # whenever self-conditioning happened to be disabled.
+            return self._add_segment_embedding(embeddings, CANVAS_SEGMENT_INDEX)
         expected_shape = (*canvas_token_ids.shape, embeddings.shape[-1])
         if canvas_self_conditioning is None:
             canvas_self_conditioning = torch.zeros_like(embeddings)
@@ -242,7 +365,11 @@ class InputContextEmbedding(nn.Module):
             )
         signal = canvas_self_conditioning.to(device=embeddings.device, dtype=embeddings.dtype)
         residual = self.self_cond_ffn(self.self_cond_norm(signal))
-        return self.self_cond_post_norm(embeddings + residual)
+        # Segment row 1 is added AFTER the post-norm, deliberately: applying it
+        # before would let self_cond_post_norm rescale the region signal away.
+        return self._add_segment_embedding(
+            self.self_cond_post_norm(embeddings + residual), CANVAS_SEGMENT_INDEX
+        )
 
 
 def _records_to_tensors(

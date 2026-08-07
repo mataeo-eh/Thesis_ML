@@ -19,6 +19,7 @@ from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
@@ -31,18 +32,23 @@ from thesis_ml.train.train import make_synthetic_examples
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _tiny_config(tmp_path: Path) -> ProjectConfig:
+def _tiny_config(tmp_path: Path, **model_overrides: bool) -> ProjectConfig:
     """A small/cheap config (tiny model + short canvas) for fast CPU tests.
 
     Mirrors the `_small_config` pattern used in `tests/test_training.py`, kept
     local here so this file has no cross-test-file dependency.
+
+    `**model_overrides` forwards straight into `replace(config.model, ...)`,
+    used by the warm-start toggle-gating tests below to build
+    `frozen_input_kv` / `segment_embeddings` / `per_segment_positions`
+    variants without a second config helper.
     """
 
     config = load_config(REPO_ROOT / "config" / "default.yaml")
     return replace(
         config,
         data=replace(config.data, input_budget_tokens=64, canvas_budget_tokens=12),
-        model=replace(config.model, d_model=32, layers=2, heads=4, ffn=64),
+        model=replace(config.model, d_model=32, layers=2, heads=4, ffn=64, **model_overrides),
         train=replace(
             config.train,
             lr=0.01,
@@ -128,6 +134,67 @@ def test_load_model_weights_restores_weights_but_leaves_optimizer_step_epoch_fre
     assert finetune_loop.global_step == fresh_global_step == 0
     assert finetune_loop.completed_epochs == fresh_completed_epochs == 0
     assert finetune_loop.optimizer.state_dict()["state"] == fresh_optimizer_state["state"] == {}
+
+
+def test_warm_start_rejects_a_checkpoint_from_a_different_ablation_toggle_set(tmp_path: Path) -> None:
+    """`load_model_weights` (the warm-start path) must apply the SAME
+    architecture-identity gate as full resume, via
+    `validate_checkpoint_compatibility`.
+
+    This matters specifically because `frozen_input_kv` and
+    `per_segment_positions` add ZERO parameters: `load_state_dict` would
+    otherwise silently SUCCEED across mismatched ablation arms and quietly
+    corrupt the ablation study. `architecture_identity` is the only thing
+    standing between the user and that false conclusion. Covers the user's
+    explicitly named minimum case: a
+    `{frozen_input_kv, segment_embeddings, per_segment_positions}` run must
+    NOT warm-start from a `{frozen_input_kv}`-only run's checkpoint.
+    """
+
+    source_config = _tiny_config(tmp_path, frozen_input_kv=True)
+    source_model = SC2StrategyDiffusionModel(source_config, vocab_size=128)
+    source_loop = TrainingLoop(model=source_model, config=source_config, seed=31)
+    checkpoint_path = source_loop.save_checkpoint(tmp_path / "frozen_kv_only.pt")
+
+    mismatched_config = _tiny_config(
+        tmp_path,
+        frozen_input_kv=True,
+        segment_embeddings=True,
+        per_segment_positions=True,
+    )
+    mismatched_loop = TrainingLoop(
+        model=SC2StrategyDiffusionModel(mismatched_config, vocab_size=128),
+        config=mismatched_config,
+        seed=31,
+    )
+
+    with pytest.raises(ValueError, match="architecture identity mismatch"):
+        mismatched_loop.load_model_weights(checkpoint_path)
+
+
+def test_warm_start_accepts_a_checkpoint_from_the_matching_ablation_toggle_set(tmp_path: Path) -> None:
+    """The positive counterpart of the rejection test above: a
+    `{segment_embeddings}` run MUST warm-start from a `{segment_embeddings}`
+    run's checkpoint (the user's other explicitly named minimum case) -- the
+    architecture-identity gate must not be so strict it rejects a genuine
+    match.
+    """
+
+    config = _tiny_config(tmp_path, segment_embeddings=True)
+    source_loop = TrainingLoop(
+        model=SC2StrategyDiffusionModel(config, vocab_size=128), config=config, seed=32
+    )
+    checkpoint_path = source_loop.save_checkpoint(tmp_path / "segment_embeddings.pt")
+
+    target_loop = TrainingLoop(
+        model=SC2StrategyDiffusionModel(config, vocab_size=128), config=config, seed=32
+    )
+    target_loop.load_model_weights(checkpoint_path)  # must not raise
+
+    for restored, saved in zip(
+        target_loop.model.parameters(), source_loop.model.parameters(), strict=True
+    ):
+        assert torch.allclose(restored, saved)
 
 
 def test_finetune_config_extends_overfit_v2_with_warm_start_and_debut_settings() -> None:

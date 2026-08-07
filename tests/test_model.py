@@ -1,4 +1,5 @@
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -34,8 +35,14 @@ from thesis_ml.model.loss import CanvasCrossEntropyLoss
 from thesis_ml.model import backbone as backbone_module
 from thesis_ml.model.backbone import GeGLU, MultiHeadSelfAttention, RotaryEmbedding, TransformerBlock
 from thesis_ml.model.embedding import InputFeatures, _numeric_feature, build_input_features
-from thesis_ml.model.model import SC2StrategyDiffusionModel, canvas_self_conditioning_from_logits
+from thesis_ml.model.model import (
+    SC2StrategyDiffusionModel,
+    _build_per_segment_position_ids,
+    canvas_self_conditioning_from_logits,
+    validate_checkpoint_compatibility,
+)
 from thesis_ml.serialize import TokenRecord
+from thesis_ml.vocab.special_tokens import PAD_ID
 
 
 def test_slash_form_numeric_features_are_encoded_as_fractions() -> None:
@@ -149,6 +156,10 @@ def _small_config(
     ffn: int = 64,
     qk_norm: bool = True,
     self_conditioning: bool = True,
+    gradient_checkpointing: bool = False,
+    frozen_input_kv: bool = False,
+    segment_embeddings: bool = False,
+    per_segment_positions: bool = False,
 ) -> ProjectConfig:
     config = load_config("config/default.yaml")
     return replace(
@@ -161,6 +172,13 @@ def _small_config(
             ffn=ffn,
             qk_norm=qk_norm,
             self_conditioning=self_conditioning,
+            gradient_checkpointing=gradient_checkpointing,
+            # Architecture ablation toggles. All three default to False so
+            # every EXISTING call site of this helper is completely unaffected;
+            # the ablation tests below opt in explicitly per case.
+            frozen_input_kv=frozen_input_kv,
+            segment_embeddings=segment_embeddings,
+            per_segment_positions=per_segment_positions,
         ),
     )
 
@@ -228,6 +246,40 @@ def _records(batch: int, seq_len: int, *, x_offset: float = 0.0) -> list[list[To
 
 def _features(records: list[list[TokenRecord]], seq_len: int) -> InputFeatures:
     return build_input_features(records, seq_len)
+
+
+def _left_padded_batch(
+    real_token_ids: list[int], total_width: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, InputFeatures]:
+    """Build one LEFT-PADDED input row: real content flush against the right edge.
+
+    Mirrors the real collater's convention (`thesis_ml.data.collate`, which
+    always left-pads the input region): `real_token_ids` occupies the final
+    ``len(real_token_ids)`` slots of a ``total_width``-wide row, and every slot
+    before that is `PAD_ID` with `input_attention_mask` False. Used by the
+    `per_segment_positions` tests below, which specifically need to vary how
+    much left padding a fixed amount of real content carries.
+
+    Parameters:
+        real_token_ids: the row's real (non-pad) input token ids, in order.
+        total_width: padded width of the input region for this row.
+    Returns:
+        ``(input_token_ids, input_attention_mask, input_lengths, input_features)``,
+        each shaped for a batch of 1.
+    Calls: `_records`, `build_input_features`.
+    """
+
+    length = len(real_token_ids)
+    ids = torch.full((1, total_width), PAD_ID, dtype=torch.long)
+    ids[0, total_width - length :] = torch.tensor(real_token_ids, dtype=torch.long)
+    mask = torch.zeros((1, total_width), dtype=torch.bool)
+    mask[0, total_width - length :] = True
+    lengths = torch.tensor([length], dtype=torch.long)
+    # `_records` builds exactly `length` records (the real content only);
+    # `build_input_features(..., left_pad=True)` places them at the tail of
+    # `total_width`, matching `ids`/`mask` above.
+    features = build_input_features(_records(1, length), total_width, left_pad=True)
+    return ids, mask, lengths, features
 
 
 def test_forward_shapes() -> None:
@@ -848,3 +900,572 @@ def test_model_uses_explicit_depth_scaled_initialization() -> None:
         model.backbone.layers[0].post_attn_norm.weight,
         torch.ones_like(model.backbone.layers[0].post_attn_norm.weight),
     )
+
+
+# =============================================================================
+# Architecture ablation toggles: frozen_input_kv, segment_embeddings,
+# per_segment_positions. All three default to False in `_small_config`, which
+# is the baseline every existing test above this line already exercises.
+# =============================================================================
+
+
+# ---- Criterion 1: all-off parity -------------------------------------------
+
+
+def test_all_toggles_off_architecture_identity_matches_baseline_exactly() -> None:
+    """The all-off baseline's identity string must be byte-for-byte unchanged.
+
+    `toggle_fingerprint` returning `""` for the all-off case is what keeps this
+    exactly `ARCHITECTURE_ID` ("uniform-gemma4-dense-v1") with no suffix, which
+    is what lets every checkpoint trained before this ablation existed keep
+    loading under `validate_checkpoint_compatibility`.
+    """
+
+    config = _small_config()
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    assert model.architecture_identity == "uniform-gemma4-dense-v1"
+
+
+def test_all_toggles_off_forward_matches_fixed_seed_reference() -> None:
+    """Regression pin for the untouched baseline forward path.
+
+    With all three ablation toggles off, this exact seed/config/input
+    construction must reproduce logit values captured once from this same
+    construction. This guards against an unintended change to the SHARED
+    forward path (embedding, backbone, output head) that the toggle-off case
+    is supposed to leave bit-identical to pre-ablation behavior -- a change
+    that per-toggle behavioral tests below would not catch, because they only
+    compare toggle-on against toggle-off, not against a fixed historical value.
+    """
+
+    torch.manual_seed(1234)
+    config = _small_config()
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    model.eval()
+    input_ids = torch.tensor([[6, 7, 8, 9]])
+    canvas_ids = torch.tensor([[10, 11, 12, 13, 14]])
+    features = _features(_records(1, input_ids.shape[1]), input_ids.shape[1])
+
+    with torch.no_grad():
+        output = model(
+            input_token_ids=input_ids,
+            canvas_token_ids=canvas_ids,
+            input_features=features,
+        )
+
+    assert output.logits.shape == (1, input_ids.shape[1] + canvas_ids.shape[1], 128)
+    assert output.hidden_states.shape == (1, input_ids.shape[1] + canvas_ids.shape[1], config.model.d_model)
+
+    # Captured once from this exact seed/config/input construction (see the
+    # prompt task's verification run). float32 accumulation noise through two
+    # transformer blocks is far below 1e-5 for a model this small; a real
+    # regression in the shared forward path would move these by orders of
+    # magnitude more.
+    expected_first_position = torch.tensor(
+        [0.05702521651983261, -0.08367864042520523, -0.04190473631024361, 0.23668478429317474, -0.08491497486829758]
+    )
+    expected_first_canvas_position = torch.tensor(
+        [0.06585192680358887, -0.018592674285173416, 0.009641138836741447, -0.04609399661421776, -0.09642499685287476]
+    )
+    expected_last_position = torch.tensor(
+        [-0.07902131974697113, -0.07257570326328278, -0.08648346364498138, 0.050129733979701996, -0.07474275678396225]
+    )
+    assert torch.allclose(output.logits[0, 0, :5], expected_first_position, atol=1e-5)
+    assert torch.allclose(output.logits[0, 4, :5], expected_first_canvas_position, atol=1e-5)
+    assert torch.allclose(output.logits[0, -1, :5], expected_last_position, atol=1e-5)
+
+
+def test_existing_overfit_v2_checkpoint_still_validates_against_all_off_model() -> None:
+    """`checkpoints/local-overfitV2/last.pt` predates this ablation and was
+    trained with all three toggles off. An all-off model built TODAY must
+    still pass `validate_checkpoint_compatibility` against it -- this is the
+    exact backward-compatibility guarantee `toggle_fingerprint`'s empty-string
+    return exists to protect. Skips (rather than fabricating a checkpoint) if
+    the file is absent from this working tree.
+    """
+
+    checkpoint_path = Path("checkpoints/local-overfitV2/last.pt")
+    if not checkpoint_path.exists():
+        pytest.skip(f"{checkpoint_path} is not present in this working tree")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    config = _small_config()
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+
+    # Must not raise.
+    validate_checkpoint_compatibility(checkpoint, model, str(checkpoint_path))
+
+
+# ---- Criterion 2: toggles compose -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "toggles",
+    [
+        {"frozen_input_kv": True},
+        {"segment_embeddings": True},
+        {"per_segment_positions": True},
+        {"frozen_input_kv": True, "segment_embeddings": True, "per_segment_positions": True},
+    ],
+    ids=["frozen_input_kv", "segment_embeddings", "per_segment_positions", "all_on"],
+)
+def test_each_toggle_and_all_toggles_compose_through_forward_and_backward(toggles: dict) -> None:
+    """Every toggle alone, and all three together, must complete a full
+    forward+backward without error and return the FULL
+    ``[B, input_len + canvas_len, vocab]`` logits shape.
+
+    This is the composability guarantee the ablation study depends on: any
+    combination of arms must be runnable, not just each toggle in isolation.
+    """
+
+    torch.manual_seed(3)
+    config = _small_config(layers=2, **toggles)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    model.train()
+    input_ids = torch.tensor([[6, 7, 8, 9], [16, 17, 18, 19]])
+    canvas_ids = torch.tensor([[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]])
+    features = _features(_records(2, input_ids.shape[1]), input_ids.shape[1])
+
+    output = model(
+        input_token_ids=input_ids,
+        canvas_token_ids=canvas_ids,
+        input_features=features,
+    )
+    expected_shape = (2, input_ids.shape[1] + canvas_ids.shape[1], 128)
+    assert output.logits.shape == expected_shape
+    assert output.hidden_states.shape[:2] == expected_shape[:2]
+
+    output.logits.sum().backward()
+    grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
+    assert grads
+    assert all(torch.isfinite(g).all() for g in grads)
+
+
+@pytest.mark.parametrize(
+    "toggles",
+    [
+        {"frozen_input_kv": True},
+        {"frozen_input_kv": True, "segment_embeddings": True, "per_segment_positions": True},
+    ],
+    ids=["frozen_input_kv", "all_on"],
+)
+def test_gradient_checkpointing_composes_with_frozen_input_kv_and_all_on(toggles: dict) -> None:
+    """Activation checkpointing takes a DIFFERENT code path for the frozen-KV
+    two-pass split (`BidirectionalTransformer.forward`'s `frozen_path` branch)
+    than the joint path already covered by
+    `test_gradient_checkpointing_is_config_gated`. Proves that branch also
+    runs under `model.train()` without error and produces finite gradients,
+    for both the `frozen_input_kv`-only arm and the all-three-on arm.
+    """
+
+    torch.manual_seed(4)
+    config = _small_config(layers=2, gradient_checkpointing=True, self_conditioning=False, **toggles)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    model.train()
+    input_ids = torch.tensor([[6, 7, 8, 9]])
+    canvas_ids = torch.tensor([[10, 11, 12, 13, 14]])
+    features = _features(_records(1, input_ids.shape[1]), input_ids.shape[1])
+
+    output = model(input_token_ids=input_ids, canvas_token_ids=canvas_ids, input_features=features)
+    assert output.logits.shape == (1, input_ids.shape[1] + canvas_ids.shape[1], 128)
+
+    output.logits.sum().backward()
+    grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
+    assert grads
+    assert all(torch.isfinite(g).all() for g in grads)
+
+
+# ---- Criterion 3(a): frozen_input_kv ----------------------------------------
+
+
+def test_frozen_input_kv_makes_input_hidden_states_invariant_to_canvas_and_off_does_not() -> None:
+    """The core claim of `frozen_input_kv`: with it ON, perturbing the CANVAS
+    leaves the INPUT region's hidden states BITWISE unchanged, proving the
+    input genuinely does not attend to the canvas under the two-pass split.
+
+    Also asserts the contrast: with the toggle OFF (the untouched joint
+    bidirectional path), the input region's hidden states DO change under the
+    same canvas perturbation, because a joint bidirectional forward lets every
+    position attend to every other position. Testing only the ON case would
+    not prove the toggle does anything -- it could just as well indicate a
+    model that never let input and canvas interact at all.
+    """
+
+    input_ids = torch.tensor([[6, 7, 8, 9]])
+    canvas_ids = torch.tensor([[10, 11, 12, 13, 14]])
+    changed_canvas_ids = canvas_ids.clone()
+    changed_canvas_ids[0, -1] = 40
+    features = _features(_records(1, input_ids.shape[1]), input_ids.shape[1])
+    input_len = input_ids.shape[1]
+
+    torch.manual_seed(5)
+    on_model = SC2StrategyDiffusionModel(_small_config(layers=2, frozen_input_kv=True), vocab_size=128)
+    on_model.eval()
+    with torch.no_grad():
+        on_base = on_model(input_token_ids=input_ids, canvas_token_ids=canvas_ids, input_features=features)
+        on_changed = on_model(
+            input_token_ids=input_ids, canvas_token_ids=changed_canvas_ids, input_features=features
+        )
+    assert torch.equal(on_base.hidden_states[:, :input_len], on_changed.hidden_states[:, :input_len])
+
+    torch.manual_seed(5)
+    off_model = SC2StrategyDiffusionModel(_small_config(layers=2), vocab_size=128)
+    off_model.eval()
+    with torch.no_grad():
+        off_base = off_model(input_token_ids=input_ids, canvas_token_ids=canvas_ids, input_features=features)
+        off_changed = off_model(
+            input_token_ids=input_ids, canvas_token_ids=changed_canvas_ids, input_features=features
+        )
+    assert not torch.allclose(off_base.hidden_states[:, :input_len], off_changed.hidden_states[:, :input_len])
+
+
+def test_frozen_input_kv_cached_forward_matches_recomputed_forward() -> None:
+    """A cached input-KV forward must be numerically indistinguishable from
+    recomputing the input pass fresh.
+
+    This is exactly the property the sampler's step loop depends on to skip
+    the input backbone pass on every denoising step but the first: it hands
+    back a `FrozenInputKV` on step 1 and feeds it in on every later step, and
+    that substitution must not change the numbers.
+    """
+
+    torch.manual_seed(9)
+    config = _small_config(layers=2, frozen_input_kv=True)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    model.eval()
+    input_ids = torch.tensor([[6, 7, 8, 9]])
+    canvas_ids = torch.tensor([[10, 11, 12, 13, 14]])
+    features = _features(_records(1, input_ids.shape[1]), input_ids.shape[1])
+
+    with torch.no_grad():
+        cache_holder = model(
+            input_token_ids=input_ids,
+            canvas_token_ids=canvas_ids,
+            input_features=features,
+            return_cached_input_kv=True,
+        )
+        cache = cache_holder.cached_input_kv
+        assert cache is not None
+
+        recomputed = model(input_token_ids=input_ids, canvas_token_ids=canvas_ids, input_features=features)
+        reused = model(
+            input_token_ids=input_ids,
+            canvas_token_ids=canvas_ids,
+            input_features=features,
+            cached_input_kv=cache,
+        )
+
+    max_diff = (reused.logits - recomputed.logits).abs().max().item()
+    # Both paths run the identical op sequence over the input region (only the
+    # SOURCE of its K/V tensors differs: freshly computed vs handed back), so
+    # any nonzero difference is float summation-order noise rather than a real
+    # divergence. 1e-6 is comfortably above float32 noise for this tiny model.
+    assert max_diff < 1e-6
+
+
+def test_frozen_input_kv_cache_arguments_raise_when_toggle_is_off() -> None:
+    """`cached_input_kv=` / `return_cached_input_kv=True` must RAISE, not
+    silently ignore, when the model was built with `frozen_input_kv=False`.
+    No cache exists on the joint path, so honoring either argument would be
+    either a silent no-op or an incorrect computation.
+    """
+
+    config = _small_config(layers=1)  # frozen_input_kv defaults False
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    input_ids = torch.tensor([[6, 7, 8]])
+    canvas_ids = torch.tensor([[9, 10, 11]])
+    features = _features(_records(1, 3), 3)
+
+    with pytest.raises(ValueError, match="frozen_input_kv=True"):
+        model(
+            input_token_ids=input_ids,
+            canvas_token_ids=canvas_ids,
+            input_features=features,
+            return_cached_input_kv=True,
+        )
+
+    # Any non-None sentinel triggers the same guard: the backbone checks
+    # `cached_input_kv is not None` before it ever inspects the value's shape,
+    # so a real `FrozenInputKV` is not required to prove the raise.
+    with pytest.raises(ValueError, match="frozen_input_kv=True"):
+        model(
+            input_token_ids=input_ids,
+            canvas_token_ids=canvas_ids,
+            input_features=features,
+            cached_input_kv=object(),
+        )
+
+
+# ---- Criterion 3(b): per_segment_positions ----------------------------------
+
+
+def test_per_segment_positions_left_pad_invariance_holds_both_on_and_off() -> None:
+    """Canvas logits must be identical regardless of how much left padding the
+    input carries -- WITH the toggle ON (that is its purpose: canvas position
+    0 always gets RoPE phase 0, no matter the padding) and, less obviously,
+    WITH it OFF too.
+
+    The OFF case is NOT a bug: RoPE is purely relative
+    (``q_i . k_j = f(i - j)``), so widening `max_input_len` shifts every REAL
+    position by the same additive constant, which relative attention cannot
+    observe. The baseline was ALREADY left-pad invariant before this ablation
+    existed (measured ~1e-7 float noise on this exact config, see below). This
+    test pins that property so a future change to the positional encoding
+    cannot silently break it -- there is no contrast to observe here, unlike
+    the frozen_input_kv test above.
+    """
+
+    real_ids = [6, 7, 8, 9]
+    canvas_ids = torch.tensor([[10, 11, 12, 13, 14]])
+
+    for toggle_kwargs in ({}, {"per_segment_positions": True}):
+        torch.manual_seed(21)
+        config = _small_config(layers=2, **toggle_kwargs)
+        model = SC2StrategyDiffusionModel(config, vocab_size=128)
+        model.eval()
+
+        narrow_ids, narrow_mask, narrow_lengths, narrow_features = _left_padded_batch(real_ids, 4)
+        wide_ids, wide_mask, wide_lengths, wide_features = _left_padded_batch(real_ids, 12)
+
+        with torch.no_grad():
+            narrow_output = model(
+                input_token_ids=narrow_ids,
+                canvas_token_ids=canvas_ids,
+                input_attention_mask=narrow_mask,
+                input_features=narrow_features,
+                input_lengths=narrow_lengths,
+            )
+            wide_output = model(
+                input_token_ids=wide_ids,
+                canvas_token_ids=canvas_ids,
+                input_attention_mask=wide_mask,
+                input_features=wide_features,
+                input_lengths=wide_lengths,
+            )
+
+        narrow_canvas_logits = narrow_output.logits[:, narrow_ids.shape[1] :]
+        wide_canvas_logits = wide_output.logits[:, wide_ids.shape[1] :]
+        # Measured ~1e-7 on this exact tiny config for both ON and OFF; 1e-4 is
+        # comfortably above that noise floor and comfortably below any real
+        # divergence (the "toggle is live" test below measures a real
+        # divergence at ~0.1 on the same shapes).
+        assert torch.allclose(narrow_canvas_logits, wide_canvas_logits, atol=1e-4), toggle_kwargs
+
+
+def test_per_segment_positions_toggle_is_live_and_changes_canvas_logits() -> None:
+    """With IDENTICAL weights and an IDENTICAL batch, canvas logits must
+    genuinely differ between the toggle ON and OFF -- otherwise the toggle
+    would be a config no-op despite the left-pad-invariance test above showing
+    both are internally self-consistent.
+    """
+
+    real_ids = list(range(6, 16))  # 10 real input tokens
+    canvas_ids = torch.tensor([[20, 21, 22, 23, 24]])
+    total_width = 40  # generous left padding so the position shift is large
+
+    canvas_logits_by_toggle: dict[str, torch.Tensor] = {}
+    for name, toggle_kwargs in (("off", {}), ("on", {"per_segment_positions": True})):
+        torch.manual_seed(55)
+        config = _small_config(layers=2, **toggle_kwargs)
+        model = SC2StrategyDiffusionModel(config, vocab_size=128)
+        model.eval()
+        ids, mask, lengths, features = _left_padded_batch(real_ids, total_width)
+        with torch.no_grad():
+            output = model(
+                input_token_ids=ids,
+                canvas_token_ids=canvas_ids,
+                input_attention_mask=mask,
+                input_features=features,
+                input_lengths=lengths,
+            )
+        canvas_logits_by_toggle[name] = output.logits[:, total_width:]
+
+    max_diff = (canvas_logits_by_toggle["on"] - canvas_logits_by_toggle["off"]).abs().max().item()
+    # Measured 0.116 on this exact tiny config (0.125 on the real config per
+    # the task's research note). 1e-3 sits far above the ~1e-7 float noise the
+    # invariance test above tolerates and far below the real measured
+    # divergence, so it cleanly distinguishes "toggle did something" from
+    # "toggle is a no-op".
+    assert max_diff > 1e-3
+
+
+def test_build_per_segment_position_ids_pins_the_canvas_to_last_input_relative_offset() -> None:
+    """Direct test of `_build_per_segment_position_ids` -- the cleanest
+    possible test of this ablation's real semantic effect.
+
+    Define ``offset = position(canvas index 0) - position(last real input
+    token)`` (the RoPE-relevant quantity for canvas queries attending to the
+    input's cached keys, which is the direction this ablation's own docstring
+    reasons in: "canvas restarts at 0 ... pins canvas index 0 to one fixed
+    RoPE phase").
+
+    Under the ON path built by THIS function, that offset is ``-(L - 1)`` for
+    real input length `L`, because the canvas restarts its own RoPE count at 0
+    while the last real input token sits at position ``L - 1`` within its own
+    restarted count. Verified by direct computation: -4 at L=5, -39 at L=40 --
+    it SCALES with L, which is the whole reason this ablation exists (RoPE
+    phase at canvas index 0 would otherwise vary with corpus input length).
+
+    Under the OFF/baseline path (`position_ids=None`, so `RotaryEmbedding`
+    falls back to one shared `arange` over the whole combined
+    ``[input | canvas]`` sequence), that same offset is a FIXED CONSTANT (+1)
+    independent of `L`, because canvas index 0 always sits exactly one
+    combined-sequence slot after the (right-aligned) last real input token, no
+    matter how much left padding precedes it. The contrast that matters is
+    "constant vs. scales with L", not the constant's particular sign.
+    """
+
+    canvas_len = 3
+    for length in (5, 12, 40):
+        input_len = length + 7  # arbitrary extra left-padding room
+        lengths_tensor = torch.tensor([length])
+
+        on_positions = _build_per_segment_position_ids(
+            input_len=input_len,
+            canvas_len=canvas_len,
+            input_lengths=lengths_tensor,
+            device=torch.device("cpu"),
+        )
+        # The OFF/baseline reference: BidirectionalTransformer passes
+        # position_ids=None on this path, and RotaryEmbedding's None branch is
+        # documented as `torch.arange(seq_len)` over the full combined length.
+        off_positions = torch.arange(input_len + canvas_len).unsqueeze(0)
+
+        last_real_input_index = input_len - 1
+        canvas_index_0 = input_len
+
+        on_offset = int(on_positions[0, canvas_index_0] - on_positions[0, last_real_input_index])
+        off_offset = int(off_positions[0, canvas_index_0] - off_positions[0, last_real_input_index])
+
+        assert on_offset == -(length - 1), length
+        assert off_offset == 1, length
+
+
+def test_per_segment_positions_explicit_and_derived_input_lengths_are_bitwise_identical() -> None:
+    """`input_lengths` may be passed explicitly (the cheap route: a caller
+    already holding `batch.input_lengths`) or omitted and derived from the
+    attention mask. The model documents these as "identically equal by
+    construction" -- prove it with a bitwise-identical output comparison.
+    """
+
+    torch.manual_seed(17)
+    config = _small_config(layers=2, per_segment_positions=True)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    model.eval()
+
+    ids, mask, lengths, features = _left_padded_batch([6, 7, 8, 9], 10)
+    canvas_ids = torch.tensor([[10, 11, 12]])
+
+    with torch.no_grad():
+        explicit = model(
+            input_token_ids=ids,
+            canvas_token_ids=canvas_ids,
+            input_attention_mask=mask,
+            input_features=features,
+            input_lengths=lengths,
+        )
+        derived = model(
+            input_token_ids=ids,
+            canvas_token_ids=canvas_ids,
+            input_attention_mask=mask,
+            input_features=features,
+        )
+
+    assert torch.equal(explicit.logits, derived.logits)
+
+
+# ---- Criterion 3(c): segment_embeddings -------------------------------------
+
+
+def test_segment_embeddings_only_diverge_after_the_zero_initialized_table_is_filled() -> None:
+    """The same token id at an input position and a canvas position produces
+    DIFFERENT embeddings once the segment table holds nonzero values, and
+    IDENTICAL embeddings before that.
+
+    The table is ZERO-initialized (`reset_segment_embeddings`), so at
+    construction ON and OFF are correctly identical -- that is the whole point
+    of zero init (day-0 behavior is unaffected; divergence is attributable to
+    learning, not initialization noise). This test fills the table explicitly
+    to exercise the ON-and-live case, and also pins the ROW ORDERING: filling
+    row 0 must shift ONLY `embed_input`, and filling row 1 must shift ONLY
+    `embed_canvas`, so the two indices cannot silently swap.
+    """
+
+    torch.manual_seed(2)
+    config = _small_config(layers=1, self_conditioning=False, segment_embeddings=True)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    token_id = 6
+    input_ids = torch.tensor([[token_id]])
+    canvas_ids = torch.tensor([[token_id]])
+    features = _features(_records(1, 1), 1)
+
+    # --- Zero-init: the table exists but contributes nothing yet. ---
+    assert torch.count_nonzero(model.embedding.segment_embedding.weight) == 0
+    zero_input_embed = model.embedding.embed_input(input_ids, input_features=features)
+    zero_canvas_embed = model.embedding.embed_canvas(canvas_ids)
+    # embed_input's own joint-feature residual is ALSO zero-initialized (see
+    # test_contextual_encodings_are_input_only), so both reduce to the plain
+    # token embedding here: same token id -> identical vectors.
+    assert torch.equal(zero_input_embed, zero_canvas_embed)
+
+    # --- Fill row 0 (INPUT_SEGMENT_INDEX) only: must shift embed_input and
+    # leave embed_canvas untouched. ---
+    with torch.no_grad():
+        model.embedding.segment_embedding.weight[0].fill_(5.0)
+    shifted_input_embed = model.embedding.embed_input(input_ids, input_features=features)
+    still_zero_canvas_embed = model.embedding.embed_canvas(canvas_ids)
+    assert not torch.equal(shifted_input_embed, zero_input_embed)
+    assert torch.equal(still_zero_canvas_embed, zero_canvas_embed)
+
+    # --- Reset (must return to exactly zero), then fill row 1
+    # (CANVAS_SEGMENT_INDEX) only: the mirror image. ---
+    model.embedding.reset_segment_embeddings()
+    assert torch.count_nonzero(model.embedding.segment_embedding.weight) == 0
+    with torch.no_grad():
+        model.embedding.segment_embedding.weight[1].fill_(5.0)
+    still_zero_input_embed = model.embedding.embed_input(input_ids, input_features=features)
+    shifted_canvas_embed = model.embedding.embed_canvas(canvas_ids)
+    assert torch.equal(still_zero_input_embed, zero_input_embed)
+    assert not torch.equal(shifted_canvas_embed, zero_canvas_embed)
+
+    # --- The same token id now genuinely differs between the two regions. ---
+    assert not torch.equal(still_zero_input_embed, shifted_canvas_embed)
+
+
+def test_reset_segment_embeddings_zeroes_a_filled_table_and_is_a_noop_when_off() -> None:
+    """`reset_segment_embeddings` must return a filled table to EXACTLY zero,
+    and must be a safe no-op (never raise) when the toggle is off, since the
+    model's `__init__` calls it unconditionally on every construction.
+    """
+
+    on_config = _small_config(layers=1, segment_embeddings=True)
+    on_model = SC2StrategyDiffusionModel(on_config, vocab_size=128)
+    with torch.no_grad():
+        on_model.embedding.segment_embedding.weight.fill_(3.0)
+    assert torch.count_nonzero(on_model.embedding.segment_embedding.weight) > 0
+    on_model.embedding.reset_segment_embeddings()
+    assert torch.count_nonzero(on_model.embedding.segment_embedding.weight) == 0
+
+    off_config = _small_config(layers=1)
+    off_model = SC2StrategyDiffusionModel(off_config, vocab_size=128)
+    assert off_model.embedding.segment_embedding is None
+    off_model.embedding.reset_segment_embeddings()  # must not raise
+    assert off_model.embedding.segment_embedding is None
+
+
+def test_segment_embeddings_toggle_adds_exactly_one_state_dict_key() -> None:
+    """With the toggle OFF, `state_dict` keys must be identical to the
+    toggle-absent baseline (no `segment_embedding.weight` key at all, which is
+    what keeps pre-ablation checkpoints loading under strict
+    `load_state_dict`). With it ON, exactly that one key is added.
+    """
+
+    off_model = SC2StrategyDiffusionModel(_small_config(layers=1), vocab_size=128)
+    on_model = SC2StrategyDiffusionModel(_small_config(layers=1, segment_embeddings=True), vocab_size=128)
+
+    off_keys = set(off_model.state_dict().keys())
+    on_keys = set(on_model.state_dict().keys())
+
+    assert "embedding.segment_embedding.weight" not in off_keys
+    assert on_keys - off_keys == {"embedding.segment_embedding.weight"}
+    assert off_keys - on_keys == set()

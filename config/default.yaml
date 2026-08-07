@@ -25,6 +25,24 @@ model:
   qk_norm: true
   self_conditioning: true
   gradient_checkpointing: false
+  # Architecture ablation toggles. All three are false here, which IS the
+  # baseline: with all three off the model behaves exactly as it does today and
+  # its stored architecture identity is unchanged, so existing checkpoints load.
+  #
+  # Run the input region alone through all L blocks first (attending only to
+  # itself, caching each layer's K/V), then run the canvas attending to
+  # concat(cached_input_K, canvas_K), instead of one joint bidirectional pass.
+  # At inference the input KV is computed once and reused for every denoising
+  # step rather than recomputed per step.
+  frozen_input_kv: false
+  # Add a learned 2-row embedding (0 = input segment, 1 = canvas segment) to the
+  # final per-region embedding, so the same token id in the input and in the
+  # canvas is genuinely different to the model.
+  segment_embeddings: false
+  # Compute RoPE position ids per segment: input real content gets 0..L_i-1 in
+  # its left-padded slots and the canvas restarts at 0 at canvas index 0, making
+  # canvas positions invariant to how much left padding a batch needed.
+  per_segment_positions: false
   rope_theta: 500000.0
   rope_scaling:
     rope_type: llama3

@@ -38,13 +38,14 @@ from thesis_ml.data.windowing import (
     replay_source_stamp,
     validate_manifest_budgets,
     validate_manifest_integrity,
+    vocabulary_stamp,
 )
 from thesis_ml.inference.timing import attach_absolute_times
 from thesis_ml.model.embedding import build_input_features
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.serialize import serialize_snapshot
 from thesis_ml.train.train import run_smoke_train
-from thesis_ml.vocab.content_vocab import ContentVocabulary, load_content_vocabulary
+from thesis_ml.vocab.content_vocab import ContentVocabulary, build_content_vocabulary, load_content_vocabulary
 from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID, WIN_ID
 
 
@@ -441,6 +442,44 @@ def test_stale_manifest_version_and_config_stamp_are_refused(tmp_path: Path) -> 
     manifest.write_text("\n".join([json.dumps(metadata), *lines[1:]]) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="stale window manifest config stamp"):
         load_window_manifest(manifest, config=config)
+
+
+def test_architecture_ablation_toggles_do_not_change_manifest_or_vocabulary_stamps() -> None:
+    """The three architecture ablation toggles must NEVER force a manifest or
+    tokenized-artifact rebuild.
+
+    `manifest_config_stamp` and `vocabulary_stamp` key persisted artifacts
+    (window manifests, tokenized replays) to the config/vocabulary that
+    produced them. `frozen_input_kv`, `segment_embeddings`, and
+    `per_segment_positions` change only what the MODEL does with an
+    already-built manifest at forward time -- they must never leak into
+    either stamp, or flipping one on would force re-preprocessing all 943
+    replays for no data-side reason. `manifest_config_stamp` only reads
+    `config.data.*` fields (see `src/thesis_ml/data/windowing.py`), and
+    `vocabulary_stamp` does not take a config at all, so this test also
+    guards against a future refactor accidentally threading `config.model`
+    into either function.
+    """
+
+    base = load_config(ROOT / "config" / "default.yaml")
+    vocabulary = build_content_vocabulary({"1": "marine", "2": "scv"})
+
+    toggle_combinations = [
+        {},
+        {"frozen_input_kv": True},
+        {"segment_embeddings": True},
+        {"per_segment_positions": True},
+        {"frozen_input_kv": True, "segment_embeddings": True, "per_segment_positions": True},
+    ]
+    manifest_stamps = set()
+    vocabulary_stamps = set()
+    for toggles in toggle_combinations:
+        config = replace(base, model=replace(base.model, **toggles))
+        manifest_stamps.add(manifest_config_stamp(config))
+        vocabulary_stamps.add(vocabulary_stamp(vocabulary))
+
+    assert len(manifest_stamps) == 1, manifest_stamps
+    assert len(vocabulary_stamps) == 1, vocabulary_stamps
 
 
 def test_short_smoke_logs_all_pretraining_classes_from_first_step(tmp_path: Path) -> None:

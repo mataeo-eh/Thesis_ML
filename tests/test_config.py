@@ -1,9 +1,10 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import yaml
 
-from thesis_ml.config import ConfigError, load_config
+from thesis_ml.config import ConfigError, load_config, toggle_fingerprint
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
@@ -28,6 +29,11 @@ def test_valid_config_loads() -> None:
     assert config.model.qk_norm is True
     assert config.model.self_conditioning is True
     assert config.model.gradient_checkpointing is False
+    # Architecture ablation toggles: all three parse from YAML and all three are
+    # false by default, which is the baseline the current model implements.
+    assert config.model.frozen_input_kv is False
+    assert config.model.segment_embeddings is False
+    assert config.model.per_segment_positions is False
     assert config.model.rope_theta == 500000.0
     assert config.model.rope_scaling.rope_type == "llama3"
     assert config.model.rope_scaling.factor == 8.0
@@ -220,6 +226,64 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert finetune.loss.class_loss_weights.win_loss == 1.0
     assert finetune.diffusion.process == "uniform"
     assert finetune.diffusion.schedule.t_one_fraction == 0.0
+
+    # Every profile transitively extends config/default.yaml, so the ablation
+    # toggles reach all four through _deep_merge without a per-profile edit.
+    # local_overfit_v2.yaml restates them as its ablation control surface; the
+    # values must still be the all-false baseline until an ablation is run.
+    for config in (overfit, overfit_v2, full, finetune):
+        assert config.model.frozen_input_kv is False
+        assert config.model.segment_embeddings is False
+        assert config.model.per_segment_positions is False
+
+
+def test_toggle_fingerprint_is_empty_at_baseline_and_sorted_when_enabled() -> None:
+    """`toggle_fingerprint` must be empty at baseline and deterministic otherwise.
+
+    The empty-string case is the one that matters most: the model stamps its
+    identity as `ARCHITECTURE_ID + toggle_fingerprint(...)`, so any non-empty
+    return with every toggle off would change the stored identity and break
+    every existing checkpoint (e.g. checkpoints/local-overfitV2/last.pt).
+    """
+
+    baseline = load_config(DEFAULT_CONFIG).model
+    assert toggle_fingerprint(baseline) == ""
+
+    # Single-toggle cases: each name appears verbatim, preceded by exactly one
+    # '+'. These strings are persisted in checkpoint identities, so they are
+    # asserted literally rather than rebuilt from the field names.
+    assert toggle_fingerprint(replace(baseline, frozen_input_kv=True)) == "+frozen_input_kv"
+    assert toggle_fingerprint(replace(baseline, segment_embeddings=True)) == "+segment_embeddings"
+    assert (
+        toggle_fingerprint(replace(baseline, per_segment_positions=True))
+        == "+per_segment_positions"
+    )
+
+    # A pair, to pin the ALPHABETICAL ordering rather than declaration order:
+    # per_segment_positions is declared after frozen_input_kv but sorts before
+    # segment_embeddings.
+    assert (
+        toggle_fingerprint(replace(baseline, frozen_input_kv=True, per_segment_positions=True))
+        == "+frozen_input_kv+per_segment_positions"
+    )
+
+    # All on.
+    assert (
+        toggle_fingerprint(
+            replace(
+                baseline,
+                frozen_input_kv=True,
+                segment_embeddings=True,
+                per_segment_positions=True,
+            )
+        )
+        == "+frozen_input_kv+per_segment_positions+segment_embeddings"
+    )
+
+    # The concatenation itself is asserted against the real ARCHITECTURE_ID in
+    # the model tests; importing it here would pull torch into a pure-config
+    # test module, so this file only pins the empty-suffix half of the contract.
+    assert "uniform-gemma4-dense-v1" + toggle_fingerprint(baseline) == "uniform-gemma4-dense-v1"
 
 
 def test_fog_is_required_in_both_modes_and_pretraining_rejects_class_weights(

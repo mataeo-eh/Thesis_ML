@@ -62,6 +62,29 @@ class ModelConfig:
     qk_norm: bool
     self_conditioning: bool
     gradient_checkpointing: bool
+    # --- Architecture ablation toggles ---------------------------------------
+    # Three independent switches over how the input region and the canvas region
+    # relate to each other inside the backbone. ALL THREE DEFAULT TO false, which
+    # is the current baseline: with all three off the model must behave exactly
+    # as it does today. That is also why `toggle_fingerprint` below returns the
+    # empty string in that case -- the stored architecture identity has to stay
+    # byte-for-byte unchanged so existing checkpoints keep loading.
+    #
+    # Split the single joint bidirectional forward into two passes: the input
+    # region alone through all L blocks (attending only to itself, caching each
+    # layer's K/V), then the canvas region attending to
+    # `concat(cached_input_K, canvas_K)`. At inference the input KV is computed
+    # once and reused across every denoising step instead of being recomputed.
+    frozen_input_kv: bool
+    # Add a learned `nn.Embedding(2, d_model)` (0 = input segment, 1 = canvas
+    # segment) to the final per-region embedding, so the same token id appearing
+    # in the input and in the canvas becomes genuinely different to the model.
+    segment_embeddings: bool
+    # Compute RoPE position ids PER SEGMENT: the input's real content gets
+    # 0..L_i-1 in its left-padded slots and the canvas restarts at 0 at canvas
+    # index 0. Canvas positions then stop shifting with however much left
+    # padding a particular batch happened to need.
+    per_segment_positions: bool
     rope_theta: float
     rope_scaling: RopeScalingConfig
 
@@ -335,6 +358,54 @@ def load_config(path: str | Path) -> ProjectConfig:
     _validate_sampler(config)
     _validate_debut_mode_sections(config)
     return config
+
+
+def toggle_fingerprint(model_config: ModelConfig) -> str:
+    """Build the architecture-identity suffix naming the enabled ablation toggles.
+
+    Downstream model code stamps its identity as
+    `ARCHITECTURE_ID + toggle_fingerprint(model_config)` so a checkpoint trained
+    with an ablation enabled can never be silently loaded into a model built
+    without it. The all-off case is load-bearing: it must return the EMPTY
+    string so the identity stays the character-for-character unchanged
+    `ARCHITECTURE_ID` and every existing checkpoint still loads.
+
+    Parameters:
+        model_config: the built `ModelConfig` whose three ablation toggles
+            (`frozen_input_kv`, `segment_embeddings`, `per_segment_positions`)
+            are read.
+
+    Returns:
+        `""` when all three toggles are false. Otherwise a deterministic,
+        alphabetically sorted suffix of the enabled toggles' config field names,
+        each preceded by `+` -- for example
+        `"+frozen_input_kv+per_segment_positions"`.
+
+    Calls: nothing. It only reads attributes off the passed dataclass.
+    """
+
+    # Each toggle is appended under its own explicit `if` rather than looped
+    # over via getattr: these strings are persisted inside checkpoint identities,
+    # so the exact name that goes into the fingerprint is spelled out literally
+    # here and cannot drift with a refactor of the dataclass.
+    enabled: list[str] = []
+    if model_config.frozen_input_kv:
+        enabled.append("frozen_input_kv")
+    if model_config.segment_embeddings:
+        enabled.append("segment_embeddings")
+    if model_config.per_segment_positions:
+        enabled.append("per_segment_positions")
+
+    if not enabled:
+        # Explicit early return for the all-off baseline. The join below would
+        # yield "" anyway, but this is the case every existing checkpoint
+        # depends on, so it is stated rather than left implied.
+        return ""
+
+    # Sorted so the fingerprint depends only on WHICH toggles are on, never on
+    # the order they happen to be declared or checked in.
+    enabled.sort()
+    return "".join(f"+{name}" for name in enabled)
 
 
 def _load_config_mapping(
