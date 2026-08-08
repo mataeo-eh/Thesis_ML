@@ -25,6 +25,17 @@
 - Normal sampling performs no post-sampling model call. The diagnostics-only `return_final_logits` option performs one final forward pass conditioned on the completed canvas and returns those raw canvas logits on CPU.
 - `denoise_canvas_once` is the diagnostics-only `t=1` endpoint: it uses a uniform random non-`[MASK]` canvas in uniform mode and all `[MASK]` in absorbing mode, performs exactly one forward call, and returns categorical/argmax diagnostic output as explicitly defined by the call without iterative refinement or an estimate pass.
 
+### Frozen input-KV reuse — AN ABLATION TOGGLE, NOT THE DEFAULT PATH
+
+Sampling participates in the prompt-009 `model.frozen_input_kv` ablation. **The toggle defaults to `false`, and with it off the sampler is byte-for-byte the historical implementation** — no cache objects, no extra kwargs. It is an experiment gated by `SPEC.md` §14a, not a feature being rolled out; do not enable it by default or treat it as the preferred path.
+
+- When on, the FIRST denoising step passes `return_cached_input_kv=True` and captures a `FrozenInputKV`; every later step passes `cached_input_kv=cache`, skipping the L backbone blocks over the input region. Measured 7.1x per-step speedup at `input_len=1536`.
+- **There is deliberately NO separate pre-loop priming forward.** One would add a whole extra full-length model call — exactly the work the toggle exists to avoid — and would break the one-model-call-per-pass contract above, which `tests/test_sampler.py` asserts as `model.calls == output.steps`. This is a contract, not an oversight; do not "optimize" a priming pass in.
+- The sampler's enable predicate mirrors the backbone's (`frozen_input_kv and input_len > 0`) and is read off the MODEL, not off `ProjectConfig`, so the documented `ValueError` for an illegal cache request is unreachable rather than merely unlikely.
+- A cache is valid only for the same input region, batch size, and layer count. The input region is bound once before the loop and never rebound; if that ever stops being true, the cache must be invalidated.
+- `input_lengths=` is passed only when the model declares `per_segment_positions` truthy AND the batch actually exposes an `input_lengths` tensor. Both conditions are load-bearing: sampler helpers are called with duck-typed stub models and `SimpleNamespace` batches from `tests/test_eval.py`, `tests/test_viz.py`, and `tests/test_finetune_report.py`, and passing the kwarg unconditionally broke eight tests. Do not collapse this guard. When omitted, the model derives the value from the attention mask, which is identically equal by construction.
+- `SamplerStep` carries `forward_wall_seconds: float = 0.0` and `used_cached_input_kv: bool = False`. Both are defaulted and appended, so nothing constructing or reading `SamplerStep` changes. Timing uses `time.perf_counter` on CPU and `torch.cuda.Event` on GPU — a bare `perf_counter` around an async CUDA launch would report a fake speedup. This is unrelated to `timing.py`, which owns in-game absolute-clock recovery (`SPEC.md` §7), not performance measurement.
+
 ## Work Guidance
 
 - Keep the sampler's self-conditioning reuse identical to the training interface. Extra forward work must remain explicit and diagnostics-only.

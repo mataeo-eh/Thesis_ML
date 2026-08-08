@@ -1341,6 +1341,97 @@ def test_build_per_segment_position_ids_pins_the_canvas_to_last_input_relative_o
         assert off_offset == 1, length
 
 
+def test_anchoring_canvas_at_zero_with_negative_input_positions_equals_the_baseline() -> None:
+    """Pins a REJECTED design so nobody implements it as if it were a change.
+
+    The intuitive proposal is: make canvas index 0 the single canonical
+    position 0, and give the input the positions "before" it, i.e. the real
+    input content occupies ``-L .. -1`` and the canvas occupies ``0 .. C-1``.
+    The stated goal is to make it obvious to the model where the canvas starts.
+
+    It cannot do that, and it is not a change at all. RoPE is purely relative
+    (``q_i . k_j`` depends only on ``i - j``), and this scheme differs from
+    today's shared ``arange`` over ``[input | canvas]`` by exactly the constant
+    ``input_len``. A constant added to every position cancels in every
+    difference, so attention is mathematically identical. Implementing it would
+    be a no-op wearing the costume of a fix.
+
+    This test asserts that equivalence on the quantity attention actually sees:
+    the full set of canvas-query-to-input-key offsets.
+
+    Corollary worth keeping in mind: with purely relative RoPE, NO assignment of
+    position ids can mark an absolute landmark such as "the canvas starts here".
+    Only content can -- which is what `model.segment_embeddings` provides, and
+    what the deferred BOS/EOS seam markers would provide (see
+    `diagnostics/009-rare-class-position-blindness.md`).
+    """
+
+    canvas_len = 4
+    for input_len, length in ((10, 3), (10, 5), (10, 10), (64, 17)):
+        # Baseline: one shared arange over the concatenation. The input is
+        # LEFT-padded, so the real content is right-aligned inside the region.
+        baseline_input = list(range(input_len - length, input_len))
+        baseline_canvas = list(range(input_len, input_len + canvas_len))
+
+        # The proposal: canvas anchored at 0, input strictly before it.
+        proposal_input = list(range(-length, 0))
+        proposal_canvas = list(range(canvas_len))
+
+        baseline_offsets = [c - i for c in baseline_canvas for i in baseline_input]
+        proposal_offsets = [c - i for c in proposal_canvas for i in proposal_input]
+
+        assert baseline_offsets == proposal_offsets, (input_len, length)
+
+        # And the seam adjacency the left padding exists to guarantee is
+        # already +1 under BOTH, independent of L -- the baseline was never
+        # missing this property.
+        assert baseline_canvas[0] - baseline_input[-1] == 1, length
+        assert proposal_canvas[0] - proposal_input[-1] == 1, length
+
+
+def test_rotary_embedding_handles_negative_positions_by_relative_offset() -> None:
+    """RoPE must rotate negative positions correctly, since the "canvas at 0,
+    input before it" framing above only makes sense if it does.
+
+    It does: a negative position is simply a rotation in the opposite
+    direction. What matters is that only the OFFSET survives into the dot
+    product, so a query at 0 against a key at -1 must equal a query at 1
+    against a key at 0.
+
+    Tolerance is 1e-4 rather than exact equality because the two sides reach
+    the same angle through different float magnitudes, so reduction order
+    differs; the values agree to ~7 significant figures in practice.
+    """
+
+    head_dim = 64
+    rope = RotaryEmbedding(head_dim)
+    generator = torch.Generator().manual_seed(3)
+    query = torch.randn(1, 1, 1, head_dim, generator=generator)
+    key = torch.randn(1, 1, 1, head_dim, generator=generator)
+
+    def rotated_dot(query_position: int, key_position: int) -> float:
+        """Return q.k after rotating the fixed pair to the given positions."""
+        cos_q, sin_q = rope(
+            1,
+            device=query.device,
+            dtype=query.dtype,
+            position_ids=torch.tensor([[query_position]], dtype=torch.long),
+        )
+        cos_k, sin_k = rope(
+            1,
+            device=key.device,
+            dtype=key.dtype,
+            position_ids=torch.tensor([[key_position]], dtype=torch.long),
+        )
+        rotated_query = backbone_module.apply_rope(query, cos_q, sin_q)
+        rotated_key = backbone_module.apply_rope(key, cos_k, sin_k)
+        return float((rotated_query * rotated_key).sum())
+
+    # Each pair shares an offset, so each pair must share a dot product.
+    for left, right in (((0, -1), (1, 0)), ((0, -5), (5, 0)), ((-3, -8), (2, -3))):
+        assert abs(rotated_dot(*left) - rotated_dot(*right)) < 1e-4, (left, right)
+
+
 def test_per_segment_positions_explicit_and_derived_input_lengths_are_bitwise_identical() -> None:
     """`input_lengths` may be passed explicitly (the cheap route: a caller
     already holding `batch.input_lengths`) or omitted and derived from the

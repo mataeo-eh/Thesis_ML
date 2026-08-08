@@ -28,6 +28,8 @@ Architecture decisions live in `SPEC.md`. That document is the source of truth a
 
 ## Do Not
 
-- Do not implement anything from `SPEC.md` section 14.
+- Do not implement anything from `SPEC.md` §14 (the hard banned list).
+- Do not implement anything from `SPEC.md` §14a (discouraged) without explicit owner confirmation first. These are gated, not banned: reason through the alternative, say why the item is warranted, ask, and get a yes BEFORE writing code. When approved, it ships as a toggle defaulting to `false` and must be measured against its baseline arm before being trusted.
+- Do not enable a `SPEC.md` §14b ablation toggle on your own initiative. `model.frozen_input_kv`, `model.segment_embeddings`, and `model.per_segment_positions` exist to run an experiment; `false` is the baseline and promoting one to a default is the owner's call on measured evidence.
 - Do not resolve or implement open questions from `SPEC.md` section 12.
 - Do not duplicate architecture decisions here.

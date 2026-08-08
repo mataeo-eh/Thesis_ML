@@ -19,10 +19,10 @@ Data extraction is complete and lives in a separate repository (`SC2-gamestate-e
 ## 2. Model family — SETTLED
 
 - **Uniform-state multinomial discrete diffusion is the default process.** The forward process, clean-state prediction target, self-conditioning path, and sampler are adapted from DiffusionGemma and its released Gemma/Hackable Diffusion implementations. Absorbing `[MASK]` diffusion remains available only as the config-selected scientific ablation `diffusion.process: absorbing`; it must retain process-compatible corruption, loss, prior, and sampling semantics rather than mixing masked and uniform components. See `research/diffusiongemma-uniform-migration.md` for dated provenance and the adopt/adapt/reject rationale.
-- Backbone: a dense bidirectional **Gemma 4-lineage** transformer with sandwich RMSNorm around each residual branch (pre-attention RMSNorm, post-attention RMSNorm, pre-FFN RMSNorm, post-FFN RMSNorm), dense **GeGLU** feed forwarding (`GELU(gate, approximate="tanh") * up`, then down projection), **Llama 3.1-style frequency-scaled RoPE** for sequence position, **vanilla multi-head attention (MHA), NOT grouped-query attention**, and **QK-norm** (per-head RMSNorm on queries/keys before RoPE, config-gated and default on). The stack remains dense and single-path: no MoE. The RoPE base and scaling factors are config fields so pretraining can use shorter sequences while inference can evaluate longer sequences without learned position tables or an architecture change. MHA is retained because GQA's KV-cache savings target autoregressive decoding; full-canvas diffusion has no autoregressive KV cache. Attention uses FlashAttention kernels via PyTorch SDPA with no causal mask and a padding mask only.
+- Backbone: a dense bidirectional **Gemma 4-lineage** transformer with sandwich RMSNorm around each residual branch (pre-attention RMSNorm, post-attention RMSNorm, pre-FFN RMSNorm, post-FFN RMSNorm), dense **GeGLU** feed forwarding (`GELU(gate, approximate="tanh") * up`, then down projection), **Llama 3.1-style frequency-scaled RoPE** for sequence position, **vanilla multi-head attention (MHA), NOT grouped-query attention**, and **QK-norm** (per-head RMSNorm on queries/keys before RoPE, config-gated and default on). The stack remains dense and single-path: no MoE. The RoPE base and scaling factors are config fields so pretraining can use shorter sequences while inference can evaluate longer sequences without learned position tables or an architecture change. MHA is retained because GQA's KV-cache savings target autoregressive decoding; full-canvas diffusion has no autoregressive KV cache. Attention goes through PyTorch SDPA with no causal mask and a padding mask only. FlashAttention is the preferred kernel and is requested first; memory-efficient attention is the accepted fallback, and MATH is deliberately excluded so an unsupported shape errors instead of silently allocating O(seq^2). Either fused backend is correct — this is a performance preference. On the local Windows target the installed torch wheel ships no FlashAttention kernel at all, so memory-efficient attention is what actually runs there.
 - DiffusionGemma is a mechanics and modern-backbone reference, not a wholesale topology template. This project adopts uniform corruption, clean-state prediction, self-conditioning, GeGLU/sandwich normalization, and uniform EB sampling while rejecting MoE routing, local/sliding attention, prompt KV caching, encoder-decoder separation, fixed 256-token canvases, and multi-canvas block autoregression.
 - Each training example is one flat sequence: `[input region][canvas region]`. Full bidirectional attention over the entire sequence. The input region is clamped — never noised, never receives loss. The canvas region is noised; loss is computed on canvas positions only.
-- Conditioning is clamping. There is no encoder-decoder split, no cross-attention conditioning, no separate prompt encoder.
+- Conditioning is clamping. There is no encoder-decoder split, no cross-attention conditioning, no separate prompt encoder. Those remain the strong preference; see §14a for the confirmation gate that applies before any of them may be built, and note that the `model.frozen_input_kv` ablation toggle (§14b, default `false`) makes attention one-directional across the input/canvas seam when enabled.
 - No SSM layers in v1 (see §12 for the shelved fallback).
 
 ## 3. Training objective — SETTLED
@@ -198,9 +198,7 @@ All of the following are config fields in one YAML file, validated by a dataclas
 Each item below was explicitly evaluated and cut. Do not introduce them in any form, including "lightweight," "optional," or "configurable" versions:
 
 - Set aggregators, set encoders, or pooling-over-entities modules of any kind
-- Encoder-decoder architecture, including cross-attention conditioning
 - Semi-autoregressive or block-autoregressive generation
-- Prompt KV caching or a separate prompt encoder
 - Mixture-of-experts routing, grouped-query attention, or cache-oriented local/sliding attention
 - Copy mechanisms: pointer networks, copy gates, copy losses
 - Classification heads (outcome prediction is generative, §8)
@@ -212,6 +210,37 @@ Each item below was explicitly evaluated and cut. Do not introduce them in any f
 - Death-signal tokens
 - Permutation-invariant losses, Hungarian matching, set losses
 - DBNs; JEPA-style objectives
+
+### 14a. Discouraged — REQUIRES EXPLICIT OWNER CONFIRMATION BEFORE ANY CODE IS WRITTEN
+
+These are not banned, but the project's clear preference is to stay away from them. They were moved out of §14 because the ablation work in prompt 009 showed the hard ban was overbroad: some of these are legitimate to *measure* even where they are undesirable to *adopt*.
+
+The rules for anything in this list:
+
+1. **Think first, and say the thinking out loud.** Justify why the item is warranted here, and what cheaper alternative you rejected. "It would be faster" is not sufficient on its own.
+2. **Ask the owner and get an explicit yes before writing code.** This is a hard gate. Do not begin an implementation, and do not implement it "provisionally" pending review.
+3. **It ships as an ablation toggle, defaulting to `false` — never as the default path.** With the toggle off, the code must be behaviorally identical to the baseline. Promotion to default is a separate decision the owner makes on evidence, not something an implementing agent may do.
+4. **It must be measured before it is trusted.** A toggle that has not been run against its baseline arm is not evidence of anything.
+
+The items:
+
+- **Prompt/input KV caching.** Allowable and worth measuring, since the input region is static across denoising steps and recomputing it is pure waste. Currently implemented as the `model.frozen_input_kv` toggle (§14b), default `false`. Note the real semantic cost: caching the input's K/V means the input no longer attends to the canvas, which makes attention one-directional across the seam. That is a genuine architecture change, not just an optimization.
+- **A separate prompt/input encoder.** Undesirable. The conditioning model is clamping within one bidirectional stack (§4), and splitting the input into its own encoder walks toward the encoder-decoder split this project deliberately rejected. Do not propose it as a performance fix.
+- **Encoder-decoder architecture, including cross-attention conditioning.** Undesirable, for the same reason. If some future need seems to require it, that is a signal to re-examine the conditioning design with the owner, not to build it.
+
+### 14b. Active ablation toggles — NOT defaults
+
+Three `model:` toggles exist purely to run the prompt-009 representational ablation. **All three default to `false`, and false is the baseline.** They are not on a path to becoming defaults; enabling one is an experiment, and promotion is the owner's call on measured evidence.
+
+| Toggle | What it changes | §14a gated |
+|---|---|---|
+| `model.frozen_input_kv` | Two-pass forward; input K/V cached per layer and reused across denoising steps | Yes — input KV caching |
+| `model.segment_embeddings` | Learned `nn.Embedding(2, d_model)` marking input vs canvas | No |
+| `model.per_segment_positions` | RoPE position ids computed per segment instead of over the concatenation | No |
+
+With all three false the model is bit-identical to the pre-009 architecture and `architecture_identity` is the unchanged `"uniform-gemma4-dense-v1"`. Any enabled toggle appends to that identity, so checkpoints cannot cross ablation arms — necessary because `frozen_input_kv` and `per_segment_positions` add zero parameters and would otherwise load silently.
+
+See `diagnostics/009-rare-class-position-blindness.md` for the motivating failure and what each toggle is meant to test.
 
 ## 15. Repository conventions
 

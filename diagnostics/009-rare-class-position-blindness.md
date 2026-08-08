@@ -283,9 +283,57 @@ canvas index 0. Positions become **per-example**, so `cos`/`sin` gain a batch di
 `apply_rope` dispatches on `cos.dim()`; the baseline branch is kept verbatim so a toggles-off model
 runs the identical tensor ops.
 
-Effect on §6: canvas index 0 stops being "somewhere around absolute index 4073, ±27, minus however
-much padding this row had" and becomes RoPE position 0, exactly, always. Relative offsets *within*
-the canvas also stop drifting with the input length.
+**Effect on §6 — stated precisely, because the intuitive framing is wrong.** It is tempting to say
+"canvas index 0 stops being somewhere around absolute index 4073 and becomes RoPE position 0,
+exactly, always." That sentence is misleading. RoPE has no absolute phase: only `i - j` survives
+into the dot product, so "being at position 0" is not a property a key or query can carry. What
+actually changes is *which relative distance is stable*:
+
+| | offset from canvas index 0 to the **last** real input token | offset to the **first** real input token |
+|---|---|---|
+| Baseline (shared `arange`) | `+1`, fixed for every `L` | varies with `L` |
+| `per_segment_positions` on | `-(L - 1)`, **varies with `L`** | `0`, fixed |
+
+Measured directly against `_build_per_segment_position_ids`: `-4` at `L=5`, `-39` at `L=40`. So the
+toggle **re-anchors the input↔canvas relationship from the END of the input to its START**. It does
+not add an absolute landmark, and it does not preserve the `-1` seam adjacency that §5 identifies as
+the baseline's one crisp landmark — it trades that away for a stable distance to the input's first
+token.
+
+Whether that trade helps is exactly the empirical question the ablation exists to answer, but it is
+worth being clear that this toggle is not a strict addition to the baseline's positional
+information. It is a substitution. Pinned by
+`tests/test_model.py::test_build_per_segment_position_ids_pins_the_canvas_to_last_input_relative_offset`.
+
+### 7.2a REJECTED: "anchor the canvas at 0 and put the input at negative positions"
+
+Raised by the owner 2026-08-07 and worth recording, because it is the natural next idea and it is a
+**no-op**. The proposal: make canvas index 0 the single canonical position `0`, and give the real
+input content the positions `-L .. -1` so everything is relative to the canvas start.
+
+Two findings, both measured rather than argued:
+
+1. **RoPE handles negative positions correctly.** A negative position is just a rotation in the
+   opposite direction; `position * inv_freq` is well-defined and the offset property holds. A query
+   at `0` against a key at `-1` gives the same dot product as a query at `1` against a key at `0`.
+   Pinned by `tests/test_model.py::test_rotary_embedding_handles_negative_positions_by_relative_offset`.
+
+2. **The scheme is identical to today's baseline.** Baseline positions are `input_len - L .. input_len - 1`
+   for the input and `input_len .. input_len + C - 1` for the canvas. The proposal is those same
+   numbers minus the constant `input_len`. A constant added to every position cancels in every
+   difference, so the complete set of canvas-query-to-input-key offsets is unchanged, and relative
+   RoPE cannot distinguish them. Pinned by
+   `tests/test_model.py::test_anchoring_canvas_at_zero_with_negative_input_positions_equals_the_baseline`.
+
+The baseline therefore **already** has the property the proposal was reaching for: the canvas is
+already anchored to the input's end at a fixed `-1`, invariant to `L` and to how much left padding a
+batch needed. Nothing needs to be built.
+
+**The general lesson, which is the real content of this section:** with purely relative RoPE, *no*
+assignment of position ids can create an absolute landmark like "the canvas starts here". Position
+ids can only choose which relative distances stay stable. A landmark has to come from **content** —
+which is precisely what `model.segment_embeddings` (§7.1) supplies, and what the deferred BOS/EOS
+seam markers (§8) would supply. That is why §7.1 and §8, not §7.2, carry the actual hypothesis.
 
 ### 7.3 They are designed to COMPOSE, and here is why
 

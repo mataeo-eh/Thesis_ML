@@ -281,6 +281,33 @@ class MultiHeadSelfAttention(nn.Module):
         # unsupported dtype/shape/mask into an immediate error instead of an
         # O(seq^2) allocation and Windows shared-memory spillover. CPU retains
         # its only available implementation for unit tests and diagnostics.
+        #
+        # Backend ORDER IS THE PREFERENCE ORDER (`set_priority=True`):
+        # FlashAttention first because it is the fastest and most
+        # memory-efficient option, then memory-efficient attention as the
+        # fallback. Both are fused and linear-memory, so either is acceptable;
+        # this is a performance preference, not a correctness one.
+        #
+        # Do not read the presence of FLASH_ATTENTION here as a promise that it
+        # runs. Measured 2026-08-07 on this project's target box (RTX 3070,
+        # sm_86, torch 2.12.1+cu130, Windows): the Windows wheel is built
+        # WITHOUT any FlashAttention kernel, so every call silently falls back
+        # to EFFICIENT_ATTENTION -- that is the backend actually serving
+        # training and inference today, and it performs fine. PyTorch reports
+        # this only as a `UserWarning: Torch was not compiled with flash
+        # attention` from sdp_utils.cpp. Note that
+        # `torch.backends.cuda.flash_sdp_enabled()` still returns True on such
+        # a build: it reports the PREFERENCE, not availability, and is
+        # misleading if used to check whether flash will actually run. To test
+        # availability, restrict to [SDPBackend.FLASH_ATTENTION] and see
+        # whether the call raises "No available kernel".
+        #
+        # Keeping flash listed first costs nothing and means a future
+        # flash-capable build (a Linux cloud trainer, or a rebuilt wheel) picks
+        # it up with no code change. Also note FlashAttention rejects a
+        # non-None `attn_mask` outright, and this project always passes a
+        # padding mask, so masked calls route to EFFICIENT_ATTENTION even where
+        # flash IS compiled in.
         kernel_context = (
             sdpa_kernel(
                 [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION],
