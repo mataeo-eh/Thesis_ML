@@ -6,37 +6,89 @@ extends: local_overfit.yaml
 # conditioning, clamped fogged input) drive the loss down at all? A run that
 # cannot overfit 10 replays will not learn 870.
 #
-# Everything about the data subset, model scale, and schedule is inherited from
-# local_overfit.yaml; this file only redirects the output paths so V2 runs never
-# mix with V1 artifacts, and pins the diffusion process.
+# The data subset and model scale are inherited from local_overfit.yaml
+# unchanged. This file redirects the output paths so V2 runs never mix with V1
+# artifacts, pins the diffusion process, and owns the run length and LR decay
+# shape for itself and for every configs/ablation_*.yaml arm that extends it.
 
 storage:
   checkpoint_uri: checkpoints/local-overfitV2
   log_uri: tests/output/overfitV2
   local_cache_dir: .pipeline_cache/local-overfitV2
 
+train:
+  # 100 epochs, overriding the 150 inherited from local_overfit.yaml. This is
+  # the SAME length the five ablation arms run for (they extend this file), so
+  # V2 and every arm now share one step budget -- 34 optimizer steps/epoch x 100
+  # = 3400 -- and their epoch_metrics.csv rows are comparable epoch for epoch
+  # without any per-arm step cap in the launcher.
+  #
+  # `max_steps` stays at the inherited 0, which is what makes the LR horizon
+  # DERIVED: train_pipeline injects len(train_loader) * epochs (= 3400) as
+  # train.max_steps, and both the LR decay (TrainingLoop._lr_multiplier) and the
+  # EMA window (TrainingLoop._resolve_ema_decay) are fitted to exactly that. So
+  # changing `epochs` here re-fits both schedules automatically; nothing else
+  # needs to be touched.
+  epochs: 100
+  # LINEAR decay to a 0.03 floor, replacing the inherited cosine-to-0.1.
+  #
+  # WHY, from the V2 and ablation loss curves: overall loss and most per-class
+  # losses stopped descending partway through and instead hovered inside a band,
+  # dipping deeper on some epochs and rebounding on others. That is the signature
+  # of a learning rate that stayed too high for too long relative to how far the
+  # model had already converged -- the step size, not the gradient, was setting
+  # the noise floor. Three changes, all in that direction:
+  #
+  #   - shape cosine -> linear: the half-cosine lingers near the peak for the
+  #     first ~15% of the decay; the linear shape starts descending immediately,
+  #     so less of the run is spent at the highest rate.
+  #   - the same linear slope is SHALLOWER through the middle of training than
+  #     the cosine's steepest section (cosine peaks at pi/2 ~= 1.57x the
+  #     straight-line slope), so the rate comes down more evenly instead of
+  #     collapsing across the middle third and then flattening.
+  #   - floor 0.1 -> 0.03: the run now ends at 9.0e-6 rather than 3.0e-5. The
+  #     end-of-training gradient-noise floor scales with the final lr, so this is
+  #     the part that should actually shrink the hovering band and let the last
+  #     epochs settle into a minimum instead of bouncing around one.
+  #
+  # Both knobs default to cosine / 0.1 in config/default.yaml, so local_full.yaml
+  # and local_overfit.yaml are untouched and the old shape is one line away.
+  lr_decay_shape: linear
+  lr_floor_ratio: 0.03
+
 # ============================================================================
 # THIS IS THE ABLATION CONTROL SURFACE.
 #
 # Flip ONE flag here to true and run `tests\overfit.bat` to measure that
-# ablation against the all-false baseline run. Everything else about this
-# profile (subset, model scale, schedule, output paths) stays fixed, so the
-# resulting loss curves in tests/output/overfitV2/epoch_metrics.csv differ only
-# by the toggle you changed.
+# ablation against the baseline run. Everything else about this profile (subset,
+# model scale, schedule, output paths) stays fixed, so the resulting loss curves
+# in tests/output/overfitV2/epoch_metrics.csv differ only by the toggle you
+# changed.
 #
-# All three are false here, matching config/default.yaml: false is the BASELINE
-# and the model behaves exactly as it does today. Enabling any of them changes
-# the model's stored architecture identity (see `toggle_fingerprint` in
+# `frozen_input_kv` IS NO LONGER LISTED HERE. It was promoted to a project-wide
+# default on 2026-08-09 (owner decision, on arm-01 evidence: no meaningful loss
+# difference, much faster inference), so this profile now INHERITS
+# `frozen_input_kv: true` from config/default.yaml rather than pinning it off.
+# Two consequences worth knowing before you launch:
+#
+#   1. This profile's stored architecture identity is now
+#      `dense-multinomial-SC2-v2+frozen_input_kv`, so the pre-promotion
+#      `checkpoints/local-overfitV2/last.pt` will NOT resume into it -- the
+#      launch aborts on a fingerprint mismatch rather than training on the wrong
+#      architecture. Archive `tests/output/overfitV2/` and move the old
+#      checkpoint aside before rerunning `tests\overfit.bat`.
+#   2. The completed prompt-009 sweep's all-false baseline arm lives on in
+#      configs/ablation_00_baseline.yaml, which pins all three toggles false at
+#      these same storage paths. That file -- not this one -- is what reproduces
+#      the recorded baseline curves and loads the recorded baseline checkpoint.
+#
+# The two toggles below are still experiments. Enabling either changes the
+# model's stored architecture identity (see `toggle_fingerprint` in
 # src/thesis_ml/config.py), so a checkpoint trained with a toggle on will refuse
-# to load into a baseline model and vice versa -- that is deliberate. Point
-# `storage.checkpoint_uri` somewhere new before running an enabled ablation if
-# you want to keep the baseline `checkpoints/local-overfitV2/last.pt`.
+# to load into a model built without it and vice versa -- that is deliberate.
+# Point `storage.checkpoint_uri` somewhere new before running an enabled
+# ablation if you want to keep whatever sits in checkpoints/local-overfitV2.
 #
-#   frozen_input_kv       -- two-pass forward: the input region alone through
-#                            all L blocks caching each layer's K/V, then the
-#                            canvas attending to concat(cached_input_K,
-#                            canvas_K). At inference the input KV is computed
-#                            once and reused across every denoising step.
 #   segment_embeddings    -- learned 2-row embedding (0 = input, 1 = canvas)
 #                            added to the final per-region embedding, so the
 #                            same token id in the input and in the canvas is
@@ -47,7 +99,6 @@ storage:
 #                            positions no longer move with the batch's padding.
 # ============================================================================
 model:
-  frozen_input_kv: false
   segment_embeddings: false
   per_segment_positions: false
 
@@ -69,7 +120,7 @@ diffusion:
 #
 # Diagnostics this run writes to tests/output/overfitV2/ (see
 # TrainingLoop._write_epoch_metrics for the full column list):
-#   - epoch_metrics.csv    : one row per epoch (150 rows), carrying train AND dev
+#   - epoch_metrics.csv    : one row per epoch (100 rows), carrying train AND dev
 #     values for every loss sub-class below, plus timestep percentiles,
 #     future-distance buckets, and memory/throughput telemetry.
 #   - step_metrics.jsonl   : one line per optimizer step.

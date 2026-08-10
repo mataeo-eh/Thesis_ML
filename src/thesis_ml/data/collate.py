@@ -9,7 +9,7 @@ import torch
 from thesis_ml.data.dataset import CLASS_ENEMY_FUTURE, CLASS_PAD, DatasetExample
 from thesis_ml.data.features import CATEGORICAL_FEATURE_WIDTH, CONTINUOUS_FEATURE_NAMES
 from thesis_ml.model.embedding import InputFeatures, build_input_features
-from thesis_ml.vocab.special_tokens import PAD_ID
+from thesis_ml.vocab.special_tokens import BOS_ID, PAD_ID
 
 # Integer encoding of DatasetExample.perspective_player carried on the batch so
 # the perspective survives `.to(device)` (a Python string would not). Kept in
@@ -131,6 +131,10 @@ def collate_diffusion_examples(
     )
     for row, example in enumerate(examples):
         length = example.target_canvas.numel()
+        if length < 2 or int(example.target_canvas[0].item()) != BOS_ID:
+            raise ValueError("every target canvas must begin with clamped [BOS]")
+        if bool(example.target_canvas[1:].eq(BOS_ID).any()):
+            raise ValueError("[BOS] may appear only at canvas position 0")
         target_canvas[row, :length] = example.target_canvas
         class_labels[row, :length] = example.class_labels
         canvas_attention_mask[row, :length] = True
@@ -139,6 +143,9 @@ def collate_diffusion_examples(
             dtype=torch.long,
         )
     canvas_loss_mask = canvas_attention_mask.clone()
+    # [BOS] remains in the attended canvas region but is fixed context rather
+    # than a prediction target. Batch-shape padding is already false above.
+    canvas_loss_mask[:, 0] = False
 
     input_records = [example.input_records for example in examples]
     if max_input_len == 0:

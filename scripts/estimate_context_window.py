@@ -27,6 +27,8 @@ DEFAULT_INPUT_DIR = WORKSPACE_DIR / "data" / "quickstart" / "parquet"
 DEFAULT_OUTPUT_PATH = SCRIPT_DIR / "output" / "context_window_estimate.json"
 DEFAULT_PATTERN = "*.parquet"
 PERSPECTIVES = ("p1", "p2")
+INPUT_BOUNDARY_TOKEN_COUNT = 1
+CANVAS_PREFIX_TOKEN_COUNT = 2
 END_TOKEN_COUNT = 1
 
 
@@ -37,9 +39,8 @@ class ReplayTokenCounts:
     The two compatibility fields now carry the same zero-fog input count:
     all self tokens plus all enemy tokens, interleaved per timestep with
     exactly one delimiter (``_build_artifact_input``'s shared grammar).
-    The output/target canvas token counts are unaffected by this mode split
-    (the reconstruction-target grammar is unchanged across both modes) and
-    stay per-perspective as before.
+    Each input includes its terminal ``[EOS]`` and each output includes its
+    ``[BOS]`` plus perspective-relative outcome prefix.
     """
 
     replay: str
@@ -73,13 +74,15 @@ def estimate_replay(parquet_path: Path) -> ReplayTokenCounts:
 
     # Both modes interleave [self][enemy] records with exactly one delimiter
     # per timestep. Estimates use the clean/zero-fog upper bound.
-    finetune_input_tokens = p1_content + p2_content + timesteps
+    finetune_input_tokens = (
+        p1_content + p2_content + timesteps + INPUT_BOUNDARY_TOKEN_COUNT
+    )
     pretrain_input_tokens = finetune_input_tokens
 
-    # Output/target canvas grammar is unchanged across both modes: the full
-    # enemy reconstruction, one delimiter per timestep, then [END].
-    p1_output = p2_content + timesteps + END_TOKEN_COUNT
-    p2_output = p1_content + timesteps + END_TOKEN_COUNT
+    # Full-replay pretraining output: [BOS], perspective outcome, enemy
+    # reconstruction, one delimiter per timestep, then [END].
+    p1_output = p2_content + timesteps + END_TOKEN_COUNT + CANVAS_PREFIX_TOKEN_COUNT
+    p2_output = p1_content + timesteps + END_TOKEN_COUNT + CANVAS_PREFIX_TOKEN_COUNT
     return ReplayTokenCounts(
         replay=parquet_path.name,
         timesteps=timesteps,
@@ -121,7 +124,7 @@ def build_report(replays: Sequence[ReplayTokenCounts]) -> dict[str, object]:
             finetune_combined_lengths.append(replay.finetune_input_tokens + output_length)
 
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "dataset": {
             "parquet_files": len(replays),
@@ -134,13 +137,18 @@ def build_report(replays: Sequence[ReplayTokenCounts]) -> dict[str, object]:
             "upgrade": "one token per listed cumulative upgrade at a timestep",
             "pretrain_input": (
                 "all self tokens plus all zero-fog enemy tokens, interleaved per timestep "
-                "([self][enemy] per timestep) with exactly one delimiter per timestep"
+                "([self][enemy] per timestep) with exactly one delimiter per timestep "
+                "and one terminal [EOS]"
             ),
             "finetune_input": (
                 "all self tokens plus all zero-fog enemy tokens, interleaved per timestep "
-                "([self][enemy] per timestep) with exactly one delimiter per timestep"
+                "([self][enemy] per timestep) with exactly one delimiter per timestep "
+                "and one terminal [EOS]"
             ),
-            "output": "all enemy tokens, with one delimiter per timestep and one terminal [END] token",
+            "output": (
+                "one [BOS] token, one perspective outcome token, all enemy tokens, "
+                "one delimiter per timestep, and one terminal [END] token"
+            ),
             "padding": "excluded",
         },
         "statistics": {

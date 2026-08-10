@@ -177,7 +177,7 @@ def run_finetune_pipeline(
     )
 
     # Because config.data.debut_mode is True here, SC2DiffusionDataset builds
-    # the 7-class debut target (outcome token at canvas position 0 plus
+    # the 7 scored debut classes (clamped BOS at position 0, outcome at position 1, plus
     # visible/fogged/future debut events) for every example -- see Worker 1's
     # `_build_debut_target`. This is what makes the resulting examples usable
     # both for training AND, unchanged, as the "examples" the Worker-4

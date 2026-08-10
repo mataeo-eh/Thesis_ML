@@ -1,0 +1,65 @@
+extends: local_overfit_v2.yaml
+
+# MEMORIZATION PROBE, ARM 3 of 3 -- REGULARIZATION OFF **AND** t=1 OVERSAMPLED.
+#
+# THE QUESTION. Arms 1 and 2 each remove one obstacle to memorization. This arm
+# removes both at once and asks the headline question directly: with nothing
+# actively fighting memorization and the hardest corruption regime densely
+# trained, can this model truly memorize 10 replays?
+#
+# It is a combined arm, not a third independent variable -- its value comes from
+# being read against arms 1 and 2, which is why all three run the same subset,
+# the same 100 epochs, and the same LR schedule. Three readings are possible:
+#
+#   - This arm ~= the better of arms 1 and 2  -> the two changes address the same
+#     bottleneck and only one of them is doing work.
+#   - This arm clearly beats both             -> the changes are complementary;
+#     regularization and t=1 starvation were two separate ceilings.
+#   - This arm sits between them              -> they interact badly. The most
+#     likely mechanism: with no fog and no weight decay the model memorizes the
+#     easy low-t windows fast, and the 25% of windows at full corruption then
+#     dominate the remaining gradient, so the reported average loss is pulled up
+#     by a bucket the other arms barely sample. Read the PER-BUCKET columns
+#     before concluding this arm is worse -- the overall loss column alone cannot
+#     distinguish "worse model" from "harder mix of problems".
+#
+# THE TWO CHANGES, both restated here rather than inherited from arms 1 and 2 so
+# this file is readable on its own (YAML `extends` is single-parent; there is no
+# way to inherit from both):
+#
+#   train.weight_decay 0.0            -- see configs/memorization_01_no_regularization.yaml
+#   fog.rate_distribution 0.0..0.0    -- see configs/memorization_01_no_regularization.yaml
+#   diffusion.schedule.t_one_fraction -- see configs/memorization_02_t_one_oversample.yaml
+#     0.25
+#
+# THESE THREE VALUES MUST STAY IN SYNC with arms 1 and 2. If arm 1's weight decay
+# or fog changes, or arm 2's t_one_fraction changes, this file has to change with
+# it or the combined arm stops being the union of the other two and the
+# comparison becomes meaningless. tests/test_config.py asserts the equality
+# directly so a drifting edit fails a test instead of quietly ruining the sweep.
+#
+# ARCHITECTURE: `model.frozen_input_kv` is INHERITED as true from
+# config/default.yaml. Architecture identity is
+# `dense-multinomial-SC2-v2+frozen_input_kv`.
+#
+# RUN LENGTH: 100 epochs = 3400 optimizer steps, inherited from
+# configs/local_overfit_v2.yaml along with the LR and EMA schedules. No
+# `--max-steps` cap.
+
+storage:
+  checkpoint_uri: checkpoints/memorization/03-no-regularization-plus-t-one
+  log_uri: tests/output/memorization/03-no-regularization-plus-t-one
+  local_cache_dir: .pipeline_cache/memorization/03-no-regularization-plus-t-one
+
+train:
+  weight_decay: 0.0
+
+fog:
+  rate_distribution:
+    name: uniform
+    min: 0.0
+    max: 0.0
+
+diffusion:
+  schedule:
+    t_one_fraction: 0.25

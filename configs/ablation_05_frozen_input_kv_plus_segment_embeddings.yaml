@@ -1,0 +1,23 @@
+extends: local_overfit_v2.yaml
+
+# ABLATION ARM 5 of 5 -- frozen_input_kv + segment_embeddings.
+#
+# The structural toggle paired with the region-identity toggle: the canvas
+# attends to a cached, input-only-conditioned K/V, AND the two regions carry
+# distinct learned identities. Arm 1 isolates the two-pass structure and arm 2
+# isolates the segment identity, so this arm tests whether the frozen-KV split
+# needs an explicit region marker to pay off.
+#
+# See configs/ablation_01_frozen_input_kv.yaml for the full rationale behind the
+# separate storage paths and behind the 100-epoch / 3400-step run length that
+# every arm inherits from configs/local_overfit_v2.yaml and runs to completion
+# (no `--max-steps` cap); both apply identically to every arm in this sweep.
+storage:
+  checkpoint_uri: checkpoints/ablations/05-frozen-input-kv-plus-segment-embeddings
+  log_uri: tests/output/ablations/05-frozen-input-kv-plus-segment-embeddings
+  local_cache_dir: .pipeline_cache/ablations/05-frozen-input-kv-plus-segment-embeddings
+
+model:
+  frozen_input_kv: true
+  segment_embeddings: true
+  per_segment_positions: false

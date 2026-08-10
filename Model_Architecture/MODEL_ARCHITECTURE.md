@@ -9,17 +9,17 @@ Unless a section explicitly says otherwise, exact run-profile values refer to th
 ## Architecture at a glance
 
 - Model family: dense, bidirectional uniform-state discrete-diffusion transformer.
-- Trainable parameters: **11,042,880**.
+- Trainable parameters: **10,995,776**.
 - Model width: **256**.
 - Transformer blocks: **10**.
 - Attention: **4** heads × **64** dimensions per head.
 - Dense GeGLU width: **1,024**.
-- Vocabulary tensor width: **383** IDs.
+- Vocabulary tensor width: **291** IDs.
 - Local-full batch size: **9**.
 - Input budget: at most **4,096** served tokens per row.
 - Canvas size: exactly **4,096** target tokens per row in the production builders.
 - Maximum concatenated model sequence: **8,192** positions.
-- Output: one untied, bias-free **256 → 383** token head at every concatenated position; training slices and scores only the canvas region.
+- Output: one untied, bias-free **256 → 291** token head at every concatenated position; training slices the canvas region and excludes its clamped BOS anchor from loss.
 - Position encoding: parameter-free Llama 3.1-style frequency-scaled RoPE.
 - No encoder-decoder split, cross-attention, causal mask, learned positional embedding, region/segment embedding, copy head, classification head, or explicit diffusion-time embedding.
 - Three config-gated architecture ablation toggles exist and are all `false` in every committed profile. The bullet above and every shape, count, and behavior in this document describe that all-off state, which is the architecture as it has always been. See "Architecture ablation toggles".
@@ -46,7 +46,7 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 | `model.frozen_input_kv` | false |
 | `model.segment_embeddings` | false |
 | `model.per_segment_positions` | false |
-| Derived `architecture_identity` | `uniform-gemma4-dense-v1` |
+| Derived `architecture_identity` | `dense-multinomial-SC2-v2` |
 | `model.rope_theta` | 500,000 |
 | RoPE type | `llama3` |
 | RoPE factor | 8.0 |
@@ -65,12 +65,14 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 | AdamW epsilon | 1e-8 |
 | Weight decay | 0.1 |
 | Warmup | 200 optimizer steps |
-| LR floor | 0.1 × peak |
+| LR floor | 0.1 × peak (`local_overfit_v2.yaml` and the ablation arms: 0.03 × peak) |
+| LR decay shape | `cosine` (`local_overfit_v2.yaml` and the ablation arms: `linear`) |
 | Gradient clipping | 1.0 |
 | Accumulation steps | 1 |
 | Effective-token accumulation target | disabled (`0`) |
 | Epochs | 8 |
-| EMA decay | 0.9999 |
+| EMA decay | derived per run; ceiling 0.9999 |
+| EMA horizon ratio | 0.1 × the run's total optimizer steps |
 | Training self-conditioning probability | 0.5 per row |
 | Compute precision | BF16 autocast |
 | Stored parameter dtype | FP32 |
@@ -80,7 +82,12 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 | Adaptive entropy threshold | 0.005 |
 | Required stable passes | 2 |
 
-`train.max_steps: 0` is resolved by the pipeline to `len(train_loader) × train.epochs` before the scheduler is constructed. The learning-rate multiplier rises linearly for 200 steps and then follows cosine decay to 10% of the peak.
+`train.max_steps: 0` is resolved by the pipeline to `len(train_loader) × train.epochs` before the scheduler is constructed, and that resolved horizon drives BOTH the learning-rate decay and the EMA averaging window.
+
+The learning-rate multiplier rises linearly for 200 steps and then decays to `lr_floor_ratio ×` peak over the remaining steps, landing on the floor exactly at the last step. `train.lr_decay_shape` selects the curve:
+
+- `cosine` (default) — half-cosine: lingers near the peak for roughly the first 15% of the decay, is steepest through the middle (its maximum per-step drop is `π/2 ≈ 1.57×` the straight-line slope), then flattens into a long tail at the floor.
+- `linear` — one constant slope: leaves the peak immediately, so less of the run is spent at the highest rate, and that constant slope is shallower through the middle than the cosine's steepest section. `configs/local_overfit_v2.yaml` and the five ablation arms use it with `lr_floor_ratio: 0.03`, ending at `9.0e-6` rather than `3.0e-5`, because their loss curves hovered inside a band late in training rather than settling into a minimum — the end-of-training gradient-noise floor scales with the final learning rate.
 
 ## Vocabulary and learned state space
 
@@ -94,21 +101,22 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 | 3 | `[DELIMITER]` | 1 |
 | 4 | `[WIN]` | 1 |
 | 5 | `[LOSS]` | 1 |
-| 6–99 | unnamed/reserved tensor IDs | 94 |
-| 100–382 | contiguous content-token IDs | 283 |
+| 6 | `[BOS]` | 1 |
+| 7 | `[EOS]` | 1 |
+| 8–290 | contiguous content-token IDs | 283 |
 
 The vocabulary width is the largest assigned token ID plus one:
 
 \[
-V = 382 + 1 = 383.
+V = 290 + 1 = 291.
 \]
 
-The input embedding and output head therefore each allocate 383 rows, although only 289 IDs are named special or content tokens. Current uniform corruption samples integer IDs from `[1, 383)`, and inference masks only ID 0 before softmax. Consequently, IDs 6–99 are part of the current noising and inference state space and own trainable embedding/output rows. Ground-truth targets do not use them.
+All 291 embedding/output rows are named special or content tokens; there is no reserved-ID hole. Uniform prior, corruption, and re-noising draw uniformly from 285 states: `[PAD]`, `[DELIMITER]`, and the 283 content IDs. They never inject `[MASK]`, `[END]`, `[WIN]`, `[LOSS]`, `[BOS]`, or `[EOS]`. Clean-token candidate sampling masks only `[MASK]`, so the output head can still predict legitimate target specials.
 
 ### Shared token embedding
 
 \[
-E \in \mathbb{R}^{383 \times 256}
+E \in \mathbb{R}^{291 \times 256}
 \]
 
 The same table embeds clamped input IDs, noised canvas IDs, and the expected token distribution used by self-conditioning. It is not tied to the output head.
@@ -123,9 +131,10 @@ For each one-second replay timestep, the served input grammar is:
 [self content records]
 [fog-filtered enemy content records]
 [one DELIMITER]
+[one EOS after the final timestep]
 ```
 
-One fog rate is sampled per served example from `Uniform(0.0, 0.8)`. Each enemy content token is independently omitted with that probability. Fog does not insert `[MASK]`; self records and the delimiter remain. Persisted artifacts remain clean.
+One fog rate is sampled per served example from `Uniform(0.0, 0.8)`. Each enemy content token is independently omitted with that probability. Fog does not insert `[MASK]`; self records, delimiters, and the terminal `[EOS]` remain. Persisted artifacts remain clean. EOS counts against the 4,096-token input budget.
 
 The collator left-pads each row to the longest served input in its batch:
 
@@ -196,14 +205,14 @@ The final joint-mixer projection is reset to exactly zero after generic model in
 The production pretraining builder emits exactly 4,096 tokens:
 
 ```text
-[perspective-relative WIN or LOSS]
+[BOS] [perspective-relative WIN or LOSS]
 (enemy timestep content [DELIMITER])*
 [END] [PAD]*                  # when game end fits
 or
 [PAD]*                        # when horizon is boundary-truncated
 ```
 
-Position 0 is always the outcome token. The body first reconstructs the enemy sequence overlapping the input window, then continues into enemy-future timesteps. In-window enemy reconstruction is bounded by `4096 × 0.5 = 2048` tokens; the remaining budget can carry the outcome, future continuation, delimiters, end token, and semantic padding.
+Position 0 is always `[BOS]`; it is attended but permanently clamped and unscored. Position 1 is always the outcome token and remains ordinarily corrupted, predicted, re-noised, and scored. The body first reconstructs the enemy sequence overlapping the input window, then continues into enemy-future timesteps. In-window enemy reconstruction is bounded by `4096 × 0.5 = 2048` tokens; the remaining budget carries the two-token prefix, future continuation, delimiters, end token, and semantic padding.
 
 | Tensor | Shape | Dtype |
 |---|---|---|
@@ -213,7 +222,7 @@ Position 0 is always the outcome token. The body first reconstructs the enemy se
 | `canvas_loss_mask` | `[B, 4096]` | bool |
 | `canvas_prediction_distances` | `[B, 4096]` | int64 |
 
-Semantic `[PAD]` is a real attended and scored target. Only extra padding introduced to batch differently sized examples is excluded. The current production builders already fill their canvas budget, so every produced canvas row is 4,096 positions.
+Semantic `[PAD]` is a real attended and scored target. Clamped BOS and extra padding introduced to batch differently sized examples are excluded from loss; BOS remains included in attention. The current production builders fill their canvas budget, so every produced canvas row is 4,096 positions, of which 4,095 are loss-eligible.
 
 ### Uniform corruption
 
@@ -223,7 +232,7 @@ For every batch row, training samples one scalar:
 t_b \sim Uniform(0,1).
 \]
 
-Every canvas position independently enters the corruption branch with probability `t_b`. Selected positions are replaced by an independent uniform integer in `[1, 383)`; the replacement can equal the clean target. The clamped input is returned unchanged.
+Every loss-eligible canvas position independently enters the corruption branch with probability `t_b`. Selected positions are replaced uniformly with `[PAD]`, `[DELIMITER]`, or one of 283 content IDs; the replacement can equal the clean target. `[WIN]`/`[LOSS]` at position 1 are eligible for replacement even though neither token is in the replacement support. The EOS-terminated input and canvas position-0 BOS are returned unchanged.
 
 The model does not receive `t_b` as a scalar, embedding, token, or feature. It must infer the current noise level from the noised canvas itself.
 
@@ -234,7 +243,7 @@ The absorbing scientific ablation replaces selected positions with `[MASK]` and 
 Given prior canvas logits
 
 \[
-Z \in \mathbb{R}^{B \times 4096 \times 383},
+Z \in \mathbb{R}^{B \times 4096 \times 291},
 \]
 
 the stopped expected token embedding is:
@@ -355,7 +364,7 @@ The local-full profile checkpoints each transformer block while training. This c
 
 Three independent boolean fields on `ModelConfig` control how the input region and the canvas region relate to each other. They exist so an ablation can isolate why the position-pinned rare classes fail to fit; the motivating failure analysis is `diagnostics/009-rare-class-position-blindness.md` and the implementation interface is `diagnostics/009-ablation-toggle-interface-map.md`.
 
-**All three are `false` in `config/default.yaml` and in every profile under `configs/`.** With all three false the model is bit-identical to the architecture this document otherwise describes: identical module tree, identical `state_dict` keys, identical tensor operations, identical `architecture_identity`, 11,042,880 trainable parameters. Every other section of this document describes that all-off state.
+**All three are `false` in `config/default.yaml` and in every baseline profile under `configs/`.** With all three false the ablation paths add nothing to the vocabulary-v2 architecture described here: `dense-multinomial-SC2-v2`, 10,995,776 trainable parameters. Every other section describes that all-off state.
 
 `configs/local_overfit_v2.yaml` is the ablation control surface: exactly one flag is flipped there per arm.
 
@@ -382,9 +391,9 @@ Adds a learned `nn.Embedding(2, 256)` — row `0` = input segment, row `1` = can
 
 The table is zero-initialized by `InputContextEmbedding.reset_segment_embeddings()`, which `SC2StrategyDiffusionModel.__init__` calls immediately after `reset_joint_output()` and for the same reason: the generic `_init_weights` sweep re-initializes every `nn.Embedding` at `std = 0.02` and would otherwise leave the table non-zero. At zero the segment term adds nothing, so day-0 behavior with the toggle enabled matches the baseline exactly and any later divergence is attributable to learning rather than to initialization noise. The reset is unconditional and is a no-op when the toggle is off.
 
-When the toggle is off the module is not constructed at all — the attribute holds a plain `None`, which `nn.Module` does not register — so **no extra `state_dict` keys appear** and existing checkpoints load under strict `load_state_dict`.
+When the toggle is off the module is not constructed at all — the attribute holds a plain `None`, which `nn.Module` does not register — so **no extra `state_dict` keys appear**. Architecture-v2 checkpoints from the matching arm load strictly.
 
-This is the only one of the three that adds parameters. When enabled it adds `2 × 256 = 512` trainable parameters to the embedding subsystem, taking the whole-model total from 11,042,880 to 11,043,392.
+This is the only one of the three that adds parameters. When enabled it adds `2 × 256 = 512` trainable parameters to the embedding subsystem, taking the whole-model total from 10,995,776 to 10,996,288.
 
 ### `model.per_segment_positions`
 
@@ -409,7 +418,7 @@ Note that per-segment positions **alias** the two regions onto the same relative
 self.architecture_identity = ARCHITECTURE_ID + toggle_fingerprint(model_config)
 ```
 
-With all toggles off this is the unchanged `uniform-gemma4-dense-v1`, so every existing checkpoint remains loadable. `validate_checkpoint_compatibility` compares the stamp on load and raises before any weights are read, so a checkpoint from one ablation arm cannot resume from, warm-start, sample from, or feed diagnostics for a model built with a different toggle set.
+With all toggles off this is `dense-multinomial-SC2-v2`. Vocabulary-v1 checkpoints are intentionally retired because their embedding/head widths and canvas grammar differ. `validate_checkpoint_compatibility` compares the stamp before reading weights, so v1 checkpoints and checkpoints from a different v2 ablation arm cannot resume, warm-start, sample, or feed diagnostics.
 
 **This gating is necessary rather than defensive.** `frozen_input_kv` and `per_segment_positions` add no parameters and no keys, so a strict `load_state_dict` across mismatched arms would otherwise succeed silently and quietly corrupt the comparison with no error anywhere. Only `segment_embeddings` would be caught by key mismatch alone.
 
@@ -423,23 +432,23 @@ After 10 blocks, a final learned RMSNorm produces:
 H \in \mathbb{R}^{B \times (L_i + 4096) \times 256}.
 \]
 
-An untied, bias-free linear head maps every position to 383 logits:
+An untied, bias-free linear head maps every position to 291 logits:
 
 \[
-W_{out} \in \mathbb{R}^{383 \times 256},
+W_{out} \in \mathbb{R}^{291 \times 256},
 \]
 
 \[
-logits \in \mathbb{R}^{B \times (L_i + 4096) \times 383}.
+logits \in \mathbb{R}^{B \times (L_i + 4096) \times 291}.
 \]
 
-At the maximum local-full shape this is `[9, 8192, 383]`. Training discards the input-region logits and scores:
+At the maximum local-full shape this is `[9, 8192, 291]`. Training discards the input-region logits and scores:
 
 \[
-canvas\_logits \in \mathbb{R}^{9 \times 4096 \times 383}.
+canvas\_logits \in \mathbb{R}^{9 \times 4096 \times 291}.
 \]
 
-Uniform-mode training uses clean-target cross-entropy over every position selected by `canvas_loss_mask`, including unchanged positions, changed positions, replacements equal to the target, the outcome token, delimiters, `[END]`, and semantic `[PAD]`. It applies neither inverse-time weighting nor corruption-mask restriction.
+Uniform-mode training uses clean-target cross-entropy over every position selected by `canvas_loss_mask`: positions 1–4095 for a full production row, including unchanged positions, changed positions, replacements equal to the target, the outcome token, delimiters, `[END]`, and semantic `[PAD]`. BOS at position 0 is attended but absent from the loss mask. The objective applies neither inverse-time weighting nor corruption-mask restriction.
 
 The seven class IDs are loss-decomposition and optional weighting labels, not separate learned output heads:
 
@@ -489,7 +498,7 @@ Each half of those rows is independently gated, and both knobs default to true.
 
 `train.interval_dev_evaluation` controls the dev half. When true, each interval row's dev values come from a full pass over the dev loader with EMA weights, identical to epoch-end validation. When false the dev columns are left blank and dev is evaluated once per epoch into `epoch_metrics.csv`. The knob exists because dev cost does not scale with training cost: on the overfit profile a dev pass is ~18 s against ~105 s of training per epoch, so ten of them would roughly double the run for resolution the per-epoch dev points already supply.
 
-`train.interval_train_evaluation` controls the train half. Unlike the dev knob it saves no compute — the values are already accumulated by the training pass — so it is purely about signal. When false the train columns are left blank and train loss is reported once per epoch, the same treatment dev gets. It exists for the opposite regime from the intra-epoch cadence itself: on a profile with few batches per epoch, a ~10% slice spans only a handful of batches, and with a fresh fog draw and a fresh corruption level `t` per example those rows measure mostly which `t` values happened to be drawn. The overfit profile runs 34 batches over 150 epochs, so its slices are 3–4 batches wide while its per-epoch series is 150 points long; it therefore sets both knobs false.
+`train.interval_train_evaluation` controls the train half. Unlike the dev knob it saves no compute — the values are already accumulated by the training pass — so it is purely about signal. When false the train columns are left blank and train loss is reported once per epoch, the same treatment dev gets. It exists for the opposite regime from the intra-epoch cadence itself: on a profile with few batches per epoch, a ~10% slice spans only a handful of batches, and with a fresh fog draw and a fresh corruption level `t` per example those rows measure mostly which `t` values happened to be drawn. The overfit profile runs 34 batches per epoch — 150 epochs for V1, 100 for V2 and the ablation arms — so its slices are 3–4 batches wide while its per-epoch series is 100–150 points long; it therefore sets both knobs false.
 
 Setting both false writes no interval row at all rather than an all-blank one, and `interval_metrics.csv` is then never created. The accumulation wiring stays live either way, so re-enabling either side requires no other change.
 
@@ -499,7 +508,7 @@ Setting both false writes no interval row at all rather than an all-blank one, a
 
 | Parameter group | Shape/count derivation | Parameters |
 |---|---:|---:|
-| Shared token embedding | `383 × 256` | 98,048 |
+| Shared token embedding | `291 × 256` | 74,496 |
 | Feature MLP first weight | `32 × 360` | 11,520 |
 | Feature MLP first bias | `32` | 32 |
 | Feature MLP second weight | `32 × 32` | 1,024 |
@@ -513,7 +522,7 @@ Setting both false writes no interval row at all rather than an all-blank one, a
 | Self-conditioning GeGLU up | `256 × 256` | 65,536 |
 | Self-conditioning GeGLU down | `256 × 256` | 65,536 |
 | Scale-less post RMSNorm | no learned scale | 0 |
-| **Embedding subsystem total** |  | **447,296** |
+| **Embedding subsystem total** |  | **423,744** |
 
 The optional segment table is absent from this inventory because `model.segment_embeddings` is `false` in every committed profile and the module is then not constructed. Enabling it would add one `2 × 256` table, `512` parameters, to this subsystem. `model.frozen_input_kv` and `model.per_segment_positions` add no parameters in either state.
 
@@ -537,16 +546,16 @@ Ten blocks contain `10 × 1,049,728 = 10,497,280` parameters. The final RMSNorm 
 
 | Subsystem | Parameters |
 |---|---:|
-| Embedding and conditioning | 447,296 |
+| Embedding and conditioning | 423,744 |
 | Ten transformer blocks | 10,497,280 |
 | Final RMSNorm | 256 |
 | Complete backbone | 10,497,536 |
-| Untied output head | 98,048 |
-| **Total trainable parameters** | **11,042,880** |
+| Untied output head | 74,496 |
+| **Total trainable parameters** | **10,995,776** |
 
 Every model parameter currently has `requires_grad=True`.
 
-This total is confirmed against live construction by `tests/test_windowing.py::test_local_model_parameter_count_is_near_ten_million`, which passes on the current source with all three ablation toggles `false`. The full suite stands at 230 passed, 0 failed. Adding the toggles changed no parameter count in the all-off state.
+This total is confirmed against live `configs/local_full.yaml` construction with the 291-ID vocabulary and by `tests/test_windowing.py::test_local_model_parameter_count_is_near_ten_million`.
 
 ### Non-trainable model buffers
 
@@ -593,31 +602,43 @@ There is no special no-decay group, so embeddings, RMSNorm scales, and biases re
 
 ### EMA
 
-Training owns a complete non-trainable model copy updated after optimizer steps:
+Training owns a complete non-trainable model copy updated after every optimizer step:
 
 \[
-\theta_{EMA} \leftarrow 0.9999\theta_{EMA} + 0.0001\theta.
+\theta_{EMA} \leftarrow d\,\theta_{EMA} + (1-d)\,\theta.
 \]
+
+The decay \(d\) is **not** a fixed constant. An EMA with decay \(d\) averages over an effective window of \(1/(1-d)\) steps, so pinning \(d\) pins that window to a step count unrelated to the run: the former fixed `0.9999` is a ~10,000-step window, and a 3,400-step run therefore ended with an EMA that had not traversed its own window even once, whose served weights still carried a large share of near-initialization parameters.
+
+`TrainingLoop._resolve_ema_decay` derives the target from the same resolved step horizon the learning-rate schedule uses:
+
+\[
+d_{target} = \min\left(\texttt{ema\_decay},\; 1 - \frac{1}{\texttt{ema\_horizon\_ratio} \times \texttt{total\_steps}}\right).
+\]
+
+At `ema_horizon_ratio: 0.1` the window is always 10% of the run — 340 steps for a 3,400-step run, about ten full turnovers before the last step — whatever the epoch budget is. `train.ema_decay: 0.9999` acts as a ceiling, so runs of 100,000+ steps behave exactly as the old constant did. `TrainingLoop.fit` re-derives the value from the step budget it actually resolves, so an explicitly bounded run still gets an EMA that completes inside the steps it is given.
+
+`_update_ema` additionally ramps the decay in as \(\min(d_{target}, (1+n)/(10+n))\) over the first updates, where \(n\) counts EMA updates so far (it is checkpointed with `global_step`, so a resumed run continues the ramp rather than restarting it). Without the ramp the EMA holds onto the random initialization it was copied from for a full window, which matters here because dev validation and every periodic checkpoint read the EMA weights rather than the raw ones.
 
 EMA weights are used for validation, final checkpointing, sampling, and evaluation.
 
 ### Persistent parameter-state memory
 
-For 11,042,880 FP32 parameters:
+For 10,995,776 FP32 parameters:
 
 | State | Size |
 |---|---:|
-| Raw FP32 model | 44,171,520 bytes = 42.125 MiB |
-| Raw model + FP32 EMA | 84.250 MiB |
-| Two FP32 Adam moment tensors | 84.250 MiB |
-| FP32 gradients | 42.125 MiB |
-| **Model + EMA + Adam moments + gradients** | **210.626 MiB** |
+| Raw FP32 model | 43,983,104 bytes = 41.946 MiB |
+| Raw model + FP32 EMA | 83.891 MiB |
+| Two FP32 Adam moment tensors | 83.891 MiB |
+| FP32 gradients | 41.946 MiB |
+| **Model + EMA + Adam moments + gradients** | **209.728 MiB** |
 
 These figures deliberately exclude activations, saved tensors, SDPA workspaces, input batches, allocator fragmentation/reservation, and checkpoint serialization. They are not a GPU peak-memory prediction.
 
 ## Sampling machinery
 
-Uniform inference starts every eligible canvas position from an independent integer sampled from `[1, 383)`. Each of at most 64 passes:
+Uniform inference installs clamped `[BOS]` at position 0 and initializes every other eligible canvas position uniformly from 285 states: `[PAD]`, `[DELIMITER]`, or one of 283 content IDs. Each of at most 64 passes:
 
 1. runs the same model over the clamped input and current canvas;
 2. temperature-shapes the logits using the current linear 0.8 → 0.4 schedule;
@@ -625,11 +646,11 @@ Uniform inference starts every eligible canvas position from an independent inte
 4. samples categorical clean-state candidates;
 5. sorts eligible positions by entropy;
 6. accepts the prefix satisfying `cumsum(sorted_entropy) - sorted_entropy <= 0.1`;
-7. replaces every nonaccepted eligible position with fresh uniform non-`[MASK]` noise.
+7. replaces every nonaccepted eligible position with fresh `[PAD]`/`[DELIMITER]`/content noise.
 
 Acceptance is transient and recomputed on every pass; a previously plausible position can be renoised. Completed rows freeze. Adaptive stopping requires mean eligible-position entropy below 0.005 and unchanged argmax predictions across two consecutive passes.
 
-Normal sampling returns a canvas `[B, 4096]`. Optional diagnostic final logits require one explicitly requested extra forward pass and have shape `[B, 4096, 383]`. The diagnostics-only one-pass path starts from the selected process's terminal prior and performs exactly one denoiser call.
+Normal sampling returns a canvas `[B, 4096]`. Optional diagnostic final logits require one explicitly requested extra forward pass and have shape `[B, 4096, 291]`. The diagnostics-only one-pass path starts from the selected process's terminal prior with BOS clamped and performs exactly one denoiser call.
 
 ### Forward-call count is exactly one per pass
 
@@ -670,11 +691,11 @@ Timing follows the convention `train/loop.py` already established: `time.perf_co
 
 ## Pretraining versus debut/outcome fine-tuning
 
-Fine-tuning reuses the same model, embeddings, backbone, 383-way token head, and parameter count. It does not add a classification head.
+Fine-tuning reuses the same model, embeddings, backbone, 291-way token head, and parameter count. It does not add a classification head.
 
 The current overfit-V2 fine-tune profile changes the following pipeline behavior:
 
-- uses debut/first-appearance canvas targets plus the same position-zero outcome token;
+- uses debut/first-appearance canvas bodies with the same `[BOS]`/position-1 outcome prefix;
 - warm-starts model weights from the overfit-V2 pretraining checkpoint;
 - uses learning rate `1e-6` for 150 epochs;
 - assigns semantic `[PAD]` class weight 0.2 while other seven-class weights remain 1.0;
@@ -693,17 +714,17 @@ These are high-consequence implementation facts that must remain explicit in fut
 4. **Output weights are untied.** Token embedding and output head have equal shapes but are separate parameter tensors.
 5. **No region embedding.** There is no learned input-versus-canvas segment ID. The `model.segment_embeddings` toggle would add one and is `false` everywhere; when off, its table is not constructed and contributes no `state_dict` keys.
 6. **Semantic padding is learned.** `[PAD]` inside the canvas is an attended target; batch-shape padding is excluded.
-7. **Tensor IDs 6–99 participate in uniform noise and inference.** Only `[MASK]` is explicitly excluded, even though 6–99 are unnamed.
+7. **Every vocabulary row is mapped.** Special IDs are contiguous 0–7 and content IDs contiguous 8–290; no unnamed tensor IDs exist. Uniform replacement support is the explicit 285-state subset `[PAD]`, `[DELIMITER]`, and content.
 8. **Null self-conditioning still normalizes canvas embeddings.** With a zero conditioning signal, canvas token embeddings pass through the scale-less post RMSNorm.
 9. **Q/K norm scales are shared across heads within a layer.** Each Q or K norm owns 64 values, not `4 × 64` independent values.
 10. **Gradient checkpointing is not architecture capacity.** It changes compute/memory tradeoffs only.
-11. **RoPE is the only positional signal and it is purely relative.** Attention scores depend on `i - j` alone; no absolute index reaches the model. The input region is left-padded and the canvas right-padded, so the last real input token always sits at relative offset `-1` from canvas index 0, but nothing marks that key as the last input token.
+11. **RoPE is the only numerical positional signal and it is purely relative.** Attention scores depend on `i - j`; no absolute index reaches the model. The terminal input `[EOS]` and clamped canvas `[BOS]` provide learned token landmarks on opposite sides of the seam, with EOS at relative offset `-1` from BOS in the baseline combined-position path.
 12. **All three ablation toggles default to `false` and the all-off model is bit-identical to the pre-toggle architecture.** Two of them add no parameters and no `state_dict` keys, which is precisely why enabling any toggle changes `architecture_identity`: without that stamp, checkpoints would load silently across mismatched ablation arms.
 13. **Frozen-KV sampling adds no forward call.** The cache is captured from the first denoising pass rather than from a dedicated priming pass, so normal sampling still makes exactly one model call per pass. A priming forward would be the obvious-looking optimization and would break that contract.
 
 ## Provenance boundary
 
-The last recorded `local_full` console log predates the current feature-conditioning implementation and reported 10,803,200 parameters. That number is historical and must not be used as the current source architecture. No checkpoint should be assumed to embody the 11,042,880-parameter architecture unless its stamped metadata and state dictionary are verified against current construction.
+Older console logs and vocabulary-v1 checkpoints are historical and must not be used as the current source architecture. A current checkpoint must stamp `dense-multinomial-SC2-v2`, carry 291-row embedding/head tensors, and pass feature-statistics identity validation.
 
 ## Source-of-truth map
 

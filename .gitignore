@@ -20,6 +20,7 @@ env/
 
 # ---- Experiment / model artifacts ----
 experiments/runs/
+checkpoints/
 *.ckpt
 *.pt
 *.pth

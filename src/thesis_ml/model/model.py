@@ -11,7 +11,22 @@ from thesis_ml.data.feature_stats import FeatureStatistics
 from thesis_ml.model.backbone import BidirectionalTransformer, FrozenInputKV, RMSNorm
 from thesis_ml.model.embedding import InputContextEmbedding, InputFeatures
 
-ARCHITECTURE_ID = "uniform-gemma4-dense-v1"
+# Canonical name for this architecture, stamped into every checkpoint (see
+# `SC2StrategyDiffusionModel.architecture_identity`) and compared before any
+# weights are read, so a checkpoint from a different architecture fails closed
+# rather than loading silently.
+#
+# The name describes what the model IS: a dense (non-MoE) bidirectional
+# transformer doing multinomial/uniform-categorical discrete diffusion over an
+# SC2 game-state canvas, second vocabulary generation. It is deliberately NOT
+# named after DiffusionGemma. That work is a mechanics reference this project
+# draws several components from -- uniform corruption, expected-embedding
+# self-conditioning, GeGLU/sandwich-RMSNorm blocks, entropy-bounded sampling --
+# and it is credited as such in SPEC.md and research/, but the architecture here
+# is its own thing (one full canvas, clamped fogged input, joint static
+# conditioning) and should not carry another model's name. Keep attribution in
+# prose; keep it out of the identifier.
+ARCHITECTURE_ID = "dense-multinomial-SC2-v2"
 
 
 @dataclass(frozen=True)
@@ -19,9 +34,10 @@ class ModelOutput:
     logits: torch.Tensor
     hidden_states: torch.Tensor
     # Populated only when the caller asked for it via
-    # `return_cached_input_kv=True`, which additionally requires the
-    # `frozen_input_kv` ablation to be enabled. Defaulted so every existing
-    # construction and every existing consumer is unaffected.
+    # `return_cached_input_kv=True`, which additionally requires
+    # `frozen_input_kv` to be enabled (now the default -- SPEC.md 14b).
+    # Defaulted so every existing construction and every existing consumer is
+    # unaffected.
     cached_input_kv: FrozenInputKV | None = None
 
 
@@ -48,15 +64,15 @@ class SC2StrategyDiffusionModel(nn.Module):
         # passes. Kept as a plain attribute so `forward` never reaches back into
         # the config object at step time.
         self.per_segment_positions = model_config.per_segment_positions
-        # The suffix is empty for the all-off baseline, so this is byte-for-byte
-        # the historical identity and every existing checkpoint still loads.
-        # Any enabled ablation appends its name, which makes
+        # The suffix is empty for the all-off vocabulary-v2 baseline. Any
+        # enabled ablation appends its name, which makes
         # `validate_checkpoint_compatibility` reject a cross-ablation load.
         self.architecture_identity = ARCHITECTURE_ID + toggle_fingerprint(model_config)
         self.diffusion_process = config.diffusion.process
         statistics = feature_statistics or FeatureStatistics.identity_for_tests()
         self.feature_statistics_identity = statistics.identity
-        # Enabling QK-norm or self-conditioning changes the architecture; pre-009 checkpoints need retraining.
+        # Enabling QK-norm or self-conditioning changes the architecture and
+        # therefore also requires a matching checkpoint identity.
         self.embedding = InputContextEmbedding(
             vocab_size,
             model_config.d_model,

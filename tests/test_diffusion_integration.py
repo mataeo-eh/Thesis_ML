@@ -50,8 +50,12 @@ def test_absorbing_real_corruption_loss_and_inference_are_process_isolated(
     loop = TrainingLoop(model=model, config=config, seed=102)
 
     batch_loss = loop.compute_batch_loss(batch, fixed_t=1.0)
-    assert batch_loss.corruption.corrupted_positions.all()
-    assert batch_loss.corruption.noised_canvas.eq(MASK_ID).all()
+    assert not batch_loss.corruption.corrupted_positions[:, 0].any()
+    assert batch_loss.corruption.corrupted_positions[:, 1:].all()
+    assert torch.equal(
+        batch_loss.corruption.noised_canvas[:, 0], batch.target_canvas[:, 0]
+    )
+    assert batch_loss.corruption.noised_canvas[:, 1:].eq(MASK_ID).all()
     assert torch.equal(batch_loss.scored_mask, batch.canvas_loss_mask)
     assert torch.allclose(
         batch_loss.corruption.position_weights,

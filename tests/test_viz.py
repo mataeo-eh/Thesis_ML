@@ -151,15 +151,17 @@ def test_module_does_not_redefine_pipeline_functions():
 
 def test_optional_canvas_and_logit_exports_preserve_raw_positions(tmp_path: Path):
     vocabulary = build_content_vocabulary({"1": "marine", "2": "barracks"})
+    marine_id = vocabulary.token_id_for("marine")
+    barracks_id = vocabulary.token_id_for("barracks")
     logits = torch.zeros(3, vocabulary.vocab_size)
     logits[0, WIN_ID] = 4.0
-    logits[1, 100] = 3.0
+    logits[1, marine_id] = 3.0
     logits[2, END_ID] = 2.0
     item = diagnostics.RenderedExample(
         example=SimpleNamespace(),
         result=SimpleNamespace(
-            predicted_canvas=(WIN_ID, 100, END_ID),
-            ground_truth_canvas=(WIN_ID, 101, END_ID),
+            predicted_canvas=(WIN_ID, marine_id, END_ID),
+            ground_truth_canvas=(WIN_ID, barracks_id, END_ID),
             final_canvas_logits=logits,
             # Position 0 was revealed as ground truth; positions 1-2 predicted.
             predicted_canvas_revealed_mask=(True, False, False),
@@ -175,7 +177,7 @@ def test_optional_canvas_and_logit_exports_preserve_raw_positions(tmp_path: Path
         rows = list(csv.DictReader(handle))
     # Header order/names match the requested comparison schema.
     assert list(rows[0].keys()) == ["sequenceindex", "modelprediction", "groundtruth", "correct"]
-    # Position 1: model predicted marine (100) but truth was barracks (101) -> mismatch.
+    # Position 1: model predicted marine but truth was barracks -> mismatch.
     assert rows[1]["modelprediction"] == "marine"
     assert rows[1]["groundtruth"] == "barracks"
     assert rows[1]["correct"] == "False"

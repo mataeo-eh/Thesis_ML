@@ -43,8 +43,12 @@ from thesis_ml.data.windowing import (
 from thesis_ml.serialize import TokenRecord, serialize_snapshot
 from thesis_ml.vocab.content_vocab import ContentVocabulary
 from thesis_ml.vocab.special_tokens import (
+    BOS_ID,
+    BOS_TOKEN,
     DELIMITER_ID,
     END_ID,
+    EOS_ID,
+    EOS_TOKEN,
     LOSS_ID,
     LOSS_TOKEN,
     PAD_ID,
@@ -59,9 +63,9 @@ CLASS_ENEMY_FUTURE = 2
 CLASS_DELIMITER = 3
 CLASS_END = 4
 CLASS_PAD = 5
-# Fine-tuning-only class id for the single win/loss outcome token that sits at
-# canvas position 0 in debut mode. Added ALONGSIDE the existing ids above; the
-# existing ids are NOT renumbered so pretraining canvases keep the same labels.
+# The clamped [BOS] anchor is attended but never scored or classified.
+CLASS_CLAMPED = -1
+# Shared class id for the single win/loss outcome token at canvas position 1.
 CLASS_WINLOSS = 6
 
 # Compatibility alias for the observed reconstruction class.
@@ -187,8 +191,8 @@ class SC2DiffusionDataset(Dataset[DatasetExample]):
             rng=rng,
         )
 
-        # Both training modes now begin the canvas with the win/loss outcome
-        # token (leading position 0, denoised last), so resolve it up front for
+        # Both modes use [BOS] at canvas position 0 and the win/loss outcome at
+        # position 1, so resolve the outcome up front for
         # either target builder. debut_mode selects only the canvas BODY:
         #   - False (pre-training): full enemy reconstruction + future roll-out.
         #   - True  (debut fine-tuning): sparse first-appearance debut events.
@@ -338,6 +342,10 @@ def _build_artifact_input(
         clean_records.extend(self_records)
         clean_records.extend(enemy_records)
         clean_records.append(delimiter)
+    # [EOS] is a per-window boundary marker, not a replay timestep token. It is
+    # appended after fogging so both clean and fogged inputs end identically.
+    fogged_records.append(_input_eos_record())
+    clean_records.append(_input_eos_record())
     return (
         fogged_records,
         clean_records,
@@ -356,11 +364,12 @@ def _build_artifact_target(
     budget: int,
     outcome_id: int,
 ) -> CanvasBuild:
-    """Build the pre-training canvas: win/loss token + full enemy roll-out.
+    """Build the pre-training canvas: [BOS] + win/loss + enemy roll-out.
 
     Layout of the returned canvas:
-        position 0: the ``outcome_id`` token (``WIN_ID`` or ``LOSS_ID``) labeled
-            ``CLASS_WINLOSS``. Sampling treats it like every other position.
+        position 0: clamped ``[BOS]`` anchor, attended but never noised/scored.
+        position 1: the ``outcome_id`` token (``WIN_ID`` or ``LOSS_ID``),
+            labeled ``CLASS_WINLOSS`` and treated like every eligible position.
         then, walking enemy timesteps from ``window.start_timestep`` to game end:
             the full enemy reconstruction (observed + fogged past/present) plus
             the enemy future continuation, each timestep followed by one
@@ -368,17 +377,17 @@ def _build_artifact_target(
         finally: ``[END]`` (if the game end is reached) then ``[PAD]`` padding out
             to ``budget``.
 
-    The outcome token consumes canvas position 0, so the reconstruction + future
-    roll-out fits within ``budget - 1``. The in-window reconstruction is bounded
+    The two-token prefix leaves ``budget - 2`` for reconstruction and future
+    roll-out. The in-window reconstruction is bounded
     by ``canvas_recon_fraction`` (see ``windowing._reconstruction_limit``), which
-    is far below ``budget``, so the leading outcome token never forces an
+    is far below ``budget``, so the two-token prefix never forces an
     in-window overflow.
 
     Parameters:
-        outcome_id: The win/loss token id to place at position 0, resolved by
+        outcome_id: The win/loss token id to place at position 1, resolved by
             ``resolve_replay_outcome``. Both pre-training and debut fine-tuning
-            now carry this token so the frozen-prior model never has to learn it
-            fresh at fine-tune time.
+            carry this token so the pretrained model sees the same outcome slot
+            before fine-tuning.
     """
 
     enemy_code = P1_CODE if enemy_player == "p1" else P2_CODE
@@ -387,11 +396,7 @@ def _build_artifact_target(
     class_labels: list[int] = []
     metadata: list[dict[str, Any]] = []
 
-    # Canvas position 0 is always the single win/loss outcome token, matching
-    # _build_debut_target and the shared CLASS_WINLOSS loss taxonomy.
-    token_ids.append(outcome_id)
-    class_labels.append(CLASS_WINLOSS)
-    metadata.append({"token_kind": "outcome", "timestep_index": None, "token_name": "[WIN/LOSS]"})
+    _append_canvas_prefix(token_ids, class_labels, metadata, outcome_id=outcome_id, budget=budget)
 
     truncated = False
     reached_game_end = False
@@ -535,11 +540,12 @@ def _build_debut_target(
     budget: int,
     outcome_id: int,
 ) -> CanvasBuild:
-    """Build the debut build-order + win/loss canvas for one window (fine-tuning).
+    """Build the [BOS] + win/loss + debut canvas for one window (fine-tuning).
 
     Layout of the returned canvas:
-        position 0: the ``outcome_id`` token (``WIN_ID`` or ``LOSS_ID``) labeled
-            ``CLASS_WINLOSS``.
+        position 0: clamped ``[BOS]`` anchor, attended but never noised/scored.
+        position 1: the ``outcome_id`` token (``WIN_ID`` or ``LOSS_ID``),
+            labeled ``CLASS_WINLOSS``.
         then, walking enemy timesteps from ``window.start_timestep`` to game end:
             only the enemy entities/upgrades making their FIRST appearance at that
             timestep (a "debut"), followed by one ``[DELIMITER]``. A timestep with
@@ -573,7 +579,7 @@ def _build_debut_target(
             entities hidden from the input, produced by ``_build_artifact_input``.
         budget: Total canvas length in tokens; the canvas is padded to exactly
             this length.
-        outcome_id: The win/loss token id to place at position 0, resolved by
+        outcome_id: The win/loss token id to place at position 1, resolved by
             ``resolve_replay_outcome``.
 
     Returns:
@@ -594,10 +600,7 @@ def _build_debut_target(
     class_labels: list[int] = []
     metadata: list[dict[str, Any]] = []
 
-    # Canvas position 0 is always the single win/loss outcome token.
-    token_ids.append(outcome_id)
-    class_labels.append(CLASS_WINLOSS)
-    metadata.append({"token_kind": "outcome", "timestep_index": None, "token_name": "[WIN/LOSS]"})
+    _append_canvas_prefix(token_ids, class_labels, metadata, outcome_id=outcome_id, budget=budget)
 
     # Cross-timestep first-appearance state, UNIFIED across entity AND upgrade
     # token kinds (the old entity-vs-upgrade special case is removed).
@@ -860,6 +863,8 @@ def build_input_records(
             input_records.append(record)
         input_records.append(delimiter)
 
+    input_records.append(_input_eos_record())
+
     return input_records, fogged_counts, observed_counts
 
 
@@ -871,6 +876,7 @@ def build_target_canvas(
     *,
     input_timestep_count: int,
     fogged_counts: dict[tuple[int, str], int],
+    outcome_id: int,
 ) -> CanvasBuild:
     budget = config.data.canvas_budget_tokens
     remaining_fogged_counts = dict(fogged_counts)
@@ -880,6 +886,8 @@ def build_target_canvas(
     truncated = False
     terminated = False
     rows = list(target_frame.iterrows())
+
+    _append_canvas_prefix(token_ids, class_labels, metadata, outcome_id=outcome_id, budget=budget)
 
     for timestep_index, (_, row) in enumerate(rows):
         records = serialize_snapshot(row, config, vocabulary, perspective_player=_enemy_player(enemy_player))
@@ -975,6 +983,54 @@ def _delimiter(records: Sequence[TokenRecord]) -> TokenRecord:
     if delimiter.token_id != DELIMITER_ID:
         raise ValueError("serialized snapshot must end with [DELIMITER]")
     return delimiter
+
+
+def _input_eos_record() -> TokenRecord:
+    """Return the featureless, clamped marker terminating one input window."""
+
+    return TokenRecord(
+        token_id=EOS_ID,
+        token_name=EOS_TOKEN,
+        token_kind="input-end",
+        owner=None,
+        allegiance=None,
+        game_loop=None,
+        timestamp_seconds=None,
+    )
+
+
+def _append_canvas_prefix(
+    token_ids: list[int],
+    class_labels: list[int],
+    metadata: list[dict[str, Any]],
+    *,
+    outcome_id: int,
+    budget: int,
+) -> None:
+    """Append the fixed [BOS] anchor and the perspective outcome target."""
+
+    if budget < 2:
+        raise ValueError("canvas budget must fit the [BOS] and win/loss prefix")
+    if outcome_id not in (WIN_ID, LOSS_ID):
+        raise ValueError(f"outcome_id must be [WIN] or [LOSS], got {outcome_id}")
+    token_ids.extend((BOS_ID, outcome_id))
+    class_labels.extend((CLASS_CLAMPED, CLASS_WINLOSS))
+    metadata.extend(
+        (
+            {
+                "token_id": BOS_ID,
+                "token_kind": "canvas-begin",
+                "timestep_index": None,
+                "token_name": BOS_TOKEN,
+            },
+            {
+                "token_id": outcome_id,
+                "token_kind": "outcome",
+                "timestep_index": None,
+                "token_name": "[WIN/LOSS]",
+            },
+        )
+    )
 
 
 def _enemy_player(perspective_player: str) -> str:

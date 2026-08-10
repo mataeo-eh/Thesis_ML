@@ -7,13 +7,14 @@
 ## Ownership
 
 - `content_vocab.py` owns content-token identity and lookup (`ContentToken`, `ContentVocabulary`, `normalize_content_name`, `load_content_vocabulary`, `build_content_vocabulary`).
-- `special_tokens.py` owns the reserved special-token constants (`[MASK]`, `[PAD]`, `[END]`, `[DELIMITER]`, `[WIN]`, `[LOSS]`, and their IDs).
+- `special_tokens.py` owns the contiguous reserved special-token constants (`[MASK]`, `[PAD]`, `[END]`, `[DELIMITER]`, `[WIN]`, `[LOSS]`, `[BOS]`, `[EOS]`, and IDs 0–7) and derives the content offset from their count.
 
 ## Local Contracts
 
 - One vocabulary is shared by input and output. Content tokens are raw entity-type tokens and carry no spatial information of any kind.
-- `[MASK]` is the absorbing-ablation noise state and is never a content target. Uniform corruption, prior sampling, renoising, and categorical candidate sampling exclude it. `[PAD]` is a real semantic canvas token for surplus positions.
-- `[WIN]`/`[LOSS]` are targets in both pretraining and outcome fine-tuning. Ground truth places one at canvas position zero, but the sampler imposes no positional token restriction.
+- `[MASK]` is the absorbing-ablation noise state and is never a content target. Uniform prior/corruption/renoising draws exactly `[PAD]`, `[DELIMITER]`, or a content ID; clean-token candidate sampling excludes only `[MASK]`. `[PAD]` is a real semantic canvas token for surplus positions.
+- Inputs terminate with `[EOS]`. Both target modes place clamped, unscored `[BOS]` at canvas position 0 and mutable/scored `[WIN]`/`[LOSS]` at position 1. `[WIN]`/`[LOSS]` positions remain noise-eligible even though those IDs are excluded from replacement draws.
+- Content token IDs begin immediately after the special-token block; unused reserved-ID holes are forbidden.
 - The vocabulary contains no tokens for coordinates, frame numbers, or absolute times.
 - Concrete content-token contents derive from the extractor schema documented in `SCHEMA.md`; do not assume field names ahead of it. Engine-created ability pseudo-entities that the extractor marks untracked, including `kd8charge` and creep tumor variants, must not be content tokens.
 

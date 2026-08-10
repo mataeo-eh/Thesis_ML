@@ -12,8 +12,8 @@ The script derives the default parquet location from the repository layout, so i
 
 Each sample is one full replay from one player perspective:
 
-- Input counts all self content and zero-fog enemy content, plus one delimiter per player per timestep.
-- Output counts all enemy content, plus one delimiter per timestep and one terminal `[END]` token.
+- Input counts all self content and zero-fog enemy content, plus one delimiter per timestep and one terminal `[EOS]` token.
+- Output counts the `[BOS]`/perspective-outcome prefix, all enemy content, one delimiter per timestep, and one terminal `[END]` token.
 - An entity contributes one token when its instance is present in a row. Each listed cumulative upgrade contributes one token in every row where it is present.
 - Padding is excluded. Token statistics cover both perspectives for every replay; timestep statistics count each replay once. Both include minimum, maximum, mean, median, mode, and all tied modes.
 

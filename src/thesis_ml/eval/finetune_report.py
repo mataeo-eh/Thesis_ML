@@ -22,7 +22,7 @@ section scores held-out replays. Both are produced by calling
 
 Metrics produced per section
 ---------------------------
-1. ``win_loss_accuracy`` -- fraction of examples whose generated position-0
+1. ``win_loss_accuracy`` -- fraction of examples whose generated position-1
    token matches the ground-truth outcome (``[WIN]``/``[LOSS]``).
 2. ``build_order_f1`` -- debut build-order precision/recall/F1, reported three
    ways: an overall ``aggregate``, ``by_fog_class`` (visible/fogged/future
@@ -34,8 +34,7 @@ Metrics produced per section
    RELAXED debut grammar (``inference.decode.validate_debut_canvas``).
 5. ``win_loss_minute_buckets`` -- cumulative outcome accuracy at each minute
    checkpoint, keyed by how far into the game the INPUT window reaches.
-6. ``win_loss_structural`` -- structural booleans: outcome token at position 0,
-   and (from the sampler trace) the outcome position denoises last.
+6. ``win_loss_structural`` -- structural boolean: outcome token at position 1.
 
 Everything that is a threshold or bucket boundary is read from config
 (``config.eval.*``, ``config.data.sampling_interval_s``). Nothing here mutates
@@ -61,8 +60,10 @@ from thesis_ml.inference.decode import validate_debut_canvas
 from thesis_ml.inference.sampler import sample_canvas
 from thesis_ml.vocab.content_vocab import ContentVocabulary
 from thesis_ml.vocab.special_tokens import (
+    BOS_ID,
     DELIMITER_ID,
     END_ID,
+    EOS_ID,
     LOSS_ID,
     MASK_ID,
     PAD_ID,
@@ -299,14 +300,15 @@ def _decode_predicted_debut_events(
 ) -> list[BuildOrderEvent]:
     """Decode a (validated) generated debut canvas into debut events.
 
-    Walks the canvas starting AFTER the position-0 outcome token. Each
+    Walks the canvas after the ``[BOS]`` + outcome prefix. Each
     ``[DELIMITER]`` advances the timestep bucket; each content token becomes one
     ``BuildOrderEvent`` at the current bucket. Decoding stops at the first
     terminal special token (``[END]``/``[PAD]``). Callers should only pass
     canvases that already passed ``validate_debut_canvas``.
 
     Parameters:
-        token_ids: The generated canvas token ids (position 0 = outcome).
+        token_ids: The generated canvas token ids (position 0 = ``[BOS]`` and
+            position 1 = outcome).
         vocabulary: Content vocabulary (or an id->name mapping) to name tokens.
 
     Returns:
@@ -316,11 +318,11 @@ def _decode_predicted_debut_events(
     id_to_name = vocabulary.id_to_name if isinstance(vocabulary, ContentVocabulary) else vocabulary
     events: list[BuildOrderEvent] = []
     current_timestep = 0
-    for token_id in token_ids[1:]:  # skip the position-0 outcome token
+    for token_id in token_ids[2:]:  # skip [BOS] + outcome
         if token_id == DELIMITER_ID:
             current_timestep += 1
             continue
-        if token_id in (END_ID, PAD_ID, MASK_ID, WIN_ID, LOSS_ID):
+        if token_id in (END_ID, PAD_ID, MASK_ID, WIN_ID, LOSS_ID, BOS_ID, EOS_ID):
             break  # reached the terminal region; no more debut events
         name = id_to_name.get(int(token_id))
         if name is None:
@@ -386,7 +388,7 @@ class _ExampleEvaluation:
     ground_truth_events: list[tuple[BuildOrderEvent, str]]
     fog_rate: float
     input_reach_minutes: float
-    position0_ok: bool
+    position1_ok: bool
     # Per-example overall build-order metrics (predicted vs. all ground truth).
     aggregate_metrics: BuildOrderMetrics
 
@@ -440,15 +442,15 @@ def _evaluate_example(
         timing_tolerance_buckets=config.eval.timing_tolerance_buckets,
     )
 
-    # Ground-truth outcome is the position-0 token baked into the debut target
+    # Ground-truth outcome is the position-1 token after the fixed [BOS] anchor
     # by the dataset builder (which set it via resolve_replay_outcome). Reading
     # it from the target keeps evaluation hermetic (no re-reading metadata).
-    ground_truth_outcome = int(example.target_canvas[0].item())
-    predicted_outcome = int(canvas[0])
+    ground_truth_outcome = int(example.target_canvas[1].item())
+    predicted_outcome = int(canvas[1])
 
-    # Structural: outcome token appears exactly once, only at position 0.
+    # Structural: outcome token appears exactly once, only at position 1.
     outcome_positions = [index for index, token in enumerate(canvas) if token in (WIN_ID, LOSS_ID)]
-    position0_ok = outcome_positions == [0]
+    position1_ok = outcome_positions == [1]
 
     return _ExampleEvaluation(
         valid=validation.valid,
@@ -458,7 +460,7 @@ def _evaluate_example(
         ground_truth_events=ground_truth_events,
         fog_rate=_example_fog_rate(example),
         input_reach_minutes=_input_reach_minutes(example, config),
-        position0_ok=position0_ok,
+        position1_ok=position1_ok,
         aggregate_metrics=per_example_metrics,
     )
 
@@ -610,7 +612,7 @@ def build_debut_report(
             win_loss_minute_buckets[_minute_key(minute)] = 0.0
 
     # --- Structural booleans ----------------------------------------------
-    position0_ok = all(ev.position0_ok for ev in evaluations) if evaluations else False
+    position1_ok = all(ev.position1_ok for ev in evaluations) if evaluations else False
 
     return {
         "label": label,
@@ -627,7 +629,7 @@ def build_debut_report(
         "grammar_validity": grammar_validity,
         "win_loss_minute_buckets": win_loss_minute_buckets,
         "win_loss_structural": {
-            "position0_ok": position0_ok,
+            "position1_ok": position1_ok,
         },
     }
 

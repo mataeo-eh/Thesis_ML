@@ -1,0 +1,58 @@
+extends: local_overfit_v2.yaml
+
+# MEMORIZATION PROBE, ARM 2 of 3 -- t=1 REGIME OVERSAMPLED TO 25%.
+#
+# THE PROBLEM THIS ADDRESSES. Training draws one corruption level `t` per example
+# per epoch, uniformly on [0, 1] (thesis_ml/train/corruption.py::_resolve_t).
+# Exactly 1.0 is a measure-zero draw, so the `t_eq_1` diagnostic bucket in
+# epoch_metrics.csv is essentially always empty and the model is effectively
+# never trained on a fully-noised canvas. That is the single hardest and most
+# important regime: it is where every sampling run STARTS. The sampler begins
+# from a canvas drawn entirely from the uniform prior and denoises down, so the
+# very first denoising step is a t=1 problem the model has never seen.
+#
+# WHAT THIS CHANGES. `t_one_fraction: 0.25` makes 25% of served windows -- an
+# independent per-example Bernoulli draw, so 25% IN EXPECTATION rather than an
+# exact count per batch -- use t = 1.0 exactly instead of their uniform draw. At
+# t=1 every noisable canvas position is resampled from the uniform prior, so the
+# target canvas is 100% noise and the model must reconstruct it from the clamped
+# input alone. The remaining ~75% keep the ordinary uniform draw on [0, 1], so
+# the rest of the schedule is still covered.
+#
+# WHAT TO READ. The `t_eq_1` loss column (and its rare-class x t-bucket
+# crosses: win_loss, [END], [DELIMITER] at 100% corruption) goes from
+# empty-or-noise to densely populated -- roughly 85 of the 334 train windows per
+# epoch. Those columns are the entire point of this arm; the other three t
+# buckets thin out proportionally and should be read as slightly noisier, not as
+# having regressed.
+#
+# WHAT IS NOT CHANGED: weight decay stays at the inherited 0.1 and fog stays at
+# the inherited uniform [0, 0.8]. This arm isolates the t=1 coverage change so it
+# can be attributed on its own; arm 3
+# (configs/memorization_03_no_regularization_plus_t_one_oversample.yaml) is the
+# one that combines it with regularization-off.
+#
+# COMPARISON POINT: ablation arm 01
+# (tests/output/ablations/01-frozen-input-kv-only/epoch_metrics.csv). Same
+# architecture (overfit V2 + the now-default frozen_input_kv), same subset, same
+# 100-epoch linear-decay schedule; this run differs by t_one_fraction alone.
+#
+# ARCHITECTURE: `model.frozen_input_kv` is INHERITED as true from
+# config/default.yaml. Architecture identity is
+# `dense-multinomial-SC2-v2+frozen_input_kv`.
+#
+# RUN LENGTH: 100 epochs = 3400 optimizer steps, inherited from
+# configs/local_overfit_v2.yaml along with the LR and EMA schedules. No
+# `--max-steps` cap.
+
+storage:
+  checkpoint_uri: checkpoints/memorization/02-t-one-oversample
+  log_uri: tests/output/memorization/02-t-one-oversample
+  local_cache_dir: .pipeline_cache/memorization/02-t-one-oversample
+
+diffusion:
+  schedule:
+    # 25% of examples per epoch, per-example Bernoulli, forced to t = 1.0 exactly
+    # -- a fully noised canvas. Range-checked to [0, 1] by
+    # thesis_ml.config._validate_diffusion at load.
+    t_one_fraction: 0.25

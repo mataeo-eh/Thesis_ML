@@ -912,18 +912,16 @@ def test_model_uses_explicit_depth_scaled_initialization() -> None:
 # ---- Criterion 1: all-off parity -------------------------------------------
 
 
-def test_all_toggles_off_architecture_identity_matches_baseline_exactly() -> None:
-    """The all-off baseline's identity string must be byte-for-byte unchanged.
+def test_all_toggles_off_architecture_identity_uses_vocab_v2_baseline() -> None:
+    """The breaking vocabulary/canvas migration advances the baseline identity.
 
     `toggle_fingerprint` returning `""` for the all-off case is what keeps this
-    exactly `ARCHITECTURE_ID` ("uniform-gemma4-dense-v1") with no suffix, which
-    is what lets every checkpoint trained before this ablation existed keep
-    loading under `validate_checkpoint_compatibility`.
+    Toggle fingerprints still append nothing in the all-off case.
     """
 
     config = _small_config()
     model = SC2StrategyDiffusionModel(config, vocab_size=128)
-    assert model.architecture_identity == "uniform-gemma4-dense-v1"
+    assert model.architecture_identity == "dense-multinomial-SC2-v2"
 
 
 def test_all_toggles_off_forward_matches_fixed_seed_reference() -> None:
@@ -975,12 +973,11 @@ def test_all_toggles_off_forward_matches_fixed_seed_reference() -> None:
     assert torch.allclose(output.logits[0, -1, :5], expected_last_position, atol=1e-5)
 
 
-def test_existing_overfit_v2_checkpoint_still_validates_against_all_off_model() -> None:
+def test_existing_overfit_v2_checkpoint_is_retired_by_vocab_v2() -> None:
     """`checkpoints/local-overfitV2/last.pt` predates this ablation and was
     trained with all three toggles off. An all-off model built TODAY must
-    still pass `validate_checkpoint_compatibility` against it -- this is the
-    exact backward-compatibility guarantee `toggle_fingerprint`'s empty-string
-    return exists to protect. Skips (rather than fabricating a checkpoint) if
+    fail `validate_checkpoint_compatibility` against it because its vocabulary
+    rows and canvas grammar are incompatible. Skips if
     the file is absent from this working tree.
     """
 
@@ -992,8 +989,8 @@ def test_existing_overfit_v2_checkpoint_still_validates_against_all_off_model() 
     config = _small_config()
     model = SC2StrategyDiffusionModel(config, vocab_size=128)
 
-    # Must not raise.
-    validate_checkpoint_compatibility(checkpoint, model, str(checkpoint_path))
+    with pytest.raises(ValueError, match="architecture identity mismatch"):
+        validate_checkpoint_compatibility(checkpoint, model, str(checkpoint_path))
 
 
 # ---- Criterion 2: toggles compose -------------------------------------------
@@ -1117,6 +1114,77 @@ def test_frozen_input_kv_makes_input_hidden_states_invariant_to_canvas_and_off_d
             input_token_ids=input_ids, canvas_token_ids=changed_canvas_ids, input_features=features
         )
     assert not torch.allclose(off_base.hidden_states[:, :input_len], off_changed.hidden_states[:, :input_len])
+
+
+def test_frozen_input_kv_canvas_positions_continue_the_input_and_survive_left_padding() -> None:
+    """The two-pass split must not change which RoPE positions the canvas gets.
+
+    REGRESSION TEST (bug found and fixed 2026-08-09, when `frozen_input_kv` was
+    promoted to a default). `RotaryEmbedding.forward` falls back to
+    `arange(seq_len)` when no explicit position ids are supplied, and on the
+    frozen path's SECOND pass `seq_len` is the canvas length -- so the canvas
+    silently restarted at position 0 while the cached input keys still carried
+    0..input_len-1. Two separate failures came out of that:
+
+      1. The canvas got per-segment positions whether or not the separate
+         `per_segment_positions` toggle was on, conflating the two toggles.
+      2. Because the input region is LEFT-padded, real input content sits at the
+         right of the region and its absolute positions move with the amount of
+         padding, while the canvas stayed pinned at 0. The canvas-to-input
+         relative offset therefore depended on how much padding the batch
+         happened to need -- i.e. a window's logits depended on which OTHER
+         windows shared its batch.
+
+    Both halves are asserted here against the joint path, which has always been
+    padding-invariant, so the test states the contract rather than a magic
+    number: a padded batch's real positions must match the same example run
+    alone, for the frozen path exactly as for the joint one.
+    """
+
+    real_ids = [6, 7, 8, 9]
+    canvas_ids = torch.tensor([[10, 11, 12, 13, 14]])
+
+    # `test_per_segment_positions_left_pad_invariance_holds_both_on_and_off`
+    # above covers the two frozen_input_kv-OFF combinations. These are the two
+    # ON ones: alone (where the bug lived -- no explicit position ids, so the
+    # second pass fell back to arange(canvas_len)) and combined with
+    # per_segment_positions (where explicit ids were always supplied and sliced,
+    # so this combination was correct all along and must stay correct).
+    for toggle_kwargs in (
+        {"frozen_input_kv": True},
+        {"frozen_input_kv": True, "per_segment_positions": True},
+    ):
+        torch.manual_seed(21)
+        model = SC2StrategyDiffusionModel(
+            _small_config(layers=2, **toggle_kwargs), vocab_size=128
+        )
+        model.eval()
+
+        narrow_ids, narrow_mask, narrow_lengths, narrow_features = _left_padded_batch(real_ids, 4)
+        wide_ids, wide_mask, wide_lengths, wide_features = _left_padded_batch(real_ids, 12)
+
+        with torch.no_grad():
+            narrow_output = model(
+                input_token_ids=narrow_ids,
+                canvas_token_ids=canvas_ids,
+                input_attention_mask=narrow_mask,
+                input_features=narrow_features,
+                input_lengths=narrow_lengths,
+            )
+            wide_output = model(
+                input_token_ids=wide_ids,
+                canvas_token_ids=canvas_ids,
+                input_attention_mask=wide_mask,
+                input_features=wide_features,
+                input_lengths=wide_lengths,
+            )
+
+        narrow_canvas_logits = narrow_output.logits[:, narrow_ids.shape[1] :]
+        wide_canvas_logits = wide_output.logits[:, wide_ids.shape[1] :]
+        max_diff = (narrow_canvas_logits - wide_canvas_logits).abs().max().item()
+        # Same 1e-4 threshold the OFF-case invariance test uses: ~1e-7 float
+        # noise passes, and the ~1.0 divergence the bug produced does not.
+        assert max_diff < 1e-4, f"{toggle_kwargs}: canvas logits moved by {max_diff:.3e}"
 
 
 def test_frozen_input_kv_cached_forward_matches_recomputed_forward() -> None:

@@ -17,12 +17,20 @@ from thesis_ml.inference.timing import attach_absolute_times
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.train.train import make_synthetic_examples
 from thesis_ml.vocab.content_vocab import build_content_vocabulary
-from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, MASK_ID, PAD_ID, WIN_ID
+from thesis_ml.vocab.special_tokens import (
+    BOS_ID,
+    CONTENT_TOKEN_OFFSET,
+    DELIMITER_ID,
+    END_ID,
+    MASK_ID,
+    PAD_ID,
+    WIN_ID,
+)
 
 
 def test_uniform_sampler_can_generate_valid_canvas_and_clamps_input() -> None:
-    config = _small_config(canvas_budget=7, max_steps=2, entropy_bound=100.0)
-    target = torch.tensor([WIN_ID, 100, DELIMITER_ID, 101, DELIMITER_ID, END_ID, PAD_ID])
+    config = _small_config(canvas_budget=8, max_steps=2, entropy_bound=100.0)
+    target = torch.tensor([BOS_ID, WIN_ID, CONTENT_TOKEN_OFFSET, DELIMITER_ID, CONTENT_TOKEN_OFFSET + 1, DELIMITER_ID, END_ID, PAD_ID])
     model = FixedCanvasModel(target, config=config, top_logit=50.0)
     output = sample_canvas(model, _batch(config), config)
     decoded = decode_canvas(output.canvas[0].tolist(), _vocab())
@@ -47,15 +55,17 @@ def test_uniform_acceptance_is_nonmonotonic_and_unaccepted_positions_renoise() -
     model = ChangingEntropyModel(config=config, canvas_len=3)
     output = sample_canvas(model, _batch(config), config)
 
-    assert output.trace[0].accepted_mask[0, 0]
-    assert not output.trace[1].accepted_mask[0, 0]
-    assert output.trace[1].unaccepted_mask[0, 0]
-    assert output.trace[1].renoised_mask[0, 0]
+    assert not output.trace[0].accepted_mask[0, 0]
+    assert output.canvas[0, 0] == BOS_ID
+    assert output.trace[0].accepted_mask[0, 1]
+    assert not output.trace[1].accepted_mask[0, 1]
+    assert output.trace[1].unaccepted_mask[0, 1]
+    assert output.trace[1].renoised_mask[0, 1]
 
 
 def test_seeded_categorical_candidates_and_uniform_renoising_are_reproducible() -> None:
     config = _small_config(canvas_budget=5, max_steps=3, entropy_bound=0.01)
-    target = torch.tensor([WIN_ID, 100, DELIMITER_ID, END_ID, PAD_ID])
+    target = torch.tensor([BOS_ID, WIN_ID, CONTENT_TOKEN_OFFSET, DELIMITER_ID, END_ID])
     first = sample_canvas(FixedCanvasModel(target, config=config, top_logit=1.0), _batch(config), config)
     second = sample_canvas(FixedCanvasModel(target, config=config, top_logit=1.0), _batch(config), config)
     assert torch.equal(first.canvas, second.canvas)
@@ -66,7 +76,7 @@ def test_seeded_categorical_candidates_and_uniform_renoising_are_reproducible() 
 
 def test_self_conditioning_reuses_expected_embeddings_without_extra_calls() -> None:
     config = _small_config(canvas_budget=3, max_steps=3, entropy_bound=0.0)
-    model = FixedCanvasModel(torch.tensor([WIN_ID, 100, END_ID]), config=config, top_logit=1.0)
+    model = FixedCanvasModel(torch.tensor([BOS_ID, WIN_ID, CONTENT_TOKEN_OFFSET]), config=config, top_logit=1.0)
     output = sample_canvas(model, _batch(config), config)
 
     assert model.calls == output.steps
@@ -78,7 +88,7 @@ def test_self_conditioning_reuses_expected_embeddings_without_extra_calls() -> N
 
 def test_optional_final_logits_are_the_only_extra_model_call() -> None:
     config = _small_config(canvas_budget=3, max_steps=2, entropy_bound=100.0)
-    model = FixedCanvasModel(torch.tensor([WIN_ID, 100, END_ID]), config=config)
+    model = FixedCanvasModel(torch.tensor([BOS_ID, WIN_ID, CONTENT_TOKEN_OFFSET]), config=config)
     output = sample_canvas(model, _batch(config), config, return_final_logits=True)
     assert output.final_canvas_logits is not None
     assert output.final_canvas_logits.shape == (1, 3, model.vocab_size)
@@ -87,7 +97,7 @@ def test_optional_final_logits_are_the_only_extra_model_call() -> None:
 
 def test_adaptive_stop_requires_entropy_and_argmax_stability() -> None:
     base = _small_config(canvas_budget=3, max_steps=3, entropy_bound=100.0)
-    target = torch.tensor([WIN_ID, 100, END_ID])
+    target = torch.tensor([BOS_ID, WIN_ID, CONTENT_TOKEN_OFFSET])
 
     both = replace(base, sampler=replace(base.sampler, adaptive_stop=True, entropy_threshold=0.01))
     both_output = sample_canvas(FixedCanvasModel(target, config=both, top_logit=50.0), _batch(both), both)
@@ -133,7 +143,7 @@ def test_done_batch_rows_freeze_while_other_rows_continue() -> None:
 def test_absorbing_sampler_is_monotonic_and_never_renoises() -> None:
     base = _small_config(canvas_budget=4, max_steps=4, entropy_bound=0.0)
     config = replace(base, diffusion=replace(base.diffusion, process="absorbing"))
-    target = torch.tensor([WIN_ID, 100, END_ID, PAD_ID])
+    target = torch.tensor([BOS_ID, WIN_ID, END_ID, PAD_ID])
     output = sample_canvas(FixedCanvasModel(target, config=config, top_logit=2.0), _batch(config), config)
     previous_unmasked = torch.zeros(1, 4, dtype=torch.bool)
     for step in output.trace:
@@ -146,8 +156,8 @@ def test_absorbing_sampler_is_monotonic_and_never_renoises() -> None:
 
 
 def test_infill_revealed_positions_are_clamped_and_excluded() -> None:
-    config = _small_config(canvas_budget=7, max_steps=2, entropy_bound=100.0)
-    target = torch.tensor([WIN_ID, 100, DELIMITER_ID, 101, DELIMITER_ID, END_ID, PAD_ID])
+    config = _small_config(canvas_budget=8, max_steps=2, entropy_bound=100.0)
+    target = torch.tensor([BOS_ID, WIN_ID, CONTENT_TOKEN_OFFSET, DELIMITER_ID, CONTENT_TOKEN_OFFSET + 1, DELIMITER_ID, END_ID, PAD_ID])
     batch = _batch(config)
     output = sample_canvas(
         FixedCanvasModel(target, config=config, top_logit=50.0),
@@ -165,7 +175,7 @@ def test_infill_revealed_positions_are_clamped_and_excluded() -> None:
 
 def test_mask_is_excluded_but_outcome_tokens_are_not_position_restricted() -> None:
     config = _small_config(canvas_budget=3, max_steps=1, entropy_bound=100.0)
-    target = torch.tensor([100, WIN_ID, WIN_ID])
+    target = torch.tensor([BOS_ID, WIN_ID, WIN_ID])
     output = sample_canvas(FixedCanvasModel(target, config=config, top_logit=50.0), _batch(config), config)
     assert not (output.canvas == MASK_ID).any()
     assert output.canvas[0, 1] == WIN_ID
@@ -219,7 +229,7 @@ def test_sample_canvas_frozen_input_kv_cache_flags_and_reproducibility() -> None
 
 def test_sampling_checkpoint_validates_architecture_and_process_before_loading(tmp_path) -> None:
     config = _small_config(canvas_budget=3, max_steps=1)
-    model = FixedCanvasModel(torch.tensor([WIN_ID, END_ID, PAD_ID]), config=config)
+    model = FixedCanvasModel(torch.tensor([BOS_ID, WIN_ID, END_ID]), config=config)
     model.feature_statistics_identity = "test-statistics"
     checkpoint = tmp_path / "checkpoint.pt"
     torch.save(
@@ -320,12 +330,12 @@ def test_inference_load_accepts_a_checkpoint_from_the_matching_ablation_toggle_s
 
 def test_decoder_and_time_recovery_contracts() -> None:
     vocab = _vocab()
-    valid = [WIN_ID, 100, 100, DELIMITER_ID, 101, DELIMITER_ID, END_ID, PAD_ID]
+    valid = [BOS_ID, WIN_ID, CONTENT_TOKEN_OFFSET, CONTENT_TOKEN_OFFSET, DELIMITER_ID, CONTENT_TOKEN_OFFSET + 1, DELIMITER_ID, END_ID, PAD_ID]
     decoded = decode_canvas(valid, vocab)
     assert decoded.validation.valid
     assert decoded.timesteps == [{"marine": 2}, {"scv": 1}]
     assert not validate_canvas([100, DELIMITER_ID, END_ID]).valid
-    assert not validate_canvas([WIN_ID, 100, PAD_ID, END_ID]).valid
+    assert not validate_canvas([BOS_ID, WIN_ID, CONTENT_TOKEN_OFFSET, PAD_ID, END_ID]).valid
     timed = attach_absolute_times(
         [{"marine": 2}, {"scv": 1}], last_input_clock=125.0, sampling_interval_s=5
     )
@@ -347,7 +357,7 @@ class FixedCanvasModel(nn.Module):
         self.top_logit = top_logit
         self.embedding = nn.Module()
         self.embedding.token_embedding = nn.Embedding(vocab_size, config.model.d_model)
-        self.architecture_identity = "uniform-gemma4-dense-v1"
+        self.architecture_identity = "dense-multinomial-SC2-v2"
         self.diffusion_process = config.diffusion.process
         self.self_conditioning_inputs: list[torch.Tensor | None] = []
         self.calls = 0
@@ -387,7 +397,7 @@ class ChangingEntropyModel(FixedCanvasModel):
         )
         input_len = input_token_ids.shape[1]
         logits = output.logits
-        preferred = (self.calls - 1) % canvas_token_ids.shape[1]
+        preferred = self.calls % canvas_token_ids.shape[1]
         logits[:, input_len:, :] = 0.0
         logits[:, input_len + preferred, 10] = 8.0
         return SimpleNamespace(logits=logits)

@@ -25,16 +25,33 @@ model:
   qk_norm: true
   self_conditioning: true
   gradient_checkpointing: false
-  # Architecture ablation toggles. All three are false here, which IS the
-  # baseline: with all three off the model behaves exactly as it does today and
-  # its stored architecture identity is unchanged, so existing checkpoints load.
+  # Architecture toggles. `segment_embeddings` and `per_segment_positions` are
+  # still ABLATION EXPERIMENTS and stay false (see SPEC.md 14b);
+  # `frozen_input_kv` has been PROMOTED TO A DEFAULT and is true below.
   #
   # Run the input region alone through all L blocks first (attending only to
   # itself, caching each layer's K/V), then run the canvas attending to
   # concat(cached_input_K, canvas_K), instead of one joint bidirectional pass.
   # At inference the input KV is computed once and reused for every denoising
   # step rather than recomputed per step.
-  frozen_input_kv: false
+  #
+  # WHY TRUE (owner decision, 2026-08-09, on measured evidence): ablation arm 01
+  # (configs/ablation_01_frozen_input_kv.yaml, 100 epochs against the all-false
+  # baseline) showed no statistically meaningful loss difference while cutting
+  # inference time substantially -- the input region is static across every
+  # denoising step, so recomputing its K/V 64 times per sample was pure waste.
+  # The accepted semantic cost is that the input no longer attends to the canvas,
+  # making attention one-directional across the input/canvas seam (SPEC.md 14a).
+  #
+  # WHAT THIS DOES TO CHECKPOINT IDENTITY: `toggle_fingerprint` is deliberately
+  # NOT rebased. A default-derived model now stamps
+  # `dense-multinomial-SC2-v2+frozen_input_kv`, so pre-promotion all-off
+  # checkpoints fail closed on load instead of silently entering a two-pass model
+  # -- and ablation arms 01/05, which pin this true themselves, keep the exact
+  # identity they were trained under. Set this to false in a profile to opt back
+  # out; configs/ablation_00_baseline.yaml does precisely that to keep the
+  # completed sweep's baseline reproducible.
+  frozen_input_kv: true
   # Add a learned 2-row embedding (0 = input segment, 1 = canvas segment) to the
   # final per-region embedding, so the same token id in the input and in the
   # canvas is genuinely different to the model.
@@ -116,6 +133,12 @@ train:
   adam_eps: 0.00000001
   warmup: 2000
   lr_floor_ratio: 0.1
+  # Post-warmup decay shape: "cosine" (half-cosine: lingers at the peak, steep
+  # middle, flat tail) or "linear" (constant slope: leaves the peak at once and
+  # is shallower than the cosine's steepest section). cosine is the default so
+  # every existing profile's schedule is unchanged; configs/local_overfit_v2.yaml
+  # opts into "linear" with a lower floor. See TrainConfig.lr_decay_shape.
+  lr_decay_shape: cosine
   grad_clip: 1.0
   accum: as-needed
   accumulation_steps: 1
@@ -137,7 +160,19 @@ train:
   checkpoint_interval: 1000
   checkpoint_dir: checkpoints
   keep_step_checkpoints: false
+  # CEILING on the EMA decay. The decay actually used is DERIVED from the run's
+  # own step horizon (TrainingLoop._resolve_ema_decay) as
+  # `1 - 1/(ema_horizon_ratio * total_steps)` and then clamped to at most this
+  # value. 0.9999 is a ~10,000-step averaging window, so a run of 100,000 steps
+  # or more sits exactly at this ceiling and behaves as it always has; shorter
+  # runs get a proportionally shorter window instead of an EMA that never
+  # finishes traversing its own.
   ema_decay: 0.9999
+  # EMA averaging window as a fraction of the run's total optimizer steps. 0.1
+  # means the served EMA weights always average over roughly the final 10% of
+  # training, whatever the epoch budget, and the EMA completes ~10 window
+  # lengths before the last step.
+  ema_horizon_ratio: 0.1
   confidence_loss_weight: 0.0
   self_cond_prob: 0.5
   precision: bf16

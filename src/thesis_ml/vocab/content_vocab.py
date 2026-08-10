@@ -33,6 +33,9 @@ class ContentVocabulary:
             raise ValueError("content vocabulary has duplicate token IDs")
         if ids and min(ids) < CONTENT_TOKEN_OFFSET:
             raise ValueError("content token IDs must start at CONTENT_TOKEN_OFFSET")
+        expected_ids = list(range(CONTENT_TOKEN_OFFSET, CONTENT_TOKEN_OFFSET + len(ids)))
+        if sorted(ids) != expected_ids:
+            raise ValueError("content token IDs must be contiguous with no unmapped IDs")
 
     @property
     def name_to_id(self) -> dict[str, int]:

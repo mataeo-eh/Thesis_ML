@@ -1,0 +1,48 @@
+extends: local_overfit_v2.yaml
+
+# ABLATION ARM 1 of 5 -- frozen_input_kv ONLY.
+#
+# Identical to configs/local_overfit_v2.yaml in every respect except (a) the
+# single model toggle enabled below and (b) the redirected storage paths, so the
+# resulting epoch_metrics.csv differs from the all-false baseline only by this
+# toggle. See the ABLATION CONTROL SURFACE block in local_overfit_v2.yaml for
+# what each toggle does.
+#
+# WHY SEPARATE checkpoint_uri / local_cache_dir: enabling any toggle changes the
+# model's stored architecture_identity (config.toggle_fingerprint), so this run
+# must never see the baseline's checkpoints/local-overfitV2/last.pt -- the
+# pipeline auto-resumes from whatever last.pt it finds in checkpoint_uri, and a
+# fingerprint mismatch would abort the launch. A private directory per arm also
+# means the five arms can run back to back without clobbering each other.
+#
+# RUN LENGTH: 100 epochs = 3400 optimizer steps (34 per epoch), inherited from
+# `train.epochs: 100` in configs/local_overfit_v2.yaml. NOTHING is capped on the
+# command line -- tests/run_ablation_sweep.sh passes no `--max-steps`, so each
+# arm trains through all 100 epochs and completes its schedules:
+#
+#   - The LR horizon is DERIVED from the config, not from a cap. With
+#     `max_steps: 0` inherited, train_pipeline injects
+#     len(train_loader) * train.epochs = 3400 as train.max_steps, and the linear
+#     decay runs from the 3.0e-4 peak down to the 0.03 * 3.0e-4 = 9.0e-6 floor
+#     across exactly those 3400 steps. A `--max-steps 3400` cap on a 150-epoch
+#     config (the previous arrangement, matching a baseline that had itself been
+#     cut short) would instead have stopped the run at 3400 of 5100 scheduled
+#     steps, so the arm would have ended at ~0.29 of peak lr with the last third
+#     of its decay never applied.
+#   - The EMA window is derived the same way (TrainingLoop._resolve_ema_decay):
+#     ema_horizon_ratio 0.1 x 3400 steps = a 340-step averaging window, so the
+#     EMA turns over ~10 times inside the run instead of trailing the fixed
+#     ~10,000-step window the old constant 0.9999 decay implied.
+#
+# Because there is no `--max-steps` override, train_pipeline also treats each arm
+# as a proper finish and writes its raw+EMA finished model via
+# export_finished_model() alongside last.pt.
+storage:
+  checkpoint_uri: checkpoints/ablations/01-frozen-input-kv-only
+  log_uri: tests/output/ablations/01-frozen-input-kv-only
+  local_cache_dir: .pipeline_cache/ablations/01-frozen-input-kv-only
+
+model:
+  frozen_input_kv: true
+  segment_embeddings: false
+  per_segment_positions: false

@@ -189,7 +189,7 @@ def render() -> None:
     axis.text(
         0.65,
         14.3,
-        "Current local_full learnable pipeline · 11,042,880 trainable parameters",
+        "Current local_full learnable pipeline · 10,995,776 trainable parameters",
         ha="center",
         va="center",
         fontsize=12,

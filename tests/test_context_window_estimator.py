@@ -28,11 +28,12 @@ def test_estimate_replay_counts_unique_entities_upgrades_and_sequence_grammar(tm
     assert estimate.p2_content_tokens == 4
     # Both modes interleave [self][enemy] per timestep with exactly one
     # delimiter; the estimator reports the clean/zero-fog upper bound:
-    # p1_content (7) + p2_content (4) + timesteps (3) = 14.
-    assert estimate.pretrain_input_tokens == 14
-    assert estimate.finetune_input_tokens == 14
-    assert estimate.p1_perspective_output_tokens == 8
-    assert estimate.p2_perspective_output_tokens == 11
+    # p1_content (7) + p2_content (4) + timesteps (3) + EOS (1) = 15.
+    assert estimate.pretrain_input_tokens == 15
+    assert estimate.finetune_input_tokens == 15
+    # Output adds BOS + outcome, enemy content, delimiters, and END.
+    assert estimate.p1_perspective_output_tokens == 10
+    assert estimate.p2_perspective_output_tokens == 13
 
 
 def test_report_statistics_include_both_perspectives(tmp_path: Path) -> None:
@@ -49,8 +50,8 @@ def test_report_statistics_include_both_perspectives(tmp_path: Path) -> None:
 
     report = build_report([estimate_replay(parquet_path)])
 
-    # Schema 3 restores the pretraining field to the shared clamped-input grammar.
-    assert report["schema_version"] == 3
+    # Schema 4 accounts for EOS and the BOS/outcome canvas prefix.
+    assert report["schema_version"] == 4
     assert report["dataset"]["perspective_samples"] == 2
     assert report["statistics"]["timesteps"] == {
         "minimum": 1,
@@ -62,28 +63,27 @@ def test_report_statistics_include_both_perspectives(tmp_path: Path) -> None:
         "all_modes": [1],
         "sample_count": 1,
     }
-    # Both input fields use p1 + p2 content + one delimiter = 3.
+    # Both input fields use p1 + p2 content + one delimiter + EOS = 4.
     assert report["statistics"]["pretrain_input_tokens"] == {
-        "minimum": 3,
-        "maximum": 3,
-        "mean": 3,
-        "median": 3.0,
-        "mode": 3,
+        "minimum": 4,
+        "maximum": 4,
+        "mean": 4,
+        "median": 4.0,
+        "mode": 4,
         "mode_frequency": 2,
-        "all_modes": [3],
+        "all_modes": [4],
         "sample_count": 2,
     }
-    # Fine-tuning: p1_content (1) + p2_content (1) + timesteps (1) = 3, one
-    # delimiter per timestep (not two, per the old grammar).
+    # Fine-tuning: p1_content (1) + p2_content (1) + delimiter (1) + EOS (1).
     assert report["statistics"]["finetune_input_tokens"] == {
-        "minimum": 3,
-        "maximum": 3,
-        "mean": 3,
-        "median": 3.0,
-        "mode": 3,
+        "minimum": 4,
+        "maximum": 4,
+        "mean": 4,
+        "median": 4.0,
+        "mode": 4,
         "mode_frequency": 2,
-        "all_modes": [3],
+        "all_modes": [4],
         "sample_count": 2,
     }
-    assert report["statistics"]["output_tokens"]["minimum"] == 3
-    assert report["statistics"]["output_tokens"]["maximum"] == 3
+    assert report["statistics"]["output_tokens"]["minimum"] == 5
+    assert report["statistics"]["output_tokens"]["maximum"] == 5

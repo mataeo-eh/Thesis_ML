@@ -54,7 +54,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -69,7 +69,7 @@ from matplotlib.colors import ListedColormap  # noqa: E402
 
 import torch  # noqa: E402
 
-from thesis_ml.config import ProjectConfig, load_config  # noqa: E402
+from thesis_ml.config import ModelConfig, ProjectConfig, load_config  # noqa: E402
 from thesis_ml.data.dataset import DatasetExample, SC2DiffusionDataset  # noqa: E402
 from thesis_ml.data.feature_stats import load_feature_statistics  # noqa: E402
 from thesis_ml.data.windowing import (  # noqa: E402
@@ -115,6 +115,58 @@ class RenderedExample:
     result: EvaluationExampleResult
     label: str
     output_noise: float = 1.0
+
+
+def _reconcile_model_config(stored: ModelConfig, fallback: ModelConfig) -> ModelConfig:
+    """Rebuild a checkpoint's stored ``ModelConfig`` against the current schema.
+
+    ``TrainingLoop.save_checkpoint`` pickles the whole ``ProjectConfig``, so a
+    checkpoint written BEFORE a field was added to ``ModelConfig`` unpickles as
+    an instance of the *current* class carrying the *old* attribute set. Reading
+    a newly-added field off it raises ``AttributeError`` rather than returning a
+    default -- which is what happens to every pre-ablation checkpoint (including
+    the all-toggles-false overfitV2 baseline) once the three `SPEC.md` §14b
+    toggles landed on the dataclass.
+
+    This copies every field the stored config does have, and fills any it lacks
+    from ``fallback`` (the user-supplied config for the run).
+
+    **This cannot silently load a checkpoint into the wrong architecture.** The
+    filled-in values only decide how the model is BUILT; the model then stamps
+    ``ARCHITECTURE_ID + toggle_fingerprint(...)`` and
+    ``validate_checkpoint_compatibility`` rejects any disagreement with the
+    identity the checkpoint recorded. A pre-toggle checkpoint carries the bare
+    ``ARCHITECTURE_ID``, which matches only when the filled values are all
+    false -- so backfilling from a config with a toggle enabled raises there
+    instead of training on the wrong thing.
+
+    Parameters:
+        stored: the ``ModelConfig`` unpickled from the checkpoint.
+        fallback: the run's own ``ModelConfig``, used only for fields the stored
+            one predates.
+
+    Returns:
+        A ``ModelConfig`` valid under the current schema.
+    """
+
+    values: dict[str, object] = {}
+    backfilled: list[str] = []
+    for field in fields(ModelConfig):
+        if hasattr(stored, field.name):
+            values[field.name] = getattr(stored, field.name)
+        else:
+            values[field.name] = getattr(fallback, field.name)
+            backfilled.append(field.name)
+    if backfilled:
+        # Loud, not silent: the reader has to know which values did not come
+        # from the checkpoint. The identity check downstream is the real guard.
+        print(
+            "checkpoint predates model config field(s) "
+            f"{', '.join(backfilled)}; filled from the run config "
+            "(architecture identity is still validated against the checkpoint)",
+            flush=True,
+        )
+    return ModelConfig(**values)
 
 
 def load_diagnostic_model(
@@ -164,7 +216,12 @@ def load_diagnostic_model(
 
     checkpoint = torch.load(Path(checkpoint_path), map_location=device, weights_only=False)
     stored_config = checkpoint.get("config")
-    model_config = stored_config.model if isinstance(stored_config, ProjectConfig) else config.model
+    if isinstance(stored_config, ProjectConfig):
+        # Reconciled rather than used directly, so a checkpoint written before a
+        # ModelConfig field existed still loads. See _reconcile_model_config.
+        model_config = _reconcile_model_config(stored_config.model, config.model)
+    else:
+        model_config = config.model
     run_config = replace(config, model=model_config)
 
     # Pick the weight set explicitly. The default path requires the EMA weights

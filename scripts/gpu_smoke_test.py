@@ -1,4 +1,4 @@
-"""Full-size GPU smoke test for the SC2 masked-diffusion training pipeline.
+"""Full-size GPU smoke test for the SC2 discrete-diffusion training pipeline.
 
 Purpose: BEFORE committing to a long (and expensive) cloud training run, launch
 this on the target GPU instance to confirm the real-size model actually does a
@@ -29,10 +29,19 @@ import torch
 
 from thesis_ml.config import ProjectConfig, load_config
 from thesis_ml.data.collate import DiffusionBatch
-from thesis_ml.model.embedding import STAT_KEYS, InputFeatures
+from thesis_ml.data.dataset import CLASS_CLAMPED, CLASS_CONTENT, CLASS_WINLOSS
+from thesis_ml.data.features import CATEGORICAL_FEATURE_WIDTH, CONTINUOUS_FEATURE_NAMES
+from thesis_ml.model.embedding import InputFeatures
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.train.loop import TrainingLoop
-from thesis_ml.vocab.special_tokens import CONTENT_TOKEN_OFFSET
+from thesis_ml.vocab.content_vocab import load_content_vocabulary
+from thesis_ml.vocab.special_tokens import (
+    BOS_ID,
+    CONTENT_TOKEN_OFFSET,
+    EOS_ID,
+    LOSS_ID,
+    WIN_ID,
+)
 
 
 def build_synthetic_batch(
@@ -60,22 +69,47 @@ def build_synthetic_batch(
     """
 
     canvas_len = config.data.canvas_budget_tokens
+    if input_len < 1:
+        raise ValueError("input_len must fit the terminal [EOS] token")
+    if canvas_len < 2:
+        raise ValueError("canvas length must fit [BOS] and [WIN]/[LOSS]")
+    if vocab_size <= CONTENT_TOKEN_OFFSET:
+        raise ValueError("vocab_size must include at least one content token")
     generator = torch.Generator().manual_seed(0)
 
     input_token_ids = torch.randint(
         CONTENT_TOKEN_OFFSET, vocab_size, (batch_size, input_len), generator=generator
     )
+    input_token_ids[:, -1] = EOS_ID
     target_canvas = torch.randint(
         CONTENT_TOKEN_OFFSET, vocab_size, (batch_size, canvas_len), generator=generator
     )
-    # Six canvas token classes (see dataset.CLASS_*); random labels are fine for
-    # a memory/throughput probe.
-    class_labels = torch.randint(0, 6, (batch_size, canvas_len), generator=generator)
+    target_canvas[:, 0] = BOS_ID
+    target_canvas[:, 1] = torch.where(
+        torch.arange(batch_size).remainder(2).eq(0),
+        torch.full((batch_size,), WIN_ID, dtype=torch.long),
+        torch.full((batch_size,), LOSS_ID, dtype=torch.long),
+    )
+    class_labels = torch.full(
+        (batch_size, canvas_len), CLASS_CONTENT, dtype=torch.long
+    )
+    class_labels[:, 0] = CLASS_CLAMPED
+    class_labels[:, 1] = CLASS_WINLOSS
+    canvas_loss_mask = torch.ones(batch_size, canvas_len, dtype=torch.bool)
+    canvas_loss_mask[:, 0] = False
 
     features = InputFeatures(
-        map_values=torch.zeros(batch_size, input_len, 2),
-        stat_values=torch.zeros(batch_size, input_len, len(STAT_KEYS)),
-        team_ids=torch.ones(batch_size, input_len, dtype=torch.long),
+        continuous_values=torch.zeros(
+            batch_size, input_len, len(CONTINUOUS_FEATURE_NAMES)
+        ),
+        continuous_validity=torch.zeros(
+            batch_size, input_len, len(CONTINUOUS_FEATURE_NAMES), dtype=torch.bool
+        ),
+        categorical_values=torch.zeros(
+            batch_size, input_len, CATEGORICAL_FEATURE_WIDTH
+        ),
+        allegiance_values=torch.zeros(batch_size, input_len, 1),
+        feature_mask=torch.zeros(batch_size, input_len, dtype=torch.bool),
     )
 
     return DiffusionBatch(
@@ -85,9 +119,15 @@ def build_synthetic_batch(
         target_canvas=target_canvas,
         canvas_attention_mask=torch.ones(batch_size, canvas_len, dtype=torch.bool),
         class_labels=class_labels,
-        canvas_loss_mask=torch.ones(batch_size, canvas_len, dtype=torch.bool),
+        canvas_loss_mask=canvas_loss_mask,
         terminated=torch.zeros(batch_size, dtype=torch.bool),
         truncated=torch.ones(batch_size, dtype=torch.bool),
+        perspective_ids=torch.ones(batch_size, dtype=torch.long),
+        input_timestep_counts=torch.zeros(batch_size, dtype=torch.long),
+        enemy_future_timestep_counts=torch.zeros(batch_size, dtype=torch.long),
+        canvas_prediction_distances=torch.full(
+            (batch_size, canvas_len), -1, dtype=torch.long
+        ),
         input_records=[[] for _ in range(batch_size)],
         canvas_metadata=[[] for _ in range(batch_size)],
         input_features=features,
@@ -98,6 +138,11 @@ def run_smoke(args: argparse.Namespace) -> None:
     """Build the real-size model, run a few train steps, report VRAM + timing."""
 
     config = load_config(args.config)
+    vocab_size = args.vocab_size
+    if vocab_size is None:
+        vocab_size = load_content_vocabulary(
+            config.pipeline.token_dictionary_uri
+        ).vocab_size
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     if device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA requested but not available on this machine")
@@ -118,14 +163,14 @@ def run_smoke(args: argparse.Namespace) -> None:
             ),
         )
 
-        model = SC2StrategyDiffusionModel(config, vocab_size=args.vocab_size)
+        model = SC2StrategyDiffusionModel(config, vocab_size=vocab_size)
         param_count = sum(parameter.numel() for parameter in model.parameters())
 
         batch = build_synthetic_batch(
             config,
             batch_size=args.batch_size,
             input_len=args.input_len,
-            vocab_size=args.vocab_size,
+            vocab_size=vocab_size,
             device=device,
         )
 
@@ -186,8 +231,8 @@ def main() -> None:
     parser.add_argument(
         "--vocab-size",
         type=int,
-        default=400,
-        help="content vocabulary size (use your real vocab size for accuracy)",
+        default=None,
+        help="override vocabulary size (default: derive it from the configured dictionary)",
     )
     parser.add_argument("--device", type=str, default=None, help="'cuda' or 'cpu' (default: auto)")
     run_smoke(parser.parse_args())

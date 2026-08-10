@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from thesis_ml.config import ProjectConfig, load_config
 from thesis_ml.data.collate import collate_diffusion_examples
 from thesis_ml.data.dataset import (
+    CLASS_CLAMPED,
     CLASS_CONTENT,
     CLASS_DELIMITER,
     CLASS_END,
@@ -27,7 +28,15 @@ from thesis_ml.data.dataset import (
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.serialize import TokenRecord
 from thesis_ml.train.loop import TrainStepLog, TrainingLoop
-from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID, WIN_ID
+from thesis_ml.vocab.special_tokens import (
+    BOS_ID,
+    CONTENT_TOKEN_OFFSET,
+    DELIMITER_ID,
+    END_ID,
+    EOS_ID,
+    PAD_ID,
+    WIN_ID,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "default.yaml"
@@ -69,15 +78,28 @@ def make_synthetic_examples(config: ProjectConfig, *, count: int) -> list[Datase
     """
 
     examples = []
-    # Position 0 is the win/loss outcome token, mirroring the real canvas built
-    # by _build_artifact_target (leading outcome token). Length stays 12 so the
-    # smoke canvas budget is unchanged.
+    # Position 0 is the clamped BOS anchor and position 1 is the outcome token,
+    # mirroring the real canvas. Length stays 12 so the smoke budget is unchanged.
     base_canvas = torch.tensor(
-        [WIN_ID, 100, 101, DELIMITER_ID, 102, 103, DELIMITER_ID, 104, 105, DELIMITER_ID, END_ID, PAD_ID],
+        [
+            BOS_ID,
+            WIN_ID,
+            CONTENT_TOKEN_OFFSET,
+            CONTENT_TOKEN_OFFSET + 1,
+            DELIMITER_ID,
+            CONTENT_TOKEN_OFFSET + 2,
+            CONTENT_TOKEN_OFFSET + 3,
+            DELIMITER_ID,
+            CONTENT_TOKEN_OFFSET + 4,
+            DELIMITER_ID,
+            END_ID,
+            PAD_ID,
+        ],
         dtype=torch.long,
     )
     class_labels = torch.tensor(
         [
+            CLASS_CLAMPED,
             CLASS_WINLOSS,
             CLASS_ENEMY_OBSERVED,
             CLASS_ENEMY_FOGGED,
@@ -85,7 +107,6 @@ def make_synthetic_examples(config: ProjectConfig, *, count: int) -> list[Datase
             CLASS_ENEMY_FUTURE,
             CLASS_ENEMY_FUTURE,
             CLASS_DELIMITER,
-            CLASS_ENEMY_FUTURE,
             CLASS_ENEMY_FUTURE,
             CLASS_DELIMITER,
             CLASS_END,
@@ -180,7 +201,7 @@ def _synthetic_input_pair(
         )
     ):
         record = TokenRecord(
-            token_id=100 + index,
+            token_id=CONTENT_TOKEN_OFFSET + index,
             token_name=name,
             token_kind="entity",
             owner=owner,
@@ -206,6 +227,17 @@ def _synthetic_input_pair(
     )
     clean.append(delimiter)
     fogged.append(delimiter)
+    eos = TokenRecord(
+        token_id=EOS_ID,
+        token_name="[EOS]",
+        token_kind="input-end",
+        owner=None,
+        allegiance=None,
+        game_loop=None,
+        timestamp_seconds=None,
+    )
+    clean.append(eos)
+    fogged.append(eos)
     return fogged, clean
 
 

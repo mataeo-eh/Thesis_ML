@@ -7,7 +7,13 @@ from dataclasses import dataclass
 import torch
 
 from thesis_ml.config import DiffusionScheduleConfig
-from thesis_ml.vocab.special_tokens import MASK_ID
+from thesis_ml.vocab.special_tokens import (
+    BOS_ID,
+    CONTENT_TOKEN_OFFSET,
+    DELIMITER_ID,
+    MASK_ID,
+    PAD_ID,
+)
 
 MIN_T = 1e-4
 SUPPORTED_PROCESSES = frozenset({"uniform", "absorbing"})
@@ -33,6 +39,7 @@ def corrupt_batch(
     generator: torch.Generator | None = None,
     t: torch.Tensor | float | None = None,
     mask_token_id: int = MASK_ID,
+    canvas_noise_mask: torch.Tensor | None = None,
 ) -> CorruptionOutput:
     """Apply the configured linear corruption process to the canvas only.
 
@@ -50,10 +57,18 @@ def corrupt_batch(
         device=target_canvas.device,
         generator=generator,
     )
-    corrupted_positions = branch_draw < probabilities
+    eligible = torch.ones_like(target_canvas, dtype=torch.bool)
+    if canvas_noise_mask is not None:
+        if canvas_noise_mask.shape != target_canvas.shape:
+            raise ValueError("canvas_noise_mask must match target_canvas shape")
+        eligible &= canvas_noise_mask.to(device=target_canvas.device, dtype=torch.bool)
+    # Defense in depth: [BOS] is fixed even if a caller supplies an overly broad
+    # mask. Production also excludes it through DiffusionBatch.canvas_loss_mask.
+    eligible &= target_canvas.ne(BOS_ID)
+    corrupted_positions = (branch_draw < probabilities) & eligible
 
     if process == "uniform":
-        replacement = sample_uniform_non_mask(
+        replacement = sample_uniform_noise(
             target_canvas.shape,
             vocab_size=vocab_size,
             device=target_canvas.device,
@@ -79,23 +94,37 @@ def corrupt_batch(
     )
 
 
-def sample_uniform_non_mask(
+def sample_uniform_noise(
     shape: torch.Size | tuple[int, ...],
     *,
     vocab_size: int,
     device: torch.device,
     generator: torch.Generator | None,
 ) -> torch.Tensor:
-    """Draw independent vocabulary states from ``[1, vocab_size)``."""
+    """Draw from the uniform diffusion noise support.
 
-    if vocab_size <= 1:
-        raise ValueError("vocab_size must include at least one non-[MASK] state")
-    return torch.randint(
-        1,
-        vocab_size,
+    Random replacement states are exactly ``[PAD]``, ``[DELIMITER]``, and all
+    content IDs. ``[MASK]``, ``[END]``, ``[WIN]``, ``[LOSS]``, ``[BOS]``, and
+    ``[EOS]`` remain meaningful targets/boundaries and are never injected as
+    random noise.
+    """
+
+    if vocab_size < CONTENT_TOKEN_OFFSET:
+        raise ValueError("vocab_size must include every reserved special token")
+    content_count = vocab_size - CONTENT_TOKEN_OFFSET
+    support_size = 2 + content_count
+    draws = torch.randint(
+        0,
+        support_size,
         shape,
         device=device,
         generator=generator,
+    )
+    content_ids = CONTENT_TOKEN_OFFSET + (draws - 2)
+    return torch.where(
+        draws.eq(0),
+        torch.full_like(draws, PAD_ID),
+        torch.where(draws.eq(1), torch.full_like(draws, DELIMITER_ID), content_ids),
     )
 
 
@@ -119,8 +148,8 @@ def _validate_arguments(
         raise ValueError(f"unsupported t distribution: {schedule.t_distribution}")
     if mask_token_id != 0:
         raise ValueError("uniform diffusion requires [MASK] to be vocabulary id zero")
-    if vocab_size <= 1:
-        raise ValueError("vocab_size must include at least one non-[MASK] state")
+    if vocab_size < CONTENT_TOKEN_OFFSET:
+        raise ValueError("vocab_size must include every reserved special token")
 
 
 def _resolve_t(

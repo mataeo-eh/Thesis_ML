@@ -62,13 +62,16 @@ class ModelConfig:
     qk_norm: bool
     self_conditioning: bool
     gradient_checkpointing: bool
-    # --- Architecture ablation toggles ---------------------------------------
+    # --- Architecture toggles -------------------------------------------------
     # Three independent switches over how the input region and the canvas region
-    # relate to each other inside the backbone. ALL THREE DEFAULT TO false, which
-    # is the current baseline: with all three off the model must behave exactly
-    # as it does today. That is also why `toggle_fingerprint` below returns the
-    # empty string in that case -- the stored architecture identity has to stay
-    # byte-for-byte unchanged so existing checkpoints keep loading.
+    # relate to each other inside the backbone. `segment_embeddings` and
+    # `per_segment_positions` are still ablation experiments and default to
+    # false; `frozen_input_kv` was PROMOTED to default true on 2026-08-09
+    # (SPEC.md 14b). `toggle_fingerprint` was deliberately not rebased by that
+    # promotion -- it still returns the empty string only for the ALL-off case,
+    # so the unsuffixed architecture ID keeps meaning exactly what it always
+    # meant and pre-promotion checkpoints fail closed against the new default.
+    # The vocabulary-v2 baseline itself intentionally retires v1 checkpoints.
     #
     # Split the single joint bidirectional forward into two passes: the input
     # region alone through all L blocks (attending only to itself, caching each
@@ -198,6 +201,24 @@ class TrainConfig:
     adam_eps: float
     warmup: int
     lr_floor_ratio: float
+    # Shape of the post-warmup learning-rate decay, from the peak `lr` down to
+    # `lr * lr_floor_ratio` over the run's derived step horizon (see
+    # `TrainingLoop._lr_multiplier`). Both shapes start at the peak and land on
+    # the floor at exactly the last step; they differ in HOW they get there.
+    #
+    #   "cosine" -- half-cosine. Lingers near the peak for the first ~15% of the
+    #               decay, drops fastest through the middle (its steepest slope
+    #               is pi/2 ~= 1.57x the straight-line slope), then flattens into
+    #               a long tail at the floor.
+    #   "linear" -- one constant slope. Leaves the peak immediately, so less of
+    #               the run is spent at the highest rate, and that same constant
+    #               slope is SHALLOWER through the middle of training than the
+    #               cosine's steepest section. Pair it with a lower
+    #               `lr_floor_ratio` to also end the run at a smaller rate; the
+    #               combination is the intended remedy for a loss curve that
+    #               hovers around a minimum instead of settling into it, because
+    #               the end-of-run gradient-noise floor scales with the final lr.
+    lr_decay_shape: str
     grad_clip: float
     accum: str
     accumulation_steps: int
@@ -252,7 +273,24 @@ class TrainConfig:
     # `last.pt` so disk/S3 usage stays flat over a multi-day run. When True,
     # every interval also keeps a timestamped `step-N.pt` snapshot.
     keep_step_checkpoints: bool
+    # CEILING on the EMA decay, not the decay actually used. See
+    # `ema_horizon_ratio` directly below and `TrainingLoop._resolve_ema_decay`:
+    # the effective decay is derived from the run's own step count and then
+    # clamped to at most this value, so a very long run still tops out at a
+    # sane averaging window instead of growing one without bound.
     ema_decay: float
+    # The EMA averaging window, expressed as a FRACTION of the run's total
+    # optimizer steps. This is what makes the EMA schedule fit the run.
+    #
+    # An EMA with decay d has an effective window of 1/(1-d) steps: the fixed
+    # 0.9999 that used to be applied unconditionally averages over ~10,000
+    # steps, so a 3,400-step run finished with an EMA that had only traversed a
+    # third of its own window and was still dragging early-training weights into
+    # the served weights. Deriving the decay as `1 - 1/(ratio * total_steps)`
+    # instead makes the window scale with the run: at 0.1 the EMA always averages
+    # over the final ~10% of training, whatever the epoch budget is, and always
+    # completes several window lengths before the last step.
+    ema_horizon_ratio: float
     confidence_loss_weight: float
     self_cond_prob: float
     precision: str
@@ -354,6 +392,7 @@ def load_config(path: str | Path) -> ProjectConfig:
 
     raw = _load_config_mapping(Path(path).resolve(), stack=())
     config = _build_dataclass(ProjectConfig, raw, "config")
+    _validate_train(config)
     _validate_diffusion(config)
     _validate_sampler(config)
     _validate_debut_mode_sections(config)
@@ -367,8 +406,9 @@ def toggle_fingerprint(model_config: ModelConfig) -> str:
     `ARCHITECTURE_ID + toggle_fingerprint(model_config)` so a checkpoint trained
     with an ablation enabled can never be silently loaded into a model built
     without it. The all-off case is load-bearing: it must return the EMPTY
-    string so the identity stays the character-for-character unchanged
-    `ARCHITECTURE_ID` and every existing checkpoint still loads.
+    string so the identity stays the unsuffixed current `ARCHITECTURE_ID`.
+    Compatibility across baseline revisions is owned by `ARCHITECTURE_ID`
+    itself; vocabulary-v1 checkpoints are intentionally retired.
 
     Parameters:
         model_config: the built `ModelConfig` whose three ablation toggles
@@ -398,8 +438,8 @@ def toggle_fingerprint(model_config: ModelConfig) -> str:
 
     if not enabled:
         # Explicit early return for the all-off baseline. The join below would
-        # yield "" anyway, but this is the case every existing checkpoint
-        # depends on, so it is stated rather than left implied.
+        # yield "" anyway, but matching vocabulary-v2 baseline checkpoints
+        # depend on this exact unsuffixed identity.
         return ""
 
     # Sorted so the fingerprint depends only on WHICH toggles are on, never on
@@ -531,6 +571,49 @@ def _validate_value(expected_type: type[Any], value: Any, path: str) -> Any:
         return value
 
     raise TypeError(f"unsupported config field type at {path}: {expected_type!r}")
+
+
+#: The learning-rate decay shapes `TrainingLoop._lr_multiplier` knows how to
+#: build. Kept here so a typo in YAML fails at config load with the list of
+#: legal values, rather than silently falling through to a default shape
+#: hundreds of optimizer steps into a run.
+LR_DECAY_SHAPES = ("cosine", "linear")
+
+
+def _validate_train(config: ProjectConfig) -> None:
+    """Range-check the learning-rate decay shape and the EMA horizon knobs.
+
+    Both settings are read once per run by `TrainingLoop` -- the decay shape by
+    `_lr_multiplier` and the EMA horizon by `_resolve_ema_decay` -- and neither
+    has a meaningful fallback, so an out-of-range value must stop the launch
+    instead of quietly changing what the run trains at.
+
+    Parameters:
+        config: the fully built `ProjectConfig` to check.
+
+    Returns:
+        None. Raises `ConfigError` on the first invalid value.
+
+    Calls: nothing. It only reads fields off `config.train`.
+    """
+
+    train = config.train
+    if train.lr_decay_shape not in LR_DECAY_SHAPES:
+        raise ConfigError(
+            "train.lr_decay_shape must be one of "
+            f"{list(LR_DECAY_SHAPES)}, got {train.lr_decay_shape!r}"
+        )
+    if not (0.0 <= train.lr_floor_ratio <= 1.0):
+        raise ConfigError(
+            f"train.lr_floor_ratio must be in [0, 1], got {train.lr_floor_ratio}"
+        )
+    if not (0.0 < train.ema_horizon_ratio <= 1.0):
+        raise ConfigError(
+            "train.ema_horizon_ratio must be in (0, 1] -- it is the EMA averaging "
+            f"window as a fraction of the run's steps, got {train.ema_horizon_ratio}"
+        )
+    if not (0.0 <= train.ema_decay <= 1.0):
+        raise ConfigError(f"train.ema_decay must be in [0, 1], got {train.ema_decay}")
 
 
 def _validate_diffusion(config: ProjectConfig) -> None:

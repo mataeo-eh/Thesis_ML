@@ -39,7 +39,7 @@ from thesis_ml.data.windowing import (
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.serialize import serialize_snapshot
 from thesis_ml.vocab.content_vocab import load_content_vocabulary
-from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID
+from thesis_ml.vocab.special_tokens import BOS_ID, DELIMITER_ID, END_ID, EOS_ID, PAD_ID, WIN_ID
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -171,6 +171,7 @@ def test_canvas_grammar_exact_budget_for_terminated_and_truncated_examples() -> 
         "p2",
         input_timestep_count=2,
         fogged_counts={},
+        outcome_id=WIN_ID,
     )
     assert terminated.terminated is True
     assert terminated.truncated is False
@@ -184,12 +185,13 @@ def test_canvas_grammar_exact_budget_for_terminated_and_truncated_examples() -> 
         "p2",
         input_timestep_count=8,
         fogged_counts={},
+        outcome_id=WIN_ID,
     )
     assert truncated.truncated is True
     assert truncated.terminated is False
     assert len(truncated.token_ids) == 17
     assert END_ID not in truncated.token_ids
-    assert PAD_ID in truncated.token_ids
+    assert truncated.token_ids[-1] == DELIMITER_ID
     _assert_canvas_grammar(truncated.token_ids)
 
 
@@ -230,6 +232,7 @@ def test_class_label_coverage_and_partially_fogged_group_counts() -> None:
         "p2",
         input_timestep_count=len(frame),
         fogged_counts=fogged_counts,
+        outcome_id=WIN_ID,
     )
 
     assert len(target.class_labels) == len(target.token_ids)
@@ -260,12 +263,16 @@ def test_truncated_target_ends_at_boundary_and_pads_without_end() -> None:
         "p2",
         input_timestep_count=8,
         fogged_counts={},
+        outcome_id=WIN_ID,
     )
     assert target.truncated is True
     assert END_ID not in target.token_ids
-    first_pad = target.token_ids.index(PAD_ID)
-    assert target.token_ids[first_pad - 1] == DELIMITER_ID
-    assert all(token == PAD_ID for token in target.token_ids[first_pad:])
+    if PAD_ID in target.token_ids:
+        first_pad = target.token_ids.index(PAD_ID)
+        assert target.token_ids[first_pad - 1] == DELIMITER_ID
+        assert all(token == PAD_ID for token in target.token_ids[first_pad:])
+    else:
+        assert target.token_ids[-1] == DELIMITER_ID
 
 
 def test_dataset_and_collate_determinism_under_seed(tmp_path: Path) -> None:
@@ -301,7 +308,9 @@ def test_dataset_and_collate_determinism_under_seed(tmp_path: Path) -> None:
     assert batch.input_token_ids.shape[0] == 2
     assert batch.target_canvas.shape[1] <= config.data.canvas_budget_tokens
     assert torch.equal(batch.input_lengths, torch.tensor([len(first.input_token_ids), len(second.input_token_ids)]))
-    assert torch.equal(batch.canvas_loss_mask, batch.canvas_attention_mask)
+    assert batch.canvas_attention_mask[:, 0].all()
+    assert not batch.canvas_loss_mask[:, 0].any()
+    assert torch.equal(batch.canvas_loss_mask[:, 1:], batch.canvas_attention_mask[:, 1:])
     future_mask = batch.class_labels == CLASS_ENEMY_FUTURE
     assert (batch.canvas_prediction_distances[future_mask] > 0).all()
     assert (batch.canvas_prediction_distances[~future_mask] == -1).all()
@@ -348,6 +357,8 @@ def test_pretraining_example_has_clamped_fogged_input_for_both_perspectives(
     assert {example.perspective_player for example in examples} == {"p1", "p2"}
     for example in examples:
         assert example.input_token_ids.numel() > 0
+        assert int(example.input_token_ids[-1]) == EOS_ID
+        assert int(example.target_canvas[0]) == BOS_ID
         assert example.clean_input_token_ids is not None
         assert example.clean_input_token_ids.numel() > example.input_token_ids.numel()
         assert all(record.allegiance != "enemy" for record in example.input_records)
@@ -407,12 +418,12 @@ def test_finetune_input_interleaves_self_then_enemy_with_one_delimiter_per_times
     delimiter_count = sum(record.token_kind == "delimiter" for record in records)
     assert delimiter_count == window.timestep_count
 
-    # Split the flat record list into per-timestep blocks at each delimiter;
-    # the input must END with a delimiter (each block is closed by one).
-    assert records[-1].token_kind == "delimiter"
+    # EOS follows the final timestep delimiter and is not part of a timestep.
+    assert records[-1].token_kind == "input-end"
+    assert records[-1].token_id == EOS_ID
     blocks: list[list] = []
     current: list = []
-    for record in records:
+    for record in records[:-1]:
         if record.token_kind == "delimiter":
             blocks.append(current)
             current = []

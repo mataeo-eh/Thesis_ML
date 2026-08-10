@@ -8,8 +8,8 @@ storage:
 
 # PRE-TRAINING profile (smallTrainingTestV2.bat -> thesis_ml.pipeline.train_pipeline).
 # debut_mode is False, so the dataset builds the full enemy reconstruction + future
-# roll-out target (_build_artifact_target), now led by the [WIN]/[LOSS] outcome
-# token at canvas position 0. Fine-tuning is the SEPARATE pathway:
+# roll-out target (_build_artifact_target), led by clamped [BOS] at canvas
+# position 0 and the mutable [WIN]/[LOSS] outcome at position 1. Fine-tuning is:
 # configs/local_overfit_v2_finetune.yaml run via thesis_ml.pipeline.finetune_pipeline
 # (smallFinetuneTest.bat).
 data:

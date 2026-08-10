@@ -17,6 +17,7 @@ import pytest
 from thesis_ml.config import load_config
 from thesis_ml.data.features import CONTINUOUS_FEATURE_NAMES
 from thesis_ml.data.dataset import (
+    CLASS_CLAMPED,
     CLASS_DELIMITER,
     CLASS_END,
     CLASS_ENEMY_FOGGED,
@@ -30,7 +31,7 @@ from thesis_ml.data.dataset import (
     resolve_replay_outcome,
 )
 from thesis_ml.data.windowing import ENTITY_CODE, P1_CODE, P2_CODE, UPGRADE_CODE, WindowManifestEntry
-from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, LOSS_ID, PAD_ID, WIN_ID
+from thesis_ml.vocab.special_tokens import BOS_ID, DELIMITER_ID, END_ID, LOSS_ID, PAD_ID, WIN_ID
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,7 +44,7 @@ QUICKSTART = ROOT / "data" / "processed" / "quickstart"
 # Synthetic replay fixtures
 # ---------------------------------------------------------------------------
 
-# Fake token ids (content tokens are >= 100 in the real vocab) and their names.
+# Arbitrary fake content IDs; this stand-in does not construct a real vocabulary.
 _TOKEN_NAMES = {100: "marine", 101: "marauder", 102: "medivac", 103: "scv"}
 
 
@@ -133,11 +134,11 @@ def _build(fogged_counts: dict[tuple[int, str], int], *, outcome_id: int = WIN_I
 # ---------------------------------------------------------------------------
 
 
-def test_outcome_token_at_position_zero_with_winloss_class() -> None:
+def test_bos_then_outcome_token_with_winloss_class() -> None:
     build = _build({}, outcome_id=LOSS_ID)
-    assert build.token_ids[0] == LOSS_ID
-    assert build.class_labels[0] == CLASS_WINLOSS
-    # The outcome token must appear exactly once, only at position 0.
+    assert build.token_ids[:2] == [BOS_ID, LOSS_ID]
+    assert build.class_labels[:2] == [CLASS_CLAMPED, CLASS_WINLOSS]
+    # The outcome token must appear exactly once, only at position 1.
     assert build.token_ids.count(LOSS_ID) == 1
     assert build.class_labels.count(CLASS_WINLOSS) == 1
     # Canvas is padded to exactly the requested budget.
@@ -226,13 +227,13 @@ def test_terminates_with_end_then_pads() -> None:
 
 def test_whole_timestep_truncation_when_budget_overflows() -> None:
     # A tiny budget cannot hold the whole game; the builder truncates on whole
-    # timesteps, emits no [END], and still pads to budget.
+    # timesteps, emits no [END], and fills or pads to budget.
     build = _build({}, budget=5)
     assert len(build.token_ids) == 5
     assert build.truncated is True
     assert build.terminated is False
     assert END_ID not in build.token_ids
-    assert PAD_ID in build.token_ids
+    assert build.token_ids[-1] in (DELIMITER_ID, PAD_ID)
 
 
 class _FakeReplayWithUpgrade:
@@ -330,10 +331,9 @@ def test_unified_running_max_rule_debuts_persistent_upgrade_exactly_once_at_firs
     assert marine_debuts == [0]
 
 
-def test_pretraining_artifact_path_leads_with_winloss_token() -> None:
-    # The debut_mode-off (pre-training) path now ALSO begins the canvas with the
-    # resolved outcome token at position 0, labeled CLASS_WINLOSS and denoised
-    # last, exactly once -- the outcome token is shared by both modes. The BODY
+def test_pretraining_artifact_path_leads_with_bos_then_winloss_token() -> None:
+    # The debut_mode-off path begins with clamped BOS then the resolved outcome
+    # token at position 1, labeled CLASS_WINLOSS, exactly once. The BODY
     # after it is the full reconstruction/roll-out (delimiters + [END]), NOT the
     # sparse debut events.
     for outcome_id in (WIN_ID, LOSS_ID):
@@ -346,9 +346,8 @@ def test_pretraining_artifact_path_leads_with_winloss_token() -> None:
             budget=64,
             outcome_id=outcome_id,
         )
-        # Position 0 echoes the resolved outcome, labeled win-loss, and appears once.
-        assert build.token_ids[0] == outcome_id
-        assert build.class_labels[0] == CLASS_WINLOSS
+        assert build.token_ids[:2] == [BOS_ID, outcome_id]
+        assert build.class_labels[:2] == [CLASS_CLAMPED, CLASS_WINLOSS]
         assert build.class_labels.count(CLASS_WINLOSS) == 1
         # Full roll-out body: game end reached within budget, delimiters present.
         assert build.terminated is True

@@ -1,0 +1,17 @@
+extends: local_overfit_v2.yaml
+
+# ABLATION ARM 3 of 5 -- per_segment_positions ONLY.
+#
+# See configs/ablation_01_frozen_input_kv.yaml for the full rationale behind the
+# separate storage paths and behind the 100-epoch / 3400-step run length that
+# every arm inherits from configs/local_overfit_v2.yaml and runs to completion
+# (no `--max-steps` cap); both apply identically to every arm in this sweep.
+storage:
+  checkpoint_uri: checkpoints/ablations/03-per-segment-positions-only
+  log_uri: tests/output/ablations/03-per-segment-positions-only
+  local_cache_dir: .pipeline_cache/ablations/03-per-segment-positions-only
+
+model:
+  frozen_input_kv: false
+  segment_embeddings: false
+  per_segment_positions: true

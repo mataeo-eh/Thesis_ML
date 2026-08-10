@@ -1,0 +1,94 @@
+extends: local_overfit_v2.yaml
+
+# MEMORIZATION PROBE, ARM 1 of 3 -- REGULARIZATION OFF.
+#
+# THE QUESTION. configs/local_overfit_v2.yaml asks "can the pipeline drive loss
+# down at all?" This family asks the sharper follow-up: "when we stop actively
+# preventing memorization, can the model actually memorize 10 replays?" An
+# overfit probe that still carries a production regularization budget is testing
+# something nobody asked about -- the loss floor it reaches is partly the floor
+# the regularizers impose, not the floor the model's capacity imposes.
+#
+# WHAT IS TURNED OFF HERE, and why each one fights memorization:
+#
+#   train.weight_decay 0.1 -> 0.0
+#       AdamW's decoupled weight decay pulls every parameter toward zero on
+#       every step, independent of the gradient (src/thesis_ml/train/loop.py
+#       constructs the optimizer with it). That is a direct penalty on the large,
+#       specific weights memorization needs: the model is being asked to fit the
+#       data AND to stay small, and the second objective never stops pushing
+#       back. For a run whose entire purpose is memorization, it is a headwind
+#       with no upside.
+#
+#   fog.rate_distribution.max 0.8 -> 0.0
+#       Fog is resampled PER SERVING (dataset._sample_fog_rate draws a fresh rate
+#       per example per epoch, then hides each enemy content token with that
+#       probability). With max 0.8 the model never sees the same input sequence
+#       twice across 100 epochs -- the input is a different partial observation
+#       every time. That is exactly the augmentation you want when generalizing
+#       and exactly the thing that makes memorization impossible: there is no
+#       fixed input to memorize. min AND max are both 0.0, so `rng.uniform(0, 0)`
+#       returns 0.0 and every enemy token stays observed, identically, every
+#       epoch.
+#
+# WHAT IS DELIBERATELY LEFT ALONE, so this arm differs from its comparison run by
+# exactly the two knobs above:
+#
+#   train.grad_clip 1.0        -- a stability guard on the update norm, not a
+#                                 capacity penalty. Removing it risks a loss
+#                                 spike destroying the run rather than revealing
+#                                 anything about memorization.
+#   train.self_cond_prob 0.5   -- self-conditioning must be trained both with and
+#                                 without its own previous prediction, because
+#                                 the sampler feeds it back at inference. Zeroing
+#                                 it would change what the model IS, not just how
+#                                 hard it is allowed to memorize.
+#   train.ema_*                -- EMA affects the SERVED/eval weights only. Train
+#                                 loss, which is the memorization signal here, is
+#                                 computed on the raw weights either way.
+#   dropout                    -- already 0.0 throughout the backbone
+#                                 (src/thesis_ml/model/backbone.py); there is no
+#                                 config knob to turn off.
+#   diffusion t resampling     -- a fresh t per example per epoch is the training
+#                                 objective itself, not a regularizer. Arm 2
+#                                 addresses its coverage problem separately.
+#
+# COMPARISON POINT: read this against ablation arm 01
+# (tests/output/ablations/01-frozen-input-kv-only/epoch_metrics.csv), NOT against
+# the pre-promotion all-false baseline. Arm 01 is exactly this profile's
+# architecture -- overfit V2 plus frozen_input_kv, which is now inherited from
+# config/default.yaml -- at the same 100 epochs, same subset, same LR schedule.
+# Against arm 01, this run differs by weight decay and fog and nothing else.
+#
+# ARCHITECTURE: `model.frozen_input_kv` is INHERITED as true from
+# config/default.yaml (promoted to a default on 2026-08-09). Nothing in this file
+# restates it, which is the point -- new profiles get it automatically.
+# Architecture identity is `dense-multinomial-SC2-v2+frozen_input_kv`.
+#
+# RUN LENGTH: 100 epochs = 3400 optimizer steps (34/epoch), inherited from
+# `train.epochs: 100` in configs/local_overfit_v2.yaml, along with the linear LR
+# decay to the 9.0e-6 floor and the derived 340-step EMA window. No `--max-steps`
+# is passed by tests/run_memorization_sweep.sh, so both schedules run to
+# completion and train_pipeline exports a finished model.
+
+storage:
+  # Private per arm. Enabling/disabling knobs does not change the architecture
+  # fingerprint for THIS arm (weight decay and fog are not architecture), so
+  # unlike the ablation arms nothing would stop the pipeline auto-resuming one of
+  # these runs from another's last.pt. Separate directories are the only thing
+  # keeping the three arms from contaminating each other.
+  checkpoint_uri: checkpoints/memorization/01-no-regularization
+  log_uri: tests/output/memorization/01-no-regularization
+  local_cache_dir: .pipeline_cache/memorization/01-no-regularization
+
+train:
+  # No decoupled weight decay. See the reasoning block above.
+  weight_decay: 0.0
+
+fog:
+  # No fog. Every enemy content token stays observed, so the input sequence for a
+  # given window is byte-identical on every one of the 100 epochs.
+  rate_distribution:
+    name: uniform
+    min: 0.0
+    max: 0.0

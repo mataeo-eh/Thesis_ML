@@ -13,7 +13,11 @@ from thesis_ml.serialize import (
     serialize_snapshot,
     snapshot_content_counts,
 )
-from thesis_ml.vocab.content_vocab import load_content_vocabulary
+from thesis_ml.vocab.content_vocab import (
+    ContentToken,
+    ContentVocabulary,
+    load_content_vocabulary,
+)
 from thesis_ml.vocab.special_tokens import CONTENT_TOKEN_OFFSET, DELIMITER_ID, SPECIAL_TOKENS
 
 
@@ -82,6 +86,10 @@ def test_vocabulary_contains_only_allowed_token_identities() -> None:
 
     assert min(token.token_id for token in vocab.tokens) == CONTENT_TOKEN_OFFSET
     assert set(SPECIAL_TOKENS.values()).isdisjoint({token.token_id for token in vocab.tokens})
+    assigned_ids = sorted(
+        [*SPECIAL_TOKENS.values(), *(token.token_id for token in vocab.tokens)]
+    )
+    assert assigned_ids == list(range(vocab.vocab_size))
     assert "stimpack" in names
     assert "scv" in names
     assert "game_loop" not in names
@@ -102,6 +110,16 @@ def test_vocabulary_contains_only_allowed_token_identities() -> None:
     )
     for name in names:
         assert all(fragment not in name for fragment in banned_fragments), name
+
+
+def test_content_vocabulary_rejects_unmapped_id_holes() -> None:
+    with pytest.raises(ValueError, match="contiguous with no unmapped IDs"):
+        ContentVocabulary(
+            tokens=(
+                ContentToken("marine", CONTENT_TOKEN_OFFSET, 1, "entity"),
+                ContentToken("marauder", CONTENT_TOKEN_OFFSET + 2, 2, "entity"),
+            )
+        )
 
 
 def test_upgrade_parser_accepts_current_and_legacy_storage_shapes() -> None:

@@ -1,0 +1,23 @@
+extends: local_overfit_v2.yaml
+
+# ABLATION ARM 4 of 5 -- segment_embeddings + per_segment_positions.
+#
+# The two purely representational toggles together: the model is told WHICH
+# region a token belongs to (segment embedding) and WHERE it sits within that
+# region (per-segment RoPE ids). Arms 2 and 3 isolate each half, so this arm is
+# what separates "the two are additive" from "either alone was sufficient" or
+# "they only work together".
+#
+# See configs/ablation_01_frozen_input_kv.yaml for the full rationale behind the
+# separate storage paths and behind the 100-epoch / 3400-step run length that
+# every arm inherits from configs/local_overfit_v2.yaml and runs to completion
+# (no `--max-steps` cap); both apply identically to every arm in this sweep.
+storage:
+  checkpoint_uri: checkpoints/ablations/04-segment-embeddings-plus-per-segment-positions
+  log_uri: tests/output/ablations/04-segment-embeddings-plus-per-segment-positions
+  local_cache_dir: .pipeline_cache/ablations/04-segment-embeddings-plus-per-segment-positions
+
+model:
+  frozen_input_kv: false
+  segment_embeddings: true
+  per_segment_positions: true

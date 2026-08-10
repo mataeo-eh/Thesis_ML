@@ -508,7 +508,7 @@ def test_dynamic_padding_masks_loss_and_preserves_real_position_outputs(tmp_path
     assert batch.input_token_ids.shape[1] == max(example.input_token_ids.numel() for example in examples)
     assert batch.target_canvas.shape[1] == max(example.target_canvas.numel() for example in examples)
     assert int(batch.input_attention_mask[short_index].sum()) == short.input_token_ids.numel()
-    assert int(batch.canvas_loss_mask[short_index].sum()) == short.target_canvas.numel()
+    assert int(batch.canvas_loss_mask[short_index].sum()) == short.target_canvas.numel() - 1
     assert not batch.canvas_loss_mask[short_index, short.target_canvas.numel() :].any()
 
     small = replace(
@@ -563,6 +563,7 @@ def test_local_model_parameter_count_is_near_ten_million() -> None:
     vocabulary = load_content_vocabulary(ROOT / "data" / "Token_Dictionary.json")
     model = SC2StrategyDiffusionModel(config, vocab_size=vocabulary.vocab_size)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    assert parameter_count == 10_995_776
     assert 7_000_000 <= parameter_count <= 13_000_000
 
 

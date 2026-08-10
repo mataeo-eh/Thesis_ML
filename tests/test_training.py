@@ -18,6 +18,7 @@ from thesis_ml.config import (
 from thesis_ml.data.collate import collate_diffusion_examples
 from thesis_ml.data.resumable_sampler import ResumableBatchSampler
 from thesis_ml.data.dataset import (
+    CLASS_CLAMPED,
     CLASS_DELIMITER,
     CLASS_END,
     CLASS_ENEMY_FOGGED,
@@ -31,7 +32,7 @@ from thesis_ml.data.dataset import (
 )
 from thesis_ml.model.loss import RARE_CLASS_T_BUCKET_NAMES
 from thesis_ml.model.model import SC2StrategyDiffusionModel
-from thesis_ml.train.corruption import corrupt_batch, inverse_t_weights
+from thesis_ml.train.corruption import corrupt_batch, inverse_t_weights, sample_uniform_noise
 from thesis_ml.train.loop import (
     INTERVAL_REPORTS_PER_EPOCH,
     TrainingLoop,
@@ -42,7 +43,17 @@ from thesis_ml.train.loop import (
     interval_boundaries,
 )
 from thesis_ml.train.train import _synthetic_input_records, make_synthetic_examples, run_smoke_train
-from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID, WIN_ID
+from thesis_ml.vocab.special_tokens import (
+    BOS_ID,
+    CONTENT_TOKEN_OFFSET,
+    DELIMITER_ID,
+    END_ID,
+    EOS_ID,
+    LOSS_ID,
+    MASK_ID,
+    PAD_ID,
+    WIN_ID,
+)
 
 # All fixtures in this file (except `_make_debut_synthetic_examples`, used only
 # by the one debut-mode test below) use the restored pretraining input and
@@ -65,7 +76,9 @@ def test_smoke_train_loss_decreases_and_first_step_per_class_logs(tmp_path: Path
     # label for every stable pretraining class id.
     examples = make_synthetic_examples(_small_config(tmp_path), count=1)
     expected_classes = {
-        PRETRAIN_CLASS_ID_TO_NAME[int(label)] for label in examples[0].class_labels.unique()
+        PRETRAIN_CLASS_ID_TO_NAME[int(label)]
+        for label in examples[0].class_labels.unique()
+        if int(label) >= 0
     }
     assert set(first.per_class) == expected_classes
     assert all(value > 0 for value in first.per_class.values())
@@ -223,24 +236,20 @@ def test_per_epoch_reseed_makes_corruption_deterministic_and_epochs_distinct(
             torch.rand(batch.target_canvas.shape[0], generator=replay_generator)
 
 
-def test_outcome_position_zero_is_noised_iid_and_scored_like_any_position(tmp_path: Path) -> None:
-    """REGRESSION: canvas position 0 (the win/loss token) gets no training exemption.
+def test_bos_is_clamped_while_outcome_position_one_is_noised_and_scored(tmp_path: Path) -> None:
+    """BOS is a visible anchor; the adjacent outcome remains an ordinary target."""
 
-    Position 0 takes the corruption branch iid at rate t like every other canvas
-    position and contributes to the loss with a NONZERO class weight in BOTH
-    training modes. Nothing in corruption, scoring, loss weighting, or sampling
-    special-cases position 0.
-    """
-
-    # t=1.0 selects the corruption branch at every position, including position 0.
     config = _small_config(tmp_path)
     loop, batch = _loop_and_batch(config, seed=93)
     result = loop.compute_batch_loss(batch, fixed_t=1.0)
-    assert result.corruption.corrupted_positions[:, 0].all()
-    assert result.scored_mask[:, 0].all()
-    # The fixtures put CLASS_WINLOSS at position 0; its per-class loss is
-    # therefore populated (it received loss like any other class).
-    assert batch.class_labels[0, 0].item() == CLASS_WINLOSS
+    assert not result.corruption.corrupted_positions[:, 0].any()
+    assert not result.scored_mask[:, 0].any()
+    assert torch.equal(result.corruption.noised_canvas[:, 0], batch.target_canvas[:, 0])
+    assert (batch.target_canvas[:, 0] == BOS_ID).all()
+    assert (batch.class_labels[:, 0] == CLASS_CLAMPED).all()
+    assert result.corruption.corrupted_positions[:, 1].all()
+    assert result.scored_mask[:, 1].all()
+    assert batch.class_labels[0, 1].item() == CLASS_WINLOSS
     assert "win-loss" in result.loss_output.per_class
 
     # Its loss weight is nonzero in both modes; semantic [PAD] is also scored.
@@ -251,11 +260,13 @@ def test_outcome_position_zero_is_noised_iid_and_scored_like_any_position(tmp_pa
     assert pretrain_weights[CLASS_WINLOSS].item() > 0.0
     assert debut_weights[CLASS_WINLOSS].item() > 0.0
 
-    # And at intermediate t the corruption branch at position 0 is a plain iid
+    # At intermediate t, position 1 takes the normal iid corruption branch while
+    # BOS remains exempt.
     # Bernoulli(t) draw: across many examples it is sometimes selected and sometimes not --
     # never always-exempt (and never always-forced).
     generator = torch.Generator(device="cpu").manual_seed(7)
-    target_canvas = torch.zeros((2_000, 4), dtype=torch.long)
+    target_canvas = torch.tensor([BOS_ID, WIN_ID, 20, 21]).repeat(2_000, 1)
+    target_canvas[1::2, 1] = LOSS_ID
     corrupted = corrupt_batch(
         input_token_ids=torch.zeros((2_000, 0), dtype=torch.long),
         target_canvas=target_canvas,
@@ -265,8 +276,28 @@ def test_outcome_position_zero_is_noised_iid_and_scored_like_any_position(tmp_pa
         generator=generator,
         t=0.5,
     )
-    position_zero_rate = float(corrupted.corrupted_positions[:, 0].float().mean())
-    assert 0.4 <= position_zero_rate <= 0.6
+    assert not corrupted.corrupted_positions[:, 0].any()
+    win_rate = float(corrupted.corrupted_positions[0::2, 1].float().mean())
+    loss_rate = float(corrupted.corrupted_positions[1::2, 1].float().mean())
+    assert 0.4 <= win_rate <= 0.6
+    assert 0.4 <= loss_rate <= 0.6
+
+    # At terminal noise both outcome classes take the corruption branch and
+    # necessarily change, because neither outcome ID belongs to the injected
+    # noise-state support.
+    terminal = corrupt_batch(
+        input_token_ids=torch.zeros((2_000, 0), dtype=torch.long),
+        target_canvas=target_canvas,
+        process=config.diffusion.process,
+        schedule=config.diffusion.schedule,
+        vocab_size=128,
+        generator=torch.Generator(device="cpu").manual_seed(8),
+        t=1.0,
+    )
+    assert terminal.corrupted_positions[:, 1].all()
+    assert terminal.changed_positions[:, 1].all()
+    assert not terminal.noised_canvas[:, 1].eq(WIN_ID).any()
+    assert not terminal.noised_canvas[:, 1].eq(LOSS_ID).any()
 
 
 def test_uniform_training_scores_every_valid_canvas_position(tmp_path: Path) -> None:
@@ -290,7 +321,7 @@ def test_uniform_replacement_can_equal_target_and_is_seed_reproducible() -> None
         "target_canvas": target,
         "process": "uniform",
         "schedule": config.diffusion.schedule,
-        "vocab_size": 2,
+        "vocab_size": 9,
         "t": 1.0,
     }
     first = corrupt_batch(
@@ -300,9 +331,24 @@ def test_uniform_replacement_can_equal_target_and_is_seed_reproducible() -> None
         **kwargs, generator=torch.Generator(device="cpu").manual_seed(44)
     )
     assert first.corrupted_positions.all()
-    assert not first.changed_positions.any()
+    assert (first.noised_canvas == target).any()
+    assert first.changed_positions.any()
     assert torch.equal(first.noised_canvas, second.noised_canvas)
     assert torch.equal(first.corrupted_positions, second.corrupted_positions)
+
+
+def test_uniform_noise_support_is_pad_delimiter_and_content_only() -> None:
+    vocab_size = CONTENT_TOKEN_OFFSET + 8
+    sampled = sample_uniform_noise(
+        (20_000,),
+        vocab_size=vocab_size,
+        device=torch.device("cpu"),
+        generator=torch.Generator(device="cpu").manual_seed(812),
+    )
+    observed = set(sampled.tolist())
+    expected = {PAD_ID, DELIMITER_ID, *range(CONTENT_TOKEN_OFFSET, vocab_size)}
+    assert observed == expected
+    assert observed.isdisjoint({MASK_ID, END_ID, WIN_ID, LOSS_ID, BOS_ID, EOS_ID})
 
 
 def test_absorbing_corruption_and_loss_retain_masked_inverse_time_objective(
@@ -455,11 +501,19 @@ def test_full_resume_accepts_a_checkpoint_from_the_matching_ablation_toggle_set(
 
 
 def test_ema_tracks_training_and_validation_uses_ema_weights(tmp_path: Path) -> None:
-    config = _small_config(tmp_path)
+    # The EMA window is now DERIVED from the run's step count
+    # (TrainingLoop._resolve_ema_decay), and a run has to be long enough for
+    # averaging to mean anything: at `ema_horizon_ratio` x total_steps <= 1 step
+    # the derived decay is 0.0 and the EMA correctly just mirrors the raw weights.
+    # This test is about the EMA LAGGING the raw weights, so it needs a run whose
+    # window spans more than one step -- an 8-step run with the whole run as the
+    # window (ratio 1.0) is the smallest thing that exercises the lag.
+    base = _small_config(tmp_path)
+    config = replace(base, train=replace(base.train, ema_horizon_ratio=1.0, max_steps=8))
     loop, batch = _loop_and_batch(config, seed=31)
     initial_ema = [parameter.detach().clone() for parameter in loop.ema_model.parameters()]
 
-    loop.fit([batch], max_steps=1, fixed_t=1.0)
+    loop.fit([batch], max_steps=8, fixed_t=1.0)
 
     assert any(
         not torch.allclose(before, after)
@@ -476,6 +530,105 @@ def test_ema_tracks_training_and_validation_uses_ema_weights(tmp_path: Path) -> 
     expected = loop.compute_batch_loss(batch, fixed_t=1.0, model=loop.ema_model)
     assert validation.loss == pytest.approx(float(expected.loss.detach()))
     assert validation.per_class
+
+
+def test_ema_averaging_window_is_fitted_to_the_runs_step_count(tmp_path: Path) -> None:
+    """The EMA window must scale with the run, capped by `train.ema_decay`.
+
+    An EMA with decay d averages over 1/(1-d) steps. Holding d constant pins that
+    window to a fixed step count, which is the bug this replaces: a fixed 0.9999
+    is a ~10,000-step window, so a 3,400-step run ended with an EMA that had never
+    traversed its own window once. `_resolve_ema_decay` derives d from the run
+    instead, so the window is always `ema_horizon_ratio` x the run's steps.
+    """
+
+    base = _small_config(tmp_path)
+    # max_steps 100_000 seeds __init__'s decay at the 0.9999 ceiling, which is
+    # what the re-fit assertion at the end of this test contrasts against.
+    config = replace(
+        base,
+        train=replace(base.train, ema_decay=0.9999, ema_horizon_ratio=0.1, max_steps=100_000),
+    )
+    loop, batch = _loop_and_batch(config, seed=33)
+    assert loop._ema_target_decay == pytest.approx(0.9999)
+
+    # 3400 steps (the overfitV2 / ablation budget) x 0.1 = a 340-step window.
+    assert loop._resolve_ema_decay(3400) == pytest.approx(1.0 - 1.0 / 340.0)
+    # Half the run length must halve the window, not leave it unchanged.
+    assert loop._resolve_ema_decay(1700) == pytest.approx(1.0 - 1.0 / 170.0)
+    # At and beyond 100,000 steps the derived window hits the 0.9999 ceiling, so
+    # the long-run behavior is exactly what the old fixed constant gave.
+    assert loop._resolve_ema_decay(100_000) == pytest.approx(0.9999)
+    assert loop._resolve_ema_decay(10_000_000) == pytest.approx(0.9999)
+    # A run too short to average over collapses to "mirror the raw weights"
+    # rather than producing a decay outside [0, 1).
+    assert loop._resolve_ema_decay(1) == pytest.approx(0.0)
+    assert loop._resolve_ema_decay(0) == pytest.approx(0.0)
+
+    # fit() must RE-FIT the window to the budget it actually derives, not keep the
+    # value __init__ computed from config.train.max_steps. A 2-step bounded run is
+    # far too short to average over, so the decay must drop from the 0.9999
+    # ceiling all the way to 0.0 (EMA mirrors the raw weights).
+    loop.fit([batch], max_steps=2, fixed_t=1.0)
+    assert loop._ema_target_decay == pytest.approx(loop._resolve_ema_decay(2))
+    assert loop._ema_target_decay == pytest.approx(0.0)
+
+
+def test_lr_decay_shape_selects_linear_or_cosine_and_both_land_on_the_floor(
+    tmp_path: Path,
+) -> None:
+    """Both shapes span peak -> floor; linear leaves the peak sooner.
+
+    These are the three properties the V2 / ablation schedule change relies on:
+    the linear shape starts descending immediately (less time at peak), its
+    constant slope is shallower than the cosine's steepest mid-run section, and
+    both shapes still end exactly on `lr_floor_ratio`.
+    """
+
+    base = _small_config(tmp_path)
+    horizon = 1000
+    warmup = 10
+
+    def multipliers(shape: str, floor: float) -> list[float]:
+        config = replace(
+            base,
+            train=replace(
+                base.train,
+                warmup=warmup,
+                max_steps=horizon,
+                lr_decay_shape=shape,
+                lr_floor_ratio=floor,
+            ),
+        )
+        loop, _ = _loop_and_batch(config, seed=34)
+        return [loop._lr_multiplier(step) for step in range(horizon + 1)]
+
+    cosine = multipliers("cosine", 0.1)
+    linear = multipliers("linear", 0.03)
+
+    # Warmup is untouched by the shape: both ramp linearly to the peak.
+    assert cosine[warmup - 1] == pytest.approx(1.0)
+    assert linear[warmup - 1] == pytest.approx(1.0)
+
+    # Less time at the peak: one tenth into the decay, linear has already given
+    # up meaningfully more of the peak rate than the cosine has.
+    tenth = warmup + (horizon - warmup) // 10
+    assert linear[tenth] < cosine[tenth]
+
+    # Shallower through the middle: the cosine's steepest per-step drop is
+    # pi/2 ~= 1.57x the straight line's constant one.
+    cosine_max_drop = max(cosine[i] - cosine[i + 1] for i in range(warmup, horizon))
+    linear_max_drop = max(linear[i] - linear[i + 1] for i in range(warmup, horizon))
+    assert linear_max_drop < cosine_max_drop
+
+    # Lower end of training, and both land exactly on their configured floor.
+    assert cosine[horizon] == pytest.approx(0.1)
+    assert linear[horizon] == pytest.approx(0.03)
+    assert linear[horizon] < cosine[horizon]
+    # Monotonically non-increasing across the decay for both shapes.
+    for series in (cosine, linear):
+        for step in range(warmup, horizon):
+            assert series[step + 1] <= series[step] + 1e-12
 
 
 def test_confidence_loss_is_weighted_and_disableable(tmp_path: Path) -> None:
@@ -579,10 +732,10 @@ def test_epoch_metrics_csv_contains_train_dev_classes_and_throughput(tmp_path: P
     assert all(float(row["train_perspective_loss_p2"]) > 0 for row in rows)
     assert all(float(row["dev_perspective_loss_p1"]) > 0 for row in rows)
     assert all(float(row["dev_perspective_loss_p2"]) > 0 for row in rows)
-    # Two examples x (3 fogged input + 12 canvas) tokens per epoch.
-    assert [int(row["total_tokens_ingested"]) for row in rows] == [30, 60]
-    # Input and canvas reuse these same 10 unique ids.
-    assert [int(row["total_unique_tokens_seen"]) for row in rows] == [10, 10]
+    # Two examples x (4 fogged input including EOS + 12 canvas) tokens per epoch.
+    assert [int(row["total_tokens_ingested"]) for row in rows] == [32, 64]
+    # BOS and EOS add two boundary identities to the shared synthetic content.
+    assert [int(row["total_unique_tokens_seen"]) for row in rows] == [11, 11]
     # Pretraining retains observed/fogged/future reconstruction classes.
     assert "train_enemy_observed_loss" in fieldnames
     assert "dev_pad_loss" in fieldnames
@@ -1128,7 +1281,8 @@ def _make_debut_synthetic_examples(config: ProjectConfig, *, count: int) -> list
 
     Mirrors ``thesis_ml.train.train.make_synthetic_examples`` (the
     pretraining fixture) but lays out a debut-style canvas: a single win/loss
-    outcome token at position 0 (``CLASS_WINLOSS``), followed by one token of
+    clamped BOS at position 0, outcome token at position 1
+    (``CLASS_WINLOSS``), followed by one token of
     each of the other 6 debut classes. This lets the per-class-loss test
     above assert every debut column is populated without needing a real
     replay or the full ``_build_debut_target`` pipeline (which depends on
@@ -1137,39 +1291,41 @@ def _make_debut_synthetic_examples(config: ProjectConfig, *, count: int) -> list
 
     debut_canvas = torch.tensor(
         [
+            BOS_ID,
             WIN_ID,
             100,
-            101,
             DELIMITER_ID,
             102,
-            103,
             DELIMITER_ID,
             104,
-            105,
             DELIMITER_ID,
             END_ID,
+            PAD_ID,
+            PAD_ID,
             PAD_ID,
         ],
         dtype=torch.long,
     )
     debut_class_labels = torch.tensor(
         [
+            CLASS_CLAMPED,
             CLASS_WINLOSS,
             CLASS_ENEMY_OBSERVED,  # "visible-debut"
-            CLASS_ENEMY_OBSERVED,
             CLASS_DELIMITER,  # "delimiter"
             CLASS_ENEMY_FOGGED,  # "fogged-debut"
-            CLASS_ENEMY_FOGGED,
             CLASS_DELIMITER,
             CLASS_ENEMY_FUTURE,  # "future-debut"
-            CLASS_ENEMY_FUTURE,
             CLASS_DELIMITER,
             CLASS_END,  # "end"
             CLASS_PAD,  # "pad"
+            CLASS_PAD,
+            CLASS_PAD,
         ],
         dtype=torch.long,
     )
-    assert set(debut_class_labels.tolist()) == set(DEBUT_CLASS_ID_TO_NAME.keys())
+    assert {label for label in debut_class_labels.tolist() if label >= 0} == set(
+        DEBUT_CLASS_ID_TO_NAME.keys()
+    )
     examples = []
     for example_index in range(count):
         input_records = _synthetic_input_records(example_index)

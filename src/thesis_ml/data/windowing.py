@@ -24,18 +24,20 @@ from thesis_ml.serialize import parse_entity_columns, parse_upgrades
 from thesis_ml.vocab.content_vocab import ContentVocabulary
 
 
-TOKENIZED_ARTIFACT_VERSION = 4
-MANIFEST_VERSION = 6
+TOKENIZED_ARTIFACT_VERSION = 5
+MANIFEST_VERSION = 7
+# v7/v5 compact content IDs after the eight contiguous special tokens and bind
+# the new per-window [EOS] input terminator plus [BOS] canvas prefix grammar.
 # v6 binds the corpus-verified raw buff-ID range through 302. Artifact v4
 # invalidates the earlier PySC2-enum-capped categorical width.
 # v5 binds the sentinel-aware, validity-preserving feature schema. Artifact v3
 # adds packed continuous validity, categorical cloak state, and sparse buff IDs.
 # v3: the pre-training canvas now leads with the win/loss outcome token at
-# position 0 (folded in from the debut task). The window geometry is unchanged,
+# position 1 after a clamped [BOS] anchor. The window geometry is unchanged,
 # but the target contract is not, so bump the semantics string to force any
 # pre-outcome-token pretraining manifest to be rebuilt rather than silently reused.
-PRETRAIN_TARGET_SEMANTICS = "clamped-fogged-input-plus-outcome-reconstruction-future-v5"
-DEBUT_TARGET_SEMANTICS = "input-tiled-debut-to-replay-end-or-canvas-budget-v1"
+PRETRAIN_TARGET_SEMANTICS = "eos-clamped-input-plus-bos-outcome-reconstruction-future-v6"
+DEBUT_TARGET_SEMANTICS = "eos-input-tiled-bos-outcome-debut-to-end-or-budget-v2"
 P1_CODE = 1
 P2_CODE = 2
 ENTITY_CODE = 1
@@ -224,7 +226,9 @@ def build_replay_windows(
         start = 0
         while start < replay.timestep_count:
             end = start
-            input_count = 0
+            # One [EOS] terminates every served input window. It is not stored
+            # per timestep in the replay artifact, so account for it once here.
+            input_count = 1
             enemy_count = 0
             while end < replay.timestep_count:
                 p1_count, p2_count = counts[end]
@@ -243,7 +247,7 @@ def build_replay_windows(
                 p1_count, p2_count = counts[start]
                 raise ValueError(
                     f"single timestep exceeds a configured window budget: replay={replay_path.name} "
-                    f"perspective={perspective} timestep={start} input={int(p1_count+p2_count)+1} "
+                    f"perspective={perspective} timestep={start} input={int(p1_count+p2_count)+2} "
                     f"enemy={int(p2_count if enemy_code == P2_CODE else p1_count)+1}"
                 )
             entries.append(

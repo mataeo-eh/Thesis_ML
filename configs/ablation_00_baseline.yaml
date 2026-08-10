@@ -1,0 +1,40 @@
+extends: local_overfit_v2.yaml
+
+# ABLATION ARM 0 of 5 -- the ALL-TOGGLES-FALSE BASELINE.
+#
+# WHY THIS FILE EXISTS. Until 2026-08-09 the baseline arm WAS
+# configs/local_overfit_v2.yaml: it pinned all three prompt-009 toggles false in
+# its own `model:` block, so loading it reproduced the run that every ablation
+# arm is read against. Then `model.frozen_input_kv` was promoted to a
+# project-wide default (config/default.yaml), local_overfit_v2.yaml dropped its
+# pin, and that profile now resolves to `frozen_input_kv: true`.
+#
+# That promotion must not retroactively rewrite a finished experiment. This file
+# restates the three toggles explicitly, so it resolves to exactly the
+# architecture the recorded baseline was trained with:
+#
+#     architecture_identity == "dense-multinomial-SC2-v2"   (unsuffixed)
+#
+# Anything that needs the baseline arm reads it from HERE -- notably
+# `ARMS[0]` in src/thesis_ml/viz/outcome_probe.py, which builds a model from this
+# config and loads the baseline checkpoint into it. Pointed at the post-promotion
+# local_overfit_v2.yaml instead, that load would abort on a fingerprint mismatch.
+#
+# STORAGE IS INHERITED ON PURPOSE -- checkpoint_uri stays
+# checkpoints/local-overfitV2, log_uri stays tests/output/overfitV2, because
+# those directories are where the recorded baseline's last.pt and
+# epoch_metrics.csv already live. This file reads them; it is not intended for a
+# fresh launch. If you do relaunch the baseline, redirect the three
+# `storage.*` paths first so the historical artifacts are not overwritten.
+#
+# EVERYTHING ELSE -- replay subset, model scale, 100-epoch budget, linear LR
+# decay to the 0.03 floor, EMA horizon -- is inherited from
+# configs/local_overfit_v2.yaml unchanged, which is what keeps this arm
+# comparable to arms 01-05 epoch for epoch.
+model:
+  # All three false = the unsuffixed vocabulary-v2 identity. Do not remove any of
+  # these lines: dropping one would make it inherit whatever config/default.yaml
+  # currently says, which is precisely the drift this file exists to prevent.
+  frozen_input_kv: false
+  segment_embeddings: false
+  per_segment_positions: false

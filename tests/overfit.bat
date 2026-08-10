@@ -3,9 +3,21 @@ REM ---------------------------------------------------------------------------
 REM Overfit (learnability probe) launcher -- PRE-TRAINING pathway.
 REM
 REM Runs configs\local_overfit_v2.yaml through thesis_ml.pipeline.train_pipeline:
-REM 150 epochs over an explicitly named 10-train / 3-dev replay subset chosen at
-REM the corpus median token count. The point is to confirm the full current
-REM pipeline can drive loss down at all before spending a long run on it.
+REM 100 epochs (= 3400 optimizer steps at 34/epoch) over an explicitly named
+REM 10-train / 3-dev replay subset chosen at the corpus median token count. The
+REM point is to confirm the full current pipeline can drive loss down at all
+REM before spending a long run on it. 100 epochs is also exactly what the five
+REM configs\ablation_*.yaml arms run for, so this baseline and every arm are
+REM comparable epoch for epoch.
+REM
+REM HEADS UP (2026-08-09): model.frozen_input_kv became a project-wide default,
+REM and configs\local_overfit_v2.yaml now inherits it, so this launcher's
+REM architecture_identity is dense-multinomial-SC2-v2+frozen_input_kv. The
+REM PRE-PROMOTION checkpoints\local-overfitV2\last.pt will NOT resume into it --
+REM the launch aborts on a fingerprint mismatch instead of training on the wrong
+REM architecture. Archive tests\output\overfitV2\ and move that last.pt aside
+REM before relaunching. The old all-toggles-false condition is preserved in
+REM configs\ablation_00_baseline.yaml.
 REM
 REM This file stays a THIN launcher on purpose. Every training knob -- replay
 REM selection, epochs, model scale, learning rate, budgets -- is owned by the

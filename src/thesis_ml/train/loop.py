@@ -308,6 +308,13 @@ class TrainingLoop:
         self._ema_tensor_cache: tuple[
             list[torch.Tensor], list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor]]
         ] | None = None
+        # Target EMA decay for THIS run, sized to the run's own step horizon
+        # rather than left at a fixed constant -- see _resolve_ema_decay. Seeded
+        # here from the configured horizon so a loop driven directly (tests,
+        # smoke paths) has a valid decay before fit() runs; fit() recomputes it
+        # from the step budget it actually derives, which is the authoritative
+        # value for a real run.
+        self._ema_target_decay = self._resolve_ema_decay(self.config.train.max_steps)
         generator_device = self.device if self.device.type in {"cpu", "cuda"} else torch.device("cpu")
         self.generator = torch.Generator(device=generator_device)
         # Store the base seed so fit() can RESEED the generator at every epoch
@@ -352,6 +359,12 @@ class TrainingLoop:
                 raise ValueError("train.epochs must be >= 1 when train.max_steps is 0")
             target_steps = batches_per_epoch * epoch_count
             epoch_limit = epoch_count
+        # Re-fit the EMA averaging window to the step budget THIS run will
+        # actually train through, now that it is known. target_steps is used
+        # rather than config.train.max_steps so that a run bounded by an explicit
+        # `--max-steps` cap still gets an EMA that completes inside the steps it
+        # is given. See _resolve_ema_decay.
+        self._ema_target_decay = self._resolve_ema_decay(target_steps)
         base_accumulation_steps = self.config.train.accumulation_steps
         if base_accumulation_steps < 1:
             raise ValueError("train.accumulation_steps must be >= 1")
@@ -374,14 +387,33 @@ class TrainingLoop:
         print(
             f"lr_schedule base_lr={base_lr:.3e} warmup_steps={warmup} "
             f"target_steps={target_steps} "
+            f"decay_shape={self.config.train.lr_decay_shape} "
             f"effective_lr_at_step_1={base_lr * self._lr_multiplier(0):.3e} "
-            f"effective_lr_after_warmup={base_lr * self._lr_multiplier(warmup):.3e}"
+            f"effective_lr_after_warmup={base_lr * self._lr_multiplier(warmup):.3e} "
+            f"effective_lr_at_final_step={base_lr * self._lr_multiplier(target_steps):.3e}"
             + (
                 "  [WARNING: warmup >= target_steps -> the run never leaves warmup; "
                 "lower train.warmup]"
                 if warmup >= target_steps
                 else ""
             ),
+            flush=True,
+        )
+        # Same idea for the EMA: print the window the derived decay corresponds
+        # to so it is visible up front that the EMA finishes inside this run
+        # rather than trailing a window sized for some other run's length.
+        ema_window_steps = (
+            math.inf
+            if self._ema_target_decay >= 1.0
+            else 1.0 / (1.0 - self._ema_target_decay)
+        )
+        print(
+            f"ema_schedule horizon_ratio={self.config.train.ema_horizon_ratio} "
+            f"decay_ceiling={self.config.train.ema_decay} "
+            f"effective_decay={self._ema_target_decay:.6f} "
+            f"averaging_window_steps={ema_window_steps:.0f} "
+            f"target_steps={target_steps} "
+            f"windows_per_run={target_steps / ema_window_steps:.1f}",
             flush=True,
         )
 
@@ -1090,6 +1122,7 @@ class TrainingLoop:
             vocab_size=int(getattr(self.model, "vocab_size")),
             generator=self.generator,
             t=fixed_t,
+            canvas_noise_mask=batch.canvas_loss_mask,
         )
 
         if self.config.diffusion.process == "uniform":
@@ -1308,14 +1341,48 @@ class TrainingLoop:
             )
 
     def _lr_multiplier(self, step_index: int) -> float:
+        """Return the factor `base_lr` is scaled by at `step_index`.
+
+        This is the `lr_lambda` handed to the `LambdaLR` scheduler built in
+        `__init__`, so it is called once per `scheduler.step()`. The schedule has
+        two phases:
+
+        1. Linear warmup over `train.warmup` steps, from `base_lr/warmup` up to
+           `base_lr`.
+        2. Decay from `base_lr` down to `base_lr * train.lr_floor_ratio`, spread
+           over the remaining steps of the run's horizon. The horizon is
+           `train.max_steps`, which `train_pipeline._run_real_pipeline` injects
+           as `len(train_loader) * train.epochs` whenever the YAML leaves
+           `max_steps: 0`, so the decay always re-fits itself to the configured
+           epoch budget rather than to a fixed step count.
+
+        `train.lr_decay_shape` selects the decay curve; see
+        `thesis_ml.config.TrainConfig.lr_decay_shape` for what each shape is for.
+
+        Parameters:
+            step_index: 0-based optimizer step the scheduler is producing a rate
+                for.
+
+        Returns:
+            A multiplier in `[lr_floor_ratio, 1.0]` during decay, or in
+            `(0, 1.0]` during warmup.
+
+        Calls: nothing beyond `math`. Reads only `self.config.train`.
+        """
+
         warmup = max(1, self.config.train.warmup)
         max_steps = max(warmup + 1, self.config.train.max_steps)
         if step_index < warmup:
             return float(step_index + 1) / float(warmup)
+        # `progress` walks 0.0 -> 1.0 across the decay phase, so both shapes
+        # below start exactly at the peak and land exactly on the floor.
         progress = min(1.0, float(step_index - warmup) / float(max_steps - warmup))
         floor = self.config.train.lr_floor_ratio
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return floor + (1.0 - floor) * cosine
+        if self.config.train.lr_decay_shape == "linear":
+            decay = 1.0 - progress
+        else:
+            decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return floor + (1.0 - floor) * decay
 
     def _make_log(
         self,
@@ -1733,10 +1800,68 @@ class TrainingLoop:
             batch_size, device=generator_device, generator=self.generator
         ) < probability
 
-    def _update_ema(self) -> None:
-        decay = self.config.train.ema_decay
-        if not 0.0 <= decay <= 1.0:
+    def _resolve_ema_decay(self, total_steps: int) -> float:
+        """Size the EMA averaging window to a run of `total_steps` steps.
+
+        An EMA with decay `d` averages over an effective window of `1/(1-d)`
+        steps. Holding `d` at a constant therefore pins that window to a fixed
+        step count regardless of how long the run is: the previous fixed 0.9999
+        is a ~10,000-step window, so a 3,400-step overfit run ended with an EMA
+        that had not traversed its own window even once and whose served weights
+        still carried a large share of early-training (near-init) parameters.
+
+        This derives the decay from the run instead. `train.ema_horizon_ratio` is
+        the window expressed as a fraction of the run's steps, so at 0.1 the EMA
+        always averages over roughly the final 10% of training -- about ten
+        window lengths before the last step, which is enough for the average to
+        have fully turned over -- whatever the epoch budget happens to be.
+        `train.ema_decay` stays in play as a CEILING, so a very long run tops out
+        at a sane window rather than growing one without bound.
+
+        Parameters:
+            total_steps: the run's total optimizer-step horizon. Values <= 0 are
+                treated as a 1-step horizon, which yields decay 0.0 (the EMA
+                simply mirrors the raw weights) -- the right answer for a run too
+                short to average over.
+
+        Returns:
+            The target decay in `[0, train.ema_decay]`.
+
+        Calls: nothing. Reads only `self.config.train`.
+
+        Called by: `__init__` (initial value) and `fit` (authoritative value,
+        from the step budget fit() derives).
+        """
+
+        ratio = self.config.train.ema_horizon_ratio
+        ceiling = self.config.train.ema_decay
+        if not 0.0 < ratio <= 1.0:
+            raise ValueError("train.ema_horizon_ratio must be in (0, 1]")
+        if not 0.0 <= ceiling <= 1.0:
             raise ValueError("train.ema_decay must be in [0, 1]")
+        # max(1.0, ...) keeps the window at least one step so the reciprocal
+        # below stays <= 1 and the decay stays in [0, 1).
+        window_steps = max(1.0, ratio * float(max(0, total_steps)))
+        derived_decay = 1.0 - 1.0 / window_steps
+        return min(ceiling, derived_decay)
+
+    def _update_ema(self) -> None:
+        # Ramp the decay in over the first steps instead of jumping straight to
+        # the target. `self.global_step` has not been incremented yet when this
+        # is called, so `updates` is how many EMA updates INCLUDING this one have
+        # happened; it is restored from the checkpoint on resume, so the ramp
+        # picks up where it left off rather than restarting.
+        #
+        # Why the ramp: the EMA buffer starts as a copy of the randomly
+        # initialized weights, and at the target decay it takes a full window to
+        # forget them. (1+n)/(10+n) is 0.18 at the first update and climbs past
+        # 0.9 by n=90, so the first handful of updates are dominated by the live
+        # weights and the EMA is a usable set of weights from epoch 1 -- which
+        # matters here because dev validation and every periodic checkpoint read
+        # the EMA weights, not the raw ones. The ramp only ever LOWERS the decay,
+        # so it can never overshoot the run-fitted target.
+        updates = self.global_step + 1
+        decay = min(self._ema_target_decay, float(1 + updates) / float(10 + updates))
         # Build the tensor cache once. state_dict() returns references to the
         # SAME underlying parameter/buffer tensors on every call, and both the
         # optimizer step and load_state_dict mutate those tensors in place, so

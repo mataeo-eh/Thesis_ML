@@ -1,15 +1,15 @@
 flowchart TD
-    A["Clamped input IDs<br/>[B, Li], Li ≤ 4096"] --> E["Shared token embedding<br/>383 → 256"]
+    A["Clamped EOS-terminated input IDs<br/>[B, Li], Li ≤ 4096"] --> E["Shared token embedding<br/>291 → 256"]
     AF["Input features<br/>25 values + 25 validity<br/>309 categorical + 1 allegiance<br/>= 360"] --> FM["Feature MLP<br/>360 → 32 → 32"]
     E --> JM["Joint mixer<br/>(256 + 32) → 256 → 256"]
     FM --> JM
     JM --> IE["Input embeddings<br/>[B, Li, 256]"]
 
-    T["Clean target canvas<br/>[B, 4096]"] --> C["Uniform corruption<br/>one t per row"]
+    T["Clean target canvas<br/>BOS at 0 · outcome at 1<br/>[B, 4096]"] --> C["Uniform corruption<br/>BOS clamped · one t per row<br/>noise = PAD/DELIMITER/content"]
     C --> NE["Noised canvas IDs<br/>[B, 4096]"]
-    NE --> E2["Same token embedding<br/>383 → 256"]
+    NE --> E2["Same token embedding<br/>291 → 256"]
 
-    FP["Stopped previous prediction<br/>[B, 4096, 383]"] --> EX["Expected embedding<br/>softmax(logits) × E<br/>→ [B, 4096, 256]"]
+    FP["Stopped previous prediction<br/>[B, 4096, 291]"] --> EX["Expected embedding<br/>softmax(logits) × E<br/>→ [B, 4096, 256]"]
     EX --> SC["RMSNorm → GeGLU 256<br/>→ residual → scale-less RMSNorm"]
     E2 --> SC
     SC --> CE["Canvas embeddings<br/>[B, 4096, 256]"]
@@ -19,8 +19,8 @@ flowchart TD
 
     CAT --> TR["10 × bidirectional transformer block<br/>MHA + GeGLU + sandwich RMSNorm"]
     TR --> FN["Final RMSNorm"]
-    FN --> OH["Untied output head<br/>256 → 383"]
-    OH --> FULL["Full logits<br/>[B, Li + 4096, 383]"]
-    FULL --> SLICE["Canvas slice only<br/>[B, 4096, 383]"]
-    SLICE --> LOSS["Clean-state cross-entropy<br/>scalar loss"]
+    FN --> OH["Untied output head<br/>256 → 291"]
+    OH --> FULL["Full logits<br/>[B, Li + 4096, 291]"]
+    FULL --> SLICE["Canvas slice<br/>[B, 4096, 291]"]
+    SLICE --> LOSS["Clean-state cross-entropy<br/>positions 1..4095"]
     LOSS --> DEC["Read-only decompositions<br/>7 classes · 4 t-buckets<br/>preserved vs noised · p1/p2<br/>5 future-distance buckets"]

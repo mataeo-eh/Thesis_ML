@@ -448,10 +448,13 @@ class BidirectionalTransformer(nn.Module):
     ) -> None:
         super().__init__()
         self.gradient_checkpointing = gradient_checkpointing
-        # Ablation toggle. When on (and the caller tells us where the canvas
-        # starts via `input_len`), the single joint forward becomes two passes:
-        # the input region alone, then the canvas attending to the input's
-        # cached keys/values. Off by default so the baseline is untouched.
+        # When on (and the caller tells us where the canvas starts via
+        # `input_len`), the single joint forward becomes two passes: the input
+        # region alone, then the canvas attending to the input's cached
+        # keys/values. This constructor argument stays False-by-default so a
+        # directly-constructed backbone is the plain joint transformer; the
+        # PROJECT default is true and arrives from config/default.yaml via
+        # `SC2StrategyDiffusionModel` (SPEC.md 14b, promoted 2026-08-09).
         self.frozen_input_kv = frozen_input_kv
         self.layers = nn.ModuleList(
             [
@@ -548,8 +551,48 @@ class BidirectionalTransformer(nn.Module):
         # Slicing recovers the two region masks exactly, because the caller
         # concatenated them in [input | canvas] order in the first place.
         input_mask = None if attention_mask is None else attention_mask[:, :input_len]
-        input_positions = None if position_ids is None else position_ids[:, :input_len]
-        canvas_positions = None if position_ids is None else position_ids[:, input_len:]
+
+        if position_ids is not None:
+            # Explicit ids (the `per_segment_positions` path): slice them the
+            # same way as the mask.
+            input_positions = position_ids[:, :input_len]
+            canvas_positions = position_ids[:, input_len:]
+        else:
+            # NO explicit ids. The two passes MUST still be given the absolute
+            # positions the joint forward would have used over the
+            # concatenation -- input 0..input_len-1, canvas
+            # input_len..input_len+canvas_len-1.
+            #
+            # WHY THIS CANNOT BE LEFT AS None (this was a real bug, fixed
+            # 2026-08-09 when `frozen_input_kv` was promoted to a default):
+            # `RotaryEmbedding.forward` falls back to `arange(seq_len)` when
+            # position_ids is None, and on the second pass `seq_len` is the
+            # CANVAS length. So the canvas silently restarted at position 0
+            # while the cached input keys carried 0..input_len-1. Two things
+            # went wrong at once:
+            #
+            #   1. The canvas got per-segment positions unconditionally, which
+            #      is precisely what the separate `per_segment_positions`
+            #      toggle exists to control. The two toggles were conflated, so
+            #      ablation arms 01 and 05 were not measuring what they claimed.
+            #   2. Worse, the canvas-to-input RELATIVE offset then moved with
+            #      however much LEFT PADDING the batch happened to need: real
+            #      input content sits at the right of the input region, so
+            #      padding pushes its absolute positions up while the canvas
+            #      stayed pinned at 0. A window's canvas logits therefore
+            #      depended on which other windows shared its batch.
+            #      tests/test_windowing.py::
+            #      test_dynamic_padding_masks_loss_and_preserves_real_position_outputs
+            #      is the regression test for exactly this.
+            #
+            # The input half's fallback happened to be correct already
+            # (`arange(input_len)`), but it is built explicitly here too so both
+            # halves come from one visible expression rather than one relying on
+            # a coincidence.
+            canvas_len = x.shape[1] - input_len
+            absolute_positions = torch.arange(input_len + canvas_len, device=x.device)
+            input_positions = absolute_positions[:input_len].unsqueeze(0).expand(x.shape[0], -1)
+            canvas_positions = absolute_positions[input_len:].unsqueeze(0).expand(x.shape[0], -1)
 
         if cached_input_kv is not None:
             # Reuse path: the input region is unchanged from a previous forward,

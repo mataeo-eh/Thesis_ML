@@ -248,7 +248,11 @@ class CanvasCrossEntropyLoss(nn.Module):
             reduction="none",
         )
         active = torch.ones_like(ce, dtype=torch.bool) if scored_mask is None else scored_mask.to(torch.bool)
-        weights = self.class_weights.to(ce.device)[class_labels]
+        # Inactive positions may carry CLASS_CLAMPED=-1 for the fixed [BOS]
+        # anchor. Index weights only for scored positions so that sentinel can
+        # never alias the final class or index outside the taxonomy.
+        weights = torch.zeros_like(ce)
+        weights[active] = self.class_weights.to(ce.device)[class_labels[active]]
         if position_weights is not None:
             weights = weights * position_weights.to(ce.device)
         weighted = ce * weights

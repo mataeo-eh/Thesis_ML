@@ -131,7 +131,7 @@ class InputContextEmbedding(nn.Module):
                 row 0 is added to every input-region embedding and row 1 to
                 every canvas-region embedding. Defaults false, which is the
                 baseline: the table is not created, so no new ``state_dict``
-                keys appear and existing checkpoints keep loading strictly.
+                keys appear in the all-off architecture-v2 baseline.
         Returns:
             None; this is a constructor.
         Calls: nn.Embedding/nn.Linear/nn.Sequential construction plus RMSNorm
@@ -181,9 +181,9 @@ class InputContextEmbedding(nn.Module):
         else:
             # Assigning a plain ``None`` (rather than an nn.Embedding that is
             # then ignored) is what keeps the toggle-off state_dict key-for-key
-            # identical to the pre-toggle model, so old checkpoints still load
-            # under strict load_state_dict. nn.Module only registers a submodule
-            # when the assigned value is an nn.Module, so this adds no keys.
+            # identical to its matching toggle-off v2 arm, so those checkpoints
+            # load under strict load_state_dict. nn.Module only registers a
+            # submodule when the assigned value is an nn.Module, so this adds no keys.
             # Same pattern as the self-conditioning branch directly above.
             self.segment_embedding = None
 

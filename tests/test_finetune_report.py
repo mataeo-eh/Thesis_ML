@@ -34,11 +34,20 @@ from thesis_ml.eval.finetune_report import (
     build_debut_report,
     write_finetune_report,
 )
-from thesis_ml.data.dataset import DatasetExample
+from thesis_ml.data.dataset import CLASS_CLAMPED, DatasetExample
 from thesis_ml.inference.decode import validate_debut_canvas
 from thesis_ml.train.train import _synthetic_input_records
 from thesis_ml.vocab.content_vocab import build_content_vocabulary
-from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, LOSS_ID, MASK_ID, PAD_ID, WIN_ID
+from thesis_ml.vocab.special_tokens import (
+    BOS_ID,
+    CONTENT_TOKEN_OFFSET,
+    DELIMITER_ID,
+    END_ID,
+    LOSS_ID,
+    MASK_ID,
+    PAD_ID,
+    WIN_ID,
+)
 
 from dataclasses import replace
 
@@ -48,18 +57,18 @@ from dataclasses import replace
 # ---------------------------------------------------------------------------
 
 CANVAS_BUDGET = 16
-MARINE_ID = 100  # build_content_vocabulary assigns ids from CONTENT_TOKEN_OFFSET (100)
-MEDIVAC_ID = 101
+MARINE_ID = CONTENT_TOKEN_OFFSET
+MEDIVAC_ID = CONTENT_TOKEN_OFFSET + 1
 
 
 def _vocab():
-    """Two-token content vocabulary: marine -> 100, medivac -> 101."""
+    """Two-token content vocabulary at the live contiguous content offset."""
 
     return build_content_vocabulary({"1": "marine", "2": "medivac"})
 
 
 def _debut_canvas() -> list[int]:
-    """A valid debut canvas: [WIN] marine | (empty t1) | medivac | [END] pads.
+    """A valid debut canvas: [BOS] [WIN] marine | empty t1 | medivac | END/pads.
 
     Timesteps (bucket index = delimiters seen before the token):
         t0: marine        -> visible-debut
@@ -67,13 +76,14 @@ def _debut_canvas() -> list[int]:
         t2: medivac       -> future-debut
     """
 
-    tokens = [WIN_ID, MARINE_ID, DELIMITER_ID, DELIMITER_ID, MEDIVAC_ID, DELIMITER_ID, END_ID]
+    tokens = [BOS_ID, WIN_ID, MARINE_ID, DELIMITER_ID, DELIMITER_ID, MEDIVAC_ID, DELIMITER_ID, END_ID]
     tokens += [PAD_ID] * (CANVAS_BUDGET - len(tokens))
     return tokens
 
 
 def _debut_class_labels() -> list[int]:
     labels = [
+        CLASS_CLAMPED,          # [BOS]
         CLASS_WINLOSS,          # [WIN]
         CLASS_ENEMY_OBSERVED,   # marine -> visible-debut
         CLASS_DELIMITER,
@@ -88,6 +98,7 @@ def _debut_class_labels() -> list[int]:
 
 def _debut_metadata() -> list[dict]:
     meta = [
+        {"token_kind": "canvas-begin", "timestep_index": None, "token_name": "[BOS]"},
         {"token_kind": "outcome", "timestep_index": None, "token_name": "[WIN/LOSS]"},
         {"token_kind": "entity", "timestep_index": 0, "token_name": "marine"},
         {"token_kind": "delimiter", "timestep_index": 0, "token_name": "[DELIMITER]"},
@@ -212,7 +223,7 @@ def test_section_has_all_required_nested_keys() -> None:
 
     # Structural booleans present and typed.
     structural = section["win_loss_structural"]
-    assert isinstance(structural["position0_ok"], bool)
+    assert isinstance(structural["position1_ok"], bool)
 
 
 def test_section_values_on_perfect_generation() -> None:
@@ -236,8 +247,8 @@ def test_section_values_on_perfect_generation() -> None:
     assert section["debut_mae"] == pytest.approx(0.0)
     assert section["debut_mae_matched_count"] == 2
 
-    # Structural: the single outcome token sits at position 0.
-    assert section["win_loss_structural"]["position0_ok"] is True
+    # Structural: BOS anchors position 0 and the single outcome sits at position 1.
+    assert section["win_loss_structural"]["position1_ok"] is True
 
     # Cumulative outcome accuracy is 1.0 at every minute checkpoint.
     for value in section["win_loss_minute_buckets"].values():
@@ -275,7 +286,7 @@ def test_relaxed_validator_accepts_empty_timesteps_and_leading_outcome() -> None
     assert validate_debut_canvas(_debut_canvas()).valid is True
 
     # A canvas that is nothing but empty timesteps then [END] is also valid.
-    only_empty = [LOSS_ID, DELIMITER_ID, DELIMITER_ID, END_ID, PAD_ID, PAD_ID]
+    only_empty = [BOS_ID, LOSS_ID, DELIMITER_ID, DELIMITER_ID, END_ID, PAD_ID, PAD_ID]
     assert validate_debut_canvas(only_empty).valid is True
 
 
@@ -283,30 +294,30 @@ def test_relaxed_validator_rejects_malformed_canvases() -> None:
     # Missing the leading outcome token.
     assert validate_debut_canvas([MARINE_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is False
 
-    # Outcome token appearing somewhere other than position 0.
-    assert validate_debut_canvas([WIN_ID, MARINE_ID, WIN_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is False
+    # Outcome token appearing somewhere other than position 1.
+    assert validate_debut_canvas([BOS_ID, WIN_ID, MARINE_ID, WIN_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is False
 
     # [END] not sitting on a completed timestep (no preceding delimiter).
-    assert validate_debut_canvas([WIN_ID, MARINE_ID, END_ID, PAD_ID]).valid is False
+    assert validate_debut_canvas([BOS_ID, WIN_ID, MARINE_ID, END_ID, PAD_ID]).valid is False
 
     # Residual [MASK] left in the canvas.
-    assert validate_debut_canvas([WIN_ID, MASK_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is False
+    assert validate_debut_canvas([BOS_ID, WIN_ID, MASK_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is False
 
     # [PAD] appearing before [END].
-    assert validate_debut_canvas([WIN_ID, MARINE_ID, DELIMITER_ID, PAD_ID, END_ID]).valid is False
+    assert validate_debut_canvas([BOS_ID, WIN_ID, MARINE_ID, DELIMITER_ID, PAD_ID, END_ID]).valid is False
 
     # Truncated canvas that does not end on a delimiter boundary.
-    assert validate_debut_canvas([WIN_ID, MARINE_ID, PAD_ID, PAD_ID]).valid is False
+    assert validate_debut_canvas([BOS_ID, WIN_ID, MARINE_ID, PAD_ID, PAD_ID]).valid is False
 
 
 def test_pretraining_validator_requires_leading_outcome_token() -> None:
     # The win/loss outcome token is now folded into PRE-TRAINING too, so the
-    # pre-training grammar REQUIRES exactly one outcome token at position 0
+    # pre-training grammar REQUIRES BOS then exactly one outcome token at position 1
     # (converging with the debut grammar). A canvas that leads with it is valid;
     # one missing it is rejected.
     from thesis_ml.inference.decode import validate_canvas
 
-    assert validate_canvas([WIN_ID, MARINE_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is True
+    assert validate_canvas([BOS_ID, WIN_ID, MARINE_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is True
     assert validate_canvas([MARINE_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is False
 
 

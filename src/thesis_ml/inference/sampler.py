@@ -17,7 +17,7 @@ from thesis_ml.model.model import (
     canvas_self_conditioning_from_logits,
     validate_checkpoint_compatibility,
 )
-from thesis_ml.train.corruption import corrupt_batch, sample_uniform_non_mask
+from thesis_ml.train.corruption import corrupt_batch, sample_uniform_noise
 from thesis_ml.vocab.special_tokens import MASK_ID
 
 
@@ -239,6 +239,7 @@ def _initial_canvas(
         vocab_size=vocab_size,
         generator=generator,
         t=noise_rate,
+        canvas_noise_mask=eligible,
     )
     mutable = corruption.corrupted_positions & eligible
     revealed = eligible & ~corruption.corrupted_positions
@@ -652,7 +653,7 @@ def _sample_uniform_at_positions(
     sampled = fallback.clone()
     count = int(eligible.sum().item())
     if count:
-        sampled[eligible] = sample_uniform_non_mask(
+        sampled[eligible] = sample_uniform_noise(
             (count,),
             vocab_size=vocab_size,
             device=fallback.device,

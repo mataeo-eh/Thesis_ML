@@ -43,10 +43,10 @@ pip install -e .
 
 **ML Architecture**
 - Uniform-state multinomial discrete diffusion with a dense, full-bidirectional Gemma 4-lineage transformer. The project adopts DiffusionGemma's uniform corruption, expected-embedding self-conditioning, dense GeGLU/sandwich-RMSNorm mechanics, and nonmonotonic entropy-bounded sampler while retaining one full output canvas and a clamped input instead of block-autoregressive KV-cache conditioning.
-- Self-supervised pretraining receives a fogged observed-game-state input and jointly reconstructs omitted enemy past/present state plus whole-timestep future continuation on the output canvas.
-    - | [clamped input tokens] | [uniformly noised output canvas] |
+- Self-supervised pretraining receives an EOS-terminated fogged observed-game-state input and jointly reconstructs omitted enemy past/present state plus whole-timestep future continuation on the output canvas.
+    - | [clamped input tokens] [EOS] | [clamped BOS] [uniformly noised output canvas] |
 - Input embeddings combine location-agnostic entity-token identity with allowlisted input-only map position, unit statistics, and allegiance. Sequence position uses Llama 3.1-style frequency-scaled RoPE; absolute time and frame-derived values never enter the model.
-- Ground truth begins with a perspective-relative `[WIN]` or `[LOSS]` token followed by the normal canvas body. The sampler applies no position-specific restriction: the model learns the position-zero outcome convention and refines it jointly with the strategy roll-out.
+- Ground truth begins with clamped `[BOS]` at canvas position 0 and a perspective-relative `[WIN]` or `[LOSS]` target at position 1, followed by the normal canvas body. The outcome slot remains eligible for corruption and sampling; uniform noise can replace it only with `[PAD]`, `[DELIMITER]`, or a content token, never by injecting a random outcome or boundary token.
 - Absorbing `[MASK]` diffusion remains a configuration-selectable scientific ablation, not the production default.
 
 **Evaluation**
