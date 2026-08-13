@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 from thesis_ml.config import (
@@ -107,6 +108,33 @@ def _enemy_counts(frame: pd.DataFrame, config: ProjectConfig, perspective_player
             key = (timestep, record.token_name)
             counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def test_power_fog_distribution_favors_high_omission_rates() -> None:
+    base = _config()
+    config = replace(
+        base,
+        fog=FogConfig(
+            rate_distribution=UniformDistributionConfig(
+                name="power",
+                min=0.0,
+                max=0.8,
+                power=2.0,
+            )
+        ),
+    )
+    dataset = object.__new__(SC2DiffusionDataset)
+    dataset.config = config
+    dataset.fog_rate_override = None
+    rng = np.random.default_rng(1234)
+
+    draws = np.asarray([dataset._sample_fog_rate(rng) for _ in range(50_000)])
+
+    assert draws.min() >= 0.0
+    assert draws.max() < 0.8
+    assert draws.mean() == pytest.approx(0.8 * 2.0 / 3.0, abs=0.01)
+    assert np.mean(draws >= 0.6) == pytest.approx(0.4375, abs=0.015)
+    assert np.mean(draws < 0.2) == pytest.approx(0.0625, abs=0.01)
 
 
 # ---------------------------------------------------------------------------

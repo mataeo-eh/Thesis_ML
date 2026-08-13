@@ -24,7 +24,7 @@ train:
   # without any per-arm step cap in the launcher.
   #
   # `max_steps` stays at the inherited 0, which is what makes the LR horizon
-  # DERIVED: train_pipeline injects len(train_loader) * epochs (= 3400) as
+  # DERIVED: train_pipeline injects optimizer_steps_per_epoch * epochs (= 3400) as
   # train.max_steps, and both the LR decay (TrainingLoop._lr_multiplier) and the
   # EMA window (TrainingLoop._resolve_ema_decay) are fitted to exactly that. So
   # changing `epochs` here re-fits both schedules automatically; nothing else
@@ -53,7 +53,7 @@ train:
   #
   # Both knobs default to cosine / 0.1 in config/default.yaml, so local_full.yaml
   # and local_overfit.yaml are untouched and the old shape is one line away.
-  lr_decay_shape: linear
+  lr_schedule: linear
   lr_floor_ratio: 0.03
 
 # ============================================================================
@@ -112,11 +112,8 @@ diffusion:
     # this above 0 if the exact-100%-corruption column needs to be dense.
     t_one_fraction: 0.0
 
-# NOTE: this profile is PRE-TRAINING (data.debut_mode=false, inherited from
-# local_overfit.yaml -> config/default.yaml). Pre-training loss is uniform (no
-# per-class weighting), so a `loss.class_loss_weights.pad` override must not
-# exist here -- that knob is fine-tuning-only and lives in
-# configs/local_overfit_v2_finetune.yaml.
+# NOTE: this historical PRE-TRAINING profile inherits unit class weights from
+# local_overfit.yaml so its original objective remains reproducible.
 #
 # Diagnostics this run writes to tests/output/overfitV2/ (see
 # TrainingLoop._write_epoch_metrics for the full column list):

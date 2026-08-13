@@ -44,9 +44,18 @@ model:
   self_conditioning: true
   gradient_checkpointing: true
 
+fog:
+  rate_distribution:
+    name: uniform
+    min: 0.0
+    max: 0.8
+    power: 1.0
+
 diffusion:
   process: uniform
   schedule:
+    t_distribution: uniform
+    t_distribution_power: 1.0
     t_one_fraction: 0.0
 
 train:
@@ -65,6 +74,8 @@ train:
   # (e.g. `smallTrainingTestV2.bat --lr 1e-4`).
   lr: 3.0e-4
   warmup: 200
+  lr_schedule: cosine
+  lr_floor_ratio: 0.1
   epochs: 8
   max_steps: 0
   early_stopping_patience_epochs: 0
@@ -72,6 +83,9 @@ train:
   accumulation_steps: 1
   target_effective_batch_tokens: 0
   checkpoint_interval: 50
+  resume_checkpoint_subdir: ""
+  save_best_checkpoint: false
+  durable_checkpoint_interval_epochs: 0
   val_interval: 0
   self_cond_prob: 0.5
   precision: bf16
@@ -82,3 +96,13 @@ train:
 eval:
   heldout_split: test
   debut_max_examples: 0
+
+loss:
+  class_loss_weights:
+    enemy_observed_reconstruction: 1.0
+    enemy_fogged_reconstruction: 1.0
+    enemy_future_prediction: 1.0
+    delimiter: 1.0
+    end: 1.0
+    pad: 1.0
+    win_loss: 1.0

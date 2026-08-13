@@ -67,7 +67,7 @@ from thesis_ml.pipeline.train_pipeline import (
     _explicit_replay_selection,
     _select_replays,
 )
-from thesis_ml.train.loop import TrainingLoop
+from thesis_ml.train.loop import TrainingLoop, optimizer_steps_per_epoch
 from thesis_ml.vocab.content_vocab import load_content_vocabulary
 
 
@@ -197,7 +197,9 @@ def run_finetune_pipeline(
 
     planned_steps = config.train.max_steps
     if planned_steps <= 0:
-        planned_steps = len(train_loader) * config.train.epochs
+        planned_steps = optimizer_steps_per_epoch(
+            len(train_loader), config.train.accumulation_steps
+        ) * config.train.epochs
     training_config = replace(
         config,
         train=replace(config.train, checkpoint_dir=str(checkpoint_dir), max_steps=planned_steps),
@@ -227,7 +229,7 @@ def run_finetune_pipeline(
         metrics_path=metrics_path,
         epoch_metrics_path=epoch_metrics_path,
         interval_metrics_path=interval_metrics_path,
-        checkpoint_publisher=_checkpoint_publisher(config, resolver),
+        checkpoint_publisher=_checkpoint_publisher(config, resolver, checkpoint_dir),
         metrics_publisher=_metrics_publisher(config, resolver),
     )
 
@@ -251,7 +253,7 @@ def run_finetune_pipeline(
         retain_logs=False,
     )
     peak_vram_bytes = torch.cuda.max_memory_allocated() if device == "cuda" else 0
-    checkpoint_uri = _publish_checkpoint(config, resolver, checkpoint_dir / "last.pt")
+    checkpoint_uri = _publish_checkpoint(config, resolver, loop.resume_checkpoint_path)
 
     # --- Worker-4 evaluation: build finetune_report.json ---------------------
     # "memorized" = the 25 replays actually fine-tuned on (diagnoses whether

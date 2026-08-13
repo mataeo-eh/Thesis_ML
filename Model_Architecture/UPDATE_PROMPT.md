@@ -33,7 +33,7 @@ dated copy or retain old behavior for history; Git owns history.
 
 <impact_trace>
 Audit all relevant paths, not only the edited module:
-- config/default.yaml, configs/local_full.yaml, and config dataclasses/merge;
+- config/default.yaml, configs/smallTrainingTestV3.yaml, configs/local_full.yaml, and config dataclasses/merge;
 - vocabulary IDs, maximum ID, valid/noise/sampling state space, embedding and
   output widths;
 - raw-to-model feature codec, normalization statistics, validity and category
@@ -53,7 +53,7 @@ Audit all relevant paths, not only the edited module:
 
 <required_live_measurement>
 1. Confirm .venv/Scripts/python.exe exists and use it for every Python command.
-2. Load configs/local_full.yaml through thesis_ml.config.load_config.
+2. Load configs/smallTrainingTestV3.yaml through thesis_ml.config.load_config.
 3. Load the configured content vocabulary and feature-statistics artifact.
 4. Instantiate SC2StrategyDiffusionModel from the current source.
 5. Enumerate every named parameter and buffer with shape, dtype, numel, and
@@ -96,7 +96,7 @@ update trigger present in every architecture-owning subsystem AGENTS.md.
 
 <verification>
 At minimum run:
-  .venv\Scripts\python.exe -m pytest -q tests/test_config.py tests/test_model.py tests/test_windowing.py::test_local_model_parameter_count_is_near_ten_million
+  .venv\Scripts\python.exe -m pytest -q tests/test_config.py tests/test_model.py tests/test_windowing.py::test_small_training_v3_model_parameter_count
 Add the focused tests required by each changed subsystem AGENTS.md. Then run
 git diff --check, inspect the rendered PNG/SVG, verify all arithmetic,
 and refresh the affected jcodemunch/jdocmunch indexes when practical.

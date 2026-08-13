@@ -1,0 +1,64 @@
+extends: local_full.yaml
+
+# Canonical full-corpus V3 run. All generated run state lives below one root;
+# the reusable tokenized corpus, manifest, and feature statistics remain shared.
+storage:
+  checkpoint_uri: tests/output/smallTrainingTestV3/checkpoints
+  log_uri: tests/output/smallTrainingTestV3/metrics
+  local_cache_dir: tests/output/smallTrainingTestV3/cache
+
+model:
+  d_model: 384
+  layers: 12
+  heads: 6
+  ffn: 1536
+  self_conditioning: true
+  gradient_checkpointing: true
+
+fog:
+  rate_distribution:
+    name: power
+    min: 0.0
+    max: 0.8
+    power: 2.0
+
+diffusion:
+  process: uniform
+  schedule:
+    t_distribution: power
+    t_distribution_power: 2.0
+    t_one_fraction: 0.05
+
+train:
+  lr: 3.0e-4
+  lr_floor_ratio: 0.01
+  lr_schedule: wsd
+  lr_warmup_ratio: 0.10
+  lr_stable_ratio: 0.70
+  lr_decay_ratio: 0.20
+  epochs: 50
+  max_steps: 0
+  early_stopping_patience_epochs: 10
+  early_stopping_min_relative_improvement: 0.001
+  accumulation_steps: 5
+  target_effective_batch_tokens: 0
+  checkpoint_interval: 100
+  resume_checkpoint_subdir: resume
+  best_checkpoint_subdir: best
+  durable_checkpoint_subdir: durable
+  save_best_checkpoint: true
+  durable_checkpoint_interval_epochs: 5
+  keep_step_checkpoints: false
+  val_interval: 0
+  interval_dev_evaluation: false
+  interval_train_evaluation: false
+
+loss:
+  class_loss_weights:
+    enemy_observed_reconstruction: 1.0
+    enemy_fogged_reconstruction: 1.0
+    enemy_future_prediction: 1.0
+    delimiter: 1.0
+    end: 24.633333333333333
+    pad: 0.1
+    win_loss: 1.0

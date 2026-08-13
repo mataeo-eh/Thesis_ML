@@ -205,8 +205,7 @@ class CanvasCrossEntropyLoss(nn.Module):
         # per-class decomposition in forward() derives its keys from this single
         # map, so pre-training and debut mode can never disagree with each other
         # or with the CSV columns train/loop.py writes (which call the same
-        # helper). ``debut_mode`` is cached because it gates configured class
-        # weighting, while distance decomposition remains shared.
+        # helper).
         self.class_id_to_name = active_class_id_to_name(config)
         self.debut_mode = config.data.debut_mode
 
@@ -214,19 +213,17 @@ class CanvasCrossEntropyLoss(nn.Module):
         # max(id) + 1, NOT len(map), so stable raw ids remain safe.
         buffer_size = max(self.class_id_to_name) + 1
         class_weights = torch.ones(buffer_size, dtype=torch.float32)
-        if self.debut_mode:
-            # Fine-tuning: per-class config weighting (unchanged behavior). The
-            # config guarantees class_loss_weights is populated in debut mode.
-            weights = config.loss.class_loss_weights
-            class_weights[CLASS_ENEMY_OBSERVED] = weights.enemy_observed_reconstruction
-            class_weights[CLASS_ENEMY_FOGGED] = weights.enemy_fogged_reconstruction
-            class_weights[CLASS_ENEMY_FUTURE] = weights.enemy_future_prediction
-            class_weights[CLASS_DELIMITER] = weights.delimiter
-            class_weights[CLASS_END] = weights.end
-            class_weights[CLASS_PAD] = weights.pad
-            class_weights[CLASS_WINLOSS] = weights.win_loss
-        # Pre-training leaves every class at 1.0, including semantic [PAD].
-        # Batch-shape padding is excluded by the caller's scored mask.
+        weights = config.loss.class_loss_weights
+        class_weights[CLASS_ENEMY_OBSERVED] = weights.enemy_observed_reconstruction
+        class_weights[CLASS_ENEMY_FOGGED] = weights.enemy_fogged_reconstruction
+        class_weights[CLASS_ENEMY_FUTURE] = weights.enemy_future_prediction
+        class_weights[CLASS_DELIMITER] = weights.delimiter
+        class_weights[CLASS_END] = weights.end
+        class_weights[CLASS_PAD] = weights.pad
+        class_weights[CLASS_WINLOSS] = weights.win_loss
+        # Semantic [PAD] is still scored; its configured weight only changes its
+        # contribution to the normalized objective. Batch-shape padding remains
+        # excluded by the caller's scored mask.
         self.register_buffer("class_weights", class_weights)
 
     def forward(

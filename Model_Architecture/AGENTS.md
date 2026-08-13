@@ -18,7 +18,7 @@
 - Every statement in this directory must describe the current repository state. Do not preserve an old number or behavior for historical context; Git already preserves history.
 - Any change that affects model-facing data, token identities, vocabulary width, feature channels, sequence grammar, token budgets, tensor shapes, learnable modules, parameter sharing, initialization, attention, position encoding, self-conditioning, corruption, loss, optimizer, scheduler, precision, EMA, checkpoint compatibility, sampling, or the profile identified here as current requires an architecture-documentation pass in the same change.
 - Update every affected occurrence together: prose, canonical Mermaid nodes and edges, rendered SVG/PNG, equations, tables, totals, caveats, source map, and verification notes. Search this directory for old names and values before closeout.
-- Derived values must be recomputed from live code and merged YAML, never copied forward on trust. At minimum, instantiate the current `local_full` model with the live vocabulary and configured feature-statistics artifact when available, enumerate parameter tensors, and check the input/canvas/output formulas.
+- Derived values must be recomputed from live code and merged YAML, never copied forward on trust. At minimum, instantiate the current `smallTrainingTestV3` model with the live vocabulary and configured feature-statistics artifact when available, enumerate parameter tensors, and check the input/canvas/output formulas.
 - Separate three kinds of facts explicitly: current code/configuration, a concrete checkpoint's stamped architecture, and historical run logs. Never use an older log or checkpoint count as the current source count.
 - Preserve the distinction between learnable parameters, non-trainable buffers/state, training-only machinery, and inference-only procedures.
 - Preserve the distinction between semantic `[PAD]` targets and batch-shape padding, input fog and canvas diffusion, and pretraining versus debut/outcome fine-tuning.
@@ -38,8 +38,8 @@
 ## Verification
 
 - Confirm `Thesis_ML/.venv/Scripts/python.exe` exists before Python commands and run all Python through that shim.
-- For architecture/model/config changes, run at least `tests/test_config.py`, `tests/test_model.py`, and `tests/test_windowing.py::test_local_model_parameter_count_is_near_ten_million`; add the owning subsystem tests named by its `AGENTS.md`.
-- Load `configs/local_full.yaml` through `thesis_ml.config.load_config`; do not manually merge YAML overrides.
+- For architecture/model/config changes, run at least `tests/test_config.py`, `tests/test_model.py`, and `tests/test_windowing.py::test_small_training_v3_model_parameter_count`; add the owning subsystem tests named by its `AGENTS.md`.
+- Load `configs/smallTrainingTestV3.yaml` through `thesis_ml.config.load_config`; do not manually merge YAML overrides.
 - Instantiate `SC2StrategyDiffusionModel` with `load_content_vocabulary(...)` and the configured feature-statistics artifact when present. Record `sum(p.numel() for p in model.parameters())`, subsystem totals, parameter shapes, buffer shapes, and dtypes.
 - Run `.venv\Scripts\python.exe Model_Architecture\render_diagram.py`, check that its Mermaid parser fails on no line or layout mismatch, visually inspect the PNG/SVG, and confirm the Markdown image/link targets resolve.
 - Check internal arithmetic and `git diff --check`.

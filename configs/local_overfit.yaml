@@ -64,9 +64,18 @@ model:
   self_conditioning: true
   gradient_checkpointing: true
 
+fog:
+  rate_distribution:
+    name: uniform
+    min: 0.0
+    max: 0.8
+    power: 1.0
+
 diffusion:
   process: uniform
   schedule:
+    t_distribution: uniform
+    t_distribution_power: 1.0
     t_one_fraction: 0.0
 
 train:
@@ -88,7 +97,7 @@ train:
   # HOW THE COSINE DECAY IS FITTED TO THIS RUN'S LENGTH: `max_steps: 0` is not
   # "no limit" -- it is the signal that the schedule horizon must be DERIVED.
   # train_pipeline._run_real_pipeline computes
-  # `planned_steps = len(train_loader) * train.epochs` and injects it as
+  # `planned_steps = optimizer_steps_per_epoch * train.epochs` and injects it as
   # `train.max_steps` before the TrainingLoop is constructed, and
   # TrainingLoop._lr_multiplier decays the cosine over exactly that horizon. So
   # the schedule re-fits itself to `epochs` automatically: at 30 epochs it decayed
@@ -97,6 +106,8 @@ train:
   # 3.0e-4 down to 3.0e-5 across the whole run rather than bottoming out early.
   lr: 3.0e-4
   warmup: 40
+  lr_schedule: cosine
+  lr_floor_ratio: 0.1
   # 150 epochs, not 30. An aggressively augmented subset (per-serving fog, a
   # freshly sampled corruption level t per example per epoch) means the model
   # never sees the same training example twice, so short runs only have time to
@@ -118,6 +129,9 @@ train:
   # epochs this overwrites last.pt 150 times (keep_step_checkpoints stays false),
   # so disk use is flat and a crash costs at most one epoch of training.
   checkpoint_interval: 34
+  resume_checkpoint_subdir: ""
+  save_best_checkpoint: false
+  durable_checkpoint_interval_epochs: 0
   # BOTH dev and train loss are reported ONCE per epoch, at the epoch end, and
   # this profile therefore emits no interval_metrics.csv rows at all.
   #
@@ -148,3 +162,13 @@ train:
   require_cuda: true
   max_cuda_reserved_gb: 7.5
   empty_cuda_cache_after_epoch: true
+
+loss:
+  class_loss_weights:
+    enemy_observed_reconstruction: 1.0
+    enemy_fogged_reconstruction: 1.0
+    enemy_future_prediction: 1.0
+    delimiter: 1.0
+    end: 1.0
+    pad: 1.0
+    win_loss: 1.0

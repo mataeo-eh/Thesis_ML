@@ -47,14 +47,14 @@ data:
   debut_mode: true
   window_manifest_path: data/processed/local/finetune_window_manifest.jsonl
 
-# Fog is required in both modes and inherited from the base config. Only
-# `loss.class_loss_weights` remains fine-tuning-only; this profile carries the
-# pad: 0.2 override that used to live in local_overfit_v2.yaml.
+# Fog and class weights are required in both modes. This historical fine-tune
+# profile carries its original pad: 0.2 override.
 fog:
   rate_distribution:
     name: uniform
     min: 0.0
     max: 0.8
+    power: 1.0
 
 diffusion:
   process: uniform

@@ -186,10 +186,8 @@ def _small_config(
 def _small_debut_config(**kwargs) -> ProjectConfig:
     """Fine-tuning (debut_mode=True) variant of `_small_config`.
 
-    The future-distance loss decomposition (and per-class config weighting) is
-    now FINE-TUNING-ONLY, so tests of those behaviors must build the loss from
-    a debut-mode config. A debut config is required (by
-    `_validate_debut_mode_sections` / `CanvasCrossEntropyLoss`) to carry `fog`
+    A debut config is required (by
+    `_validate_shared_training_sections` / `CanvasCrossEntropyLoss`) to carry `fog`
     and `loss.class_loss_weights`, so both are populated with plain uniform
     values here -- their exact numbers are not what these tests assert.
     """
@@ -806,30 +804,20 @@ def test_canvas_state_ignores_positions_excluded_by_the_scored_mask() -> None:
     assert set(result.canvas_state) == {"noised"}
 
 
-def test_pretraining_loss_weights_are_uniform_including_semantic_pad() -> None:
-    """Pre-training loss weighting is fully uniform (published MDLM style).
-
-    The weight buffer must be length 7 (max class id 6 + 1, even though the
-    pre-training map is sparse with 5 entries), hold exactly 1.0 for every
-    class including semantic `[PAD]`, and be built
-    WITHOUT reading `config.loss.class_loss_weights` -- which is None for a
-    pre-training config, so any read would crash.
-    """
+def test_pretraining_loss_uses_configured_pad_and_end_weights() -> None:
+    """Pretraining shares the configured seven-class weighting contract."""
 
     config = _small_config()
-    # Precondition making the "never reads the knob" claim meaningful: the
-    # pre-training config genuinely has no class-weight section to read.
-    assert config.loss.class_loss_weights is None
+    assert config.loss.class_loss_weights is not None
 
     loss_fn = CanvasCrossEntropyLoss(config)
     weights = loss_fn.class_weights
 
     assert weights.shape == (7,)
-    assert weights[CLASS_PAD].item() == 1.0
-    for class_id in (CLASS_CONTENT, CLASS_DELIMITER, CLASS_END, CLASS_WINLOSS):
+    assert weights[CLASS_PAD].item() == pytest.approx(0.1)
+    assert weights[CLASS_END].item() == pytest.approx(42862 / 1740)
+    for class_id in (CLASS_CONTENT, CLASS_DELIMITER, CLASS_WINLOSS):
         assert weights[class_id].item() == 1.0
-    # The unused ids 1/2 keep the uniform fill too (they are never emitted in
-    # pre-training, but the buffer is id-indexed so they must exist).
     assert weights[CLASS_ENEMY_FOGGED].item() == 1.0
     assert weights[CLASS_ENEMY_FUTURE].item() == 1.0
 
@@ -872,15 +860,15 @@ def test_rope_length_extrapolation_smoke() -> None:
     assert output.logits.shape == (1, input_ids.shape[1] + canvas_ids.shape[1], 128)
 
 
-def test_default_local_shape_instantiates_on_meta_device() -> None:
+def test_default_full_training_shape_instantiates_on_meta_device() -> None:
     config = load_config("config/default.yaml")
     with torch.device("meta"):
         model = SC2StrategyDiffusionModel(config, vocab_size=400)
 
     first_layer = model.backbone.layers[0]
-    assert model.embedding.token_embedding.embedding_dim == 256
-    assert len(model.backbone.layers) == 10
-    assert first_layer.attn.heads == 4
+    assert model.embedding.token_embedding.embedding_dim == 384
+    assert len(model.backbone.layers) == 12
+    assert first_layer.attn.heads == 6
     assert first_layer.attn.head_dim == 64
 
 

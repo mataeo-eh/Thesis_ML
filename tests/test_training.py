@@ -41,6 +41,7 @@ from thesis_ml.train.loop import (
     _latest_metrics_csv_path,
     auxiliary_confidence_loss,
     interval_boundaries,
+    optimizer_steps_per_epoch,
 )
 from thesis_ml.train.train import _synthetic_input_records, make_synthetic_examples, run_smoke_train
 from thesis_ml.vocab.special_tokens import (
@@ -337,6 +338,32 @@ def test_uniform_replacement_can_equal_target_and_is_seed_reproducible() -> None
     assert torch.equal(first.corrupted_positions, second.corrupted_positions)
 
 
+def test_power_t_sampling_favors_high_noise_and_keeps_five_percent_exact_terminal() -> None:
+    base = _small_config()
+    schedule = replace(
+        base.diffusion.schedule,
+        t_distribution="power",
+        t_distribution_power=2.0,
+        t_one_fraction=0.05,
+    )
+    target = torch.tensor([BOS_ID, CONTENT_TOKEN_OFFSET]).repeat(50_000, 1)
+    result = corrupt_batch(
+        input_token_ids=torch.empty((50_000, 0), dtype=torch.long),
+        target_canvas=target,
+        process="uniform",
+        schedule=schedule,
+        vocab_size=128,
+        generator=torch.Generator(device="cpu").manual_seed(812),
+    )
+
+    exact_terminal = result.t.eq(1.0)
+    continuous = result.t[~exact_terminal]
+    assert float(exact_terminal.float().mean()) == pytest.approx(0.05, abs=0.004)
+    assert float(continuous.mean()) == pytest.approx(2.0 / 3.0, abs=0.01)
+    assert float((continuous >= 0.75).float().mean()) == pytest.approx(0.4375, abs=0.015)
+    assert float((continuous < 0.25).float().mean()) == pytest.approx(0.0625, abs=0.01)
+
+
 def test_uniform_noise_support_is_pad_delimiter_and_content_only() -> None:
     vocab_size = CONTENT_TOKEN_OFFSET + 8
     sampled = sample_uniform_noise(
@@ -439,6 +466,67 @@ def test_checkpoint_roundtrip_restores_model_optimizer_and_step(tmp_path: Path) 
     logs = restored.fit([batch], max_steps=2, fixed_t=1.0)
     assert restored.global_step == 2
     assert logs
+
+
+def test_epoch_checkpoint_families_replace_best_and_retain_durable(tmp_path: Path) -> None:
+    base = _small_config(tmp_path)
+    config = replace(
+        base,
+        train=replace(
+            base.train,
+            resume_checkpoint_subdir="resume",
+            best_checkpoint_subdir="best",
+            durable_checkpoint_subdir="durable",
+            save_best_checkpoint=True,
+            durable_checkpoint_interval_epochs=5,
+            early_stopping_patience_epochs=10,
+        ),
+    )
+    loop = TrainingLoop(
+        model=SC2StrategyDiffusionModel(config, vocab_size=128),
+        config=config,
+        seed=22,
+    )
+
+    loop.completed_epochs = 1
+    assert loop._should_stop_early(2.0) is False
+    loop._save_epoch_checkpoints(2.0)
+    assert (tmp_path / "checkpoints" / "best" / "epoch-0001.pt").exists()
+
+    loop.completed_epochs = 2
+    # A strict 0.05% improvement is too small to reset the 0.1% patience
+    # threshold, but it is still the best dev loss seen and must replace the
+    # inference/resume checkpoint.
+    assert loop._should_stop_early(1.999) is False
+    assert loop.epochs_without_improvement == 1
+    loop._save_epoch_checkpoints(1.999)
+    assert not (tmp_path / "checkpoints" / "best" / "epoch-0001.pt").exists()
+    assert (tmp_path / "checkpoints" / "best" / "epoch-0002.pt").exists()
+
+    loop.completed_epochs = 3
+    assert loop._should_stop_early(1.8) is False
+    loop._save_epoch_checkpoints(1.8)
+    assert not (tmp_path / "checkpoints" / "best" / "epoch-0002.pt").exists()
+    assert (tmp_path / "checkpoints" / "best" / "epoch-0003.pt").exists()
+
+    loop.completed_epochs = 5
+    loop._save_epoch_checkpoints(1.9)
+    durable = tmp_path / "checkpoints" / "durable" / "epoch-0005.pt"
+    assert durable.exists()
+    restored = TrainingLoop(
+        model=SC2StrategyDiffusionModel(config, vocab_size=128),
+        config=config,
+        seed=22,
+    )
+    restored.load_checkpoint(durable)
+    assert restored.completed_epochs == 5
+    assert restored.best_dev_loss == pytest.approx(1.8)
+
+
+def test_optimizer_steps_per_epoch_accounts_for_gradient_accumulation() -> None:
+    assert optimizer_steps_per_epoch(4_763, 5) == 953
+    assert optimizer_steps_per_epoch(10, 5) == 2
+    assert optimizer_steps_per_epoch(11, 5) == 3
 
 
 def test_full_resume_rejects_a_checkpoint_from_a_different_ablation_toggle_set(tmp_path: Path) -> None:
@@ -574,7 +662,7 @@ def test_ema_averaging_window_is_fitted_to_the_runs_step_count(tmp_path: Path) -
     assert loop._ema_target_decay == pytest.approx(0.0)
 
 
-def test_lr_decay_shape_selects_linear_or_cosine_and_both_land_on_the_floor(
+def test_lr_schedule_selects_linear_or_cosine_and_both_land_on_the_floor(
     tmp_path: Path,
 ) -> None:
     """Both shapes span peak -> floor; linear leaves the peak sooner.
@@ -596,7 +684,7 @@ def test_lr_decay_shape_selects_linear_or_cosine_and_both_land_on_the_floor(
                 base.train,
                 warmup=warmup,
                 max_steps=horizon,
-                lr_decay_shape=shape,
+                lr_schedule=shape,
                 lr_floor_ratio=floor,
             ),
         )
@@ -629,6 +717,34 @@ def test_lr_decay_shape_selects_linear_or_cosine_and_both_land_on_the_floor(
     for series in (cosine, linear):
         for step in range(warmup, horizon):
             assert series[step + 1] <= series[step] + 1e-12
+
+
+def test_wsd_schedule_holds_peak_for_seventy_percent_then_linearly_decays(
+    tmp_path: Path,
+) -> None:
+    base = _small_config(tmp_path)
+    horizon = 1000
+    config = replace(
+        base,
+        train=replace(
+            base.train,
+            max_steps=horizon,
+            lr_schedule="wsd",
+            lr_floor_ratio=0.01,
+            lr_warmup_ratio=0.10,
+            lr_stable_ratio=0.70,
+            lr_decay_ratio=0.20,
+        ),
+    )
+    loop, _ = _loop_and_batch(config, seed=34)
+
+    assert loop._schedule_phase_steps(horizon) == (100, 700, 200)
+    assert loop._lr_multiplier(0) == pytest.approx(0.01)
+    assert loop._lr_multiplier(99) == pytest.approx(1.0)
+    assert loop._lr_multiplier(799) == pytest.approx(1.0)
+    assert loop._lr_multiplier(800) == pytest.approx(1.0)
+    assert loop._lr_multiplier(900) == pytest.approx(0.505)
+    assert loop._lr_multiplier(1000) == pytest.approx(0.01)
 
 
 def test_confidence_loss_is_weighted_and_disableable(tmp_path: Path) -> None:
@@ -1553,6 +1669,7 @@ def test_relative_early_stopping_requires_consecutive_subthreshold_epochs(tmp_pa
     assert loop._should_stop_early(9.995) is False
     assert loop._should_stop_early(9.994) is True
     assert loop.epochs_without_improvement == 2
+    assert loop.early_stopping_best_dev_loss == pytest.approx(10.0)
 
 
 def _small_config(tmp_path: Path | None = None, **model_overrides: bool) -> ProjectConfig:
@@ -1570,12 +1687,16 @@ def _small_config(tmp_path: Path | None = None, **model_overrides: bool) -> Proj
             adam_eps=1e-8,
             warmup=1,
             lr_floor_ratio=0.1,
+            lr_schedule="cosine",
             accumulation_steps=1,
             target_effective_batch_tokens=0,
             max_steps=8,
             val_interval=0,
             checkpoint_interval=100,
             checkpoint_dir=str(tmp_path / "checkpoints") if tmp_path is not None else "checkpoints/test",
+            resume_checkpoint_subdir="",
+            save_best_checkpoint=False,
+            durable_checkpoint_interval_epochs=0,
             ema_decay=0.9,
             confidence_loss_weight=0.1,
             precision="fp32",
@@ -1586,7 +1707,7 @@ def _small_config(tmp_path: Path | None = None, **model_overrides: bool) -> Proj
 def _small_debut_config(tmp_path: Path | None = None) -> ProjectConfig:
     """Fine-tuning (debut_mode=True) variant of `_small_config`.
 
-    A debut-mode config is REQUIRED (by `_validate_debut_mode_sections` /
+    A debut-mode config is REQUIRED (by `_validate_shared_training_sections` /
     `CanvasCrossEntropyLoss`) to carry `fog` and `loss.class_loss_weights`, so
     both are populated here with plain uniform values -- the exact numbers are
     not what tests using this helper assert.

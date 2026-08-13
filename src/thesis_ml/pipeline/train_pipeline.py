@@ -38,7 +38,7 @@ from thesis_ml.eval.finetune_report import build_and_write_finetune_report
 from thesis_ml.model.model import SC2StrategyDiffusionModel
 from thesis_ml.pipeline.finished_export import export_finished_model
 from thesis_ml.pipeline.storage import StorageResolver
-from thesis_ml.train.loop import TrainingLoop
+from thesis_ml.train.loop import TrainingLoop, optimizer_steps_per_epoch
 from thesis_ml.train.train import SMOKE_VOCAB_SIZE, make_synthetic_examples
 from thesis_ml.vocab.content_vocab import load_content_vocabulary
 
@@ -151,7 +151,7 @@ def _run_smoke_pipeline(config: ProjectConfig, resolver: StorageResolver) -> Tra
     loop = TrainingLoop(model=model, config=smoke_config, seed=smoke_config.pipeline.seed)
     resumed = _try_resume(loop, checkpoint_dir)
     loop.fit(dataloader, max_steps=smoke_config.pipeline.smoke_steps, fixed_t=1.0)
-    checkpoint_uri = _publish_checkpoint(config, resolver, checkpoint_dir / "last.pt")
+    checkpoint_uri = _publish_checkpoint(config, resolver, loop.resume_checkpoint_path)
     return TrainingPipelineResult(
         checkpoint_uri=checkpoint_uri,
         resumed=resumed,
@@ -262,7 +262,9 @@ def _run_real_pipeline(
 
     planned_steps = config.train.max_steps
     if planned_steps <= 0:
-        planned_steps = len(train_loader) * config.train.epochs
+        planned_steps = optimizer_steps_per_epoch(
+            len(train_loader), config.train.accumulation_steps
+        ) * config.train.epochs
     # --lr overrides the base learning rate for this run without editing YAML.
     # Applied here (before the optimizer is built inside TrainingLoop) so the
     # override actually takes effect; None leaves the config value untouched.
@@ -299,7 +301,7 @@ def _run_real_pipeline(
         metrics_path=metrics_path,
         epoch_metrics_path=epoch_metrics_path,
         interval_metrics_path=interval_metrics_path,
-        checkpoint_publisher=_checkpoint_publisher(config, resolver),
+        checkpoint_publisher=_checkpoint_publisher(config, resolver, checkpoint_dir),
         metrics_publisher=_metrics_publisher(config, resolver),
     )
     # Resume from durable storage first (fresh spot instance has no local
@@ -326,7 +328,7 @@ def _run_real_pipeline(
         _shutdown_dataloader(train_loader)
         _shutdown_dataloader(val_loader)
     peak_vram_bytes = torch.cuda.max_memory_allocated() if device == "cuda" else 0
-    checkpoint_uri = _publish_checkpoint(config, resolver, checkpoint_dir / "last.pt")
+    checkpoint_uri = _publish_checkpoint(config, resolver, loop.resume_checkpoint_path)
 
     # A "proper finish" is a real run that returned normally from loop.fit() --
     # it trained through every configured epoch or stopped via early stopping.
@@ -672,12 +674,16 @@ def _select_eval_examples(dataset, cap: int):
     return [dataset[index] for index in selected_indices]
 
 
-def _checkpoint_publisher(config: ProjectConfig, resolver: StorageResolver) -> Callable[[Path], None] | None:
+def _checkpoint_publisher(
+    config: ProjectConfig,
+    resolver: StorageResolver,
+    checkpoint_dir: Path,
+) -> Callable[[Path], None] | None:
     """Return a callback that mirrors a local checkpoint to remote storage.
 
     None when checkpoints are local-only (nothing to publish). Otherwise the
-    callback uploads each saved file under its basename to the checkpoint URI,
-    so `last.pt` lands at `<checkpoint_uri>/last.pt` for the resume path.
+    callback preserves each path relative to the local checkpoint root, so
+    resume, best, and durable families keep their separate remote subdirectories.
     """
 
     checkpoint_uri = config.storage.checkpoint_uri
@@ -685,7 +691,8 @@ def _checkpoint_publisher(config: ProjectConfig, resolver: StorageResolver) -> C
         return None
 
     def publish(local_path: Path) -> None:
-        resolver.put_file(local_path, f"{checkpoint_uri.rstrip('/')}/{local_path.name}")
+        relative = local_path.relative_to(checkpoint_dir).as_posix()
+        resolver.put_file(local_path, f"{checkpoint_uri.rstrip('/')}/{relative}")
 
     return publish
 
@@ -729,7 +736,7 @@ def _resume_from_remote(
     resolver: StorageResolver,
     checkpoint_dir: Path,
 ) -> bool:
-    """Pull `last.pt` from remote storage and resume, if one exists.
+    """Pull the configured rolling resume checkpoint from remote storage.
 
     Enables a fresh (replacement) spot instance to continue a preempted run:
     point storage.checkpoint_uri at the same S3 prefix and training picks up
@@ -739,10 +746,13 @@ def _resume_from_remote(
     checkpoint_uri = config.storage.checkpoint_uri
     if not resolver.is_s3(checkpoint_uri):
         return False
-    remote = f"{checkpoint_uri.rstrip('/')}/last.pt"
+    resume_subdir = config.train.resume_checkpoint_subdir.strip()
+    relative = f"{resume_subdir}/last.pt" if resume_subdir else "last.pt"
+    remote = f"{checkpoint_uri.rstrip('/')}/{relative}"
     if not resolver.exists(remote):
         return False
-    local_checkpoint = checkpoint_dir / "last.pt"
+    local_checkpoint = checkpoint_dir / relative
+    local_checkpoint.parent.mkdir(parents=True, exist_ok=True)
     resolver.get_file(remote, local_checkpoint)
     loop.load_checkpoint(local_checkpoint)
     return True
@@ -755,7 +765,7 @@ def _dataset_available(config: ProjectConfig, resolver: StorageResolver) -> bool
 
 
 def _try_resume(loop: TrainingLoop, checkpoint_dir: Path) -> bool:
-    checkpoint = checkpoint_dir / "last.pt"
+    checkpoint = loop.resume_checkpoint_path
     if not checkpoint.exists():
         return False
     loop.load_checkpoint(checkpoint)
@@ -774,7 +784,9 @@ def _local_checkpoint_dir(config: ProjectConfig, resolver: StorageResolver) -> P
 def _publish_checkpoint(config: ProjectConfig, resolver: StorageResolver, local_checkpoint: Path) -> str:
     if not resolver.is_s3(config.storage.checkpoint_uri):
         return str(local_checkpoint)
-    target = f"{config.storage.checkpoint_uri.rstrip('/')}/last.pt"
+    checkpoint_dir = _local_checkpoint_dir(config, resolver)
+    relative = local_checkpoint.relative_to(checkpoint_dir).as_posix()
+    target = f"{config.storage.checkpoint_uri.rstrip('/')}/{relative}"
     resolver.put_file(local_checkpoint, target)
     return target
 

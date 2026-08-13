@@ -13,15 +13,19 @@ data:
 
 fog:
   rate_distribution:
-    name: uniform
+    # Beta(power, 1) sampled by x = U ** (1 / power), then scaled to min/max.
+    # power=2 intentionally favors heavier enemy omission while retaining the
+    # full 0.0-0.8 support.
+    name: power
     min: 0.0
     max: 0.8
+    power: 2.0
 
 model:
-  d_model: 256
-  layers: 10
-  heads: 4
-  ffn: 1024
+  d_model: 384
+  layers: 12
+  heads: 6
+  ffn: 1536
   qk_norm: true
   self_conditioning: true
   gradient_checkpointing: false
@@ -72,13 +76,16 @@ diffusion:
   process: uniform
   schedule:
     name: linear
-    t_distribution: uniform
+    t_distribution: power
+    # Beta(power, 1); 2.0 gives density 2t and therefore emphasizes high-noise
+    # conditioning without removing low-noise examples entirely.
+    t_distribution_power: 2.0
     min: 0.0
     max: 1.0
     # Fraction of examples per epoch (per-example Bernoulli, in expectation)
     # oversampled to t=1.0 exactly. Applies to both pre-training and
     # fine-tuning pipelines.
-    t_one_fraction: 0.0
+    t_one_fraction: 0.05
 
 storage:
   data_uri: data/processed/quickstart
@@ -131,18 +138,18 @@ train:
   beta2: 0.95
   weight_decay: 0.1
   adam_eps: 0.00000001
+  # `warmup` is the absolute step warmup retained by the legacy cosine/linear
+  # schedules. WSD uses the three horizon ratios below instead.
   warmup: 2000
-  lr_floor_ratio: 0.1
-  # Post-warmup decay shape: "cosine" (half-cosine: lingers at the peak, steep
-  # middle, flat tail) or "linear" (constant slope: leaves the peak at once and
-  # is shallower than the cosine's steepest section). cosine is the default so
-  # every existing profile's schedule is unchanged; configs/local_overfit_v2.yaml
-  # opts into "linear" with a lower floor. See TrainConfig.lr_decay_shape.
-  lr_decay_shape: cosine
+  lr_floor_ratio: 0.01
+  lr_schedule: wsd
+  lr_warmup_ratio: 0.10
+  lr_stable_ratio: 0.70
+  lr_decay_ratio: 0.20
   grad_clip: 1.0
   accum: as-needed
-  accumulation_steps: 1
-  target_effective_batch_tokens: 524288
+  accumulation_steps: 5
+  target_effective_batch_tokens: 0
   max_steps: 100000
   epochs: 6
   early_stopping_patience_epochs: 0
@@ -159,6 +166,11 @@ train:
   interval_train_evaluation: true
   checkpoint_interval: 1000
   checkpoint_dir: checkpoints
+  resume_checkpoint_subdir: resume
+  best_checkpoint_subdir: best
+  durable_checkpoint_subdir: durable
+  save_best_checkpoint: true
+  durable_checkpoint_interval_epochs: 5
   keep_step_checkpoints: false
   # CEILING on the EMA decay. The decay actually used is DERIVED from the run's
   # own step horizon (TrainingLoop._resolve_ema_decay) as
@@ -205,3 +217,14 @@ eval:
 
 loss:
   use_fused_cross_entropy: false
+  class_loss_weights:
+    enemy_observed_reconstruction: 1.0
+    enemy_fogged_reconstruction: 1.0
+    enemy_future_prediction: 1.0
+    delimiter: 1.0
+    # 42,862 train windows / 1,740 terminal train windows in the canonical
+    # 870-replay split. This gives [END] approximately the same total weighted
+    # occurrence mass as the once-per-window [WIN]/[LOSS] target.
+    end: 24.633333333333333
+    pad: 0.1
+    win_loss: 1.0

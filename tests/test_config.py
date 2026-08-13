@@ -19,13 +19,14 @@ def test_valid_config_loads() -> None:
     assert config.data.canvas_recon_fraction == 0.5
     assert config.data.within_type_tiebreak == "unit_id"
     assert config.data.feature_statistics_path == "data/processed/feature_statistics.v1.json"
-    assert config.fog.rate_distribution.name == "uniform"
+    assert config.fog.rate_distribution.name == "power"
     assert config.fog.rate_distribution.min == 0.0
     assert config.fog.rate_distribution.max == 0.8
-    assert config.model.d_model == 256
-    assert config.model.layers == 10
-    assert config.model.heads == 4
-    assert config.model.ffn == 1024
+    assert config.fog.rate_distribution.power == 2.0
+    assert config.model.d_model == 384
+    assert config.model.layers == 12
+    assert config.model.heads == 6
+    assert config.model.ffn == 1536
     assert config.model.qk_norm is True
     assert config.model.self_conditioning is True
     assert config.model.gradient_checkpointing is False
@@ -46,10 +47,11 @@ def test_valid_config_loads() -> None:
     assert config.model.rope_scaling.original_max_position_embeddings == 8192
     assert config.diffusion.process == "uniform"
     assert config.diffusion.schedule.name == "linear"
-    assert config.diffusion.schedule.t_distribution == "uniform"
+    assert config.diffusion.schedule.t_distribution == "power"
+    assert config.diffusion.schedule.t_distribution_power == 2.0
     assert config.diffusion.schedule.min == 0.0
     assert config.diffusion.schedule.max == 1.0
-    assert config.diffusion.schedule.t_one_fraction == 0.0
+    assert config.diffusion.schedule.t_one_fraction == 0.05
     assert config.storage.data_uri == "data/processed/quickstart"
     assert config.storage.raw_uri == "data/raw/replays"
     assert config.storage.checkpoint_uri == "checkpoints"
@@ -77,14 +79,15 @@ def test_valid_config_loads() -> None:
     assert config.train.weight_decay == 0.1
     assert config.train.adam_eps == 1e-8
     assert config.train.warmup == 2000
-    assert config.train.lr_floor_ratio == 0.1
-    # cosine is the DEFAULT shape so adding the knob changed no existing profile;
-    # configs/local_overfit_v2.yaml is the only file that opts into "linear".
-    assert config.train.lr_decay_shape == "cosine"
+    assert config.train.lr_floor_ratio == 0.01
+    assert config.train.lr_schedule == "wsd"
+    assert config.train.lr_warmup_ratio == 0.10
+    assert config.train.lr_stable_ratio == 0.70
+    assert config.train.lr_decay_ratio == 0.20
     assert config.train.grad_clip == 1.0
     assert config.train.accum == "as-needed"
-    assert config.train.accumulation_steps == 1
-    assert config.train.target_effective_batch_tokens == 524288
+    assert config.train.accumulation_steps == 5
+    assert config.train.target_effective_batch_tokens == 0
     assert config.train.max_steps == 100000
     assert config.train.epochs == 6
     assert config.train.early_stopping_patience_epochs == 0
@@ -92,6 +95,11 @@ def test_valid_config_loads() -> None:
     assert config.train.val_interval == 1000
     assert config.train.checkpoint_interval == 1000
     assert config.train.checkpoint_dir == "checkpoints"
+    assert config.train.resume_checkpoint_subdir == "resume"
+    assert config.train.best_checkpoint_subdir == "best"
+    assert config.train.durable_checkpoint_subdir == "durable"
+    assert config.train.save_best_checkpoint is True
+    assert config.train.durable_checkpoint_interval_epochs == 5
     # ema_decay is now a CEILING on a run-derived decay, and ema_horizon_ratio is
     # what sizes the EMA window to the run. 0.9999 is a 10,000-step window, so at
     # ratio 0.1 a run of 100,000+ steps sits exactly at the old fixed behavior.
@@ -117,10 +125,11 @@ def test_valid_config_loads() -> None:
     assert config.eval.timing_tolerance_buckets == 1
     assert config.eval.fog_rate == 0.0
     assert config.loss.use_fused_cross_entropy is False
-    # Per-class loss weighting is likewise fine-tuning-only; pre-training uses
-    # fully uniform published-MDLM-style weighting instead (see
-    # CanvasCrossEntropyLoss.__init__), so this section must be absent too.
-    assert config.loss.class_loss_weights is None
+    # Per-class loss weighting is shared by both modes.
+    assert config.loss.class_loss_weights is not None
+    assert config.loss.class_loss_weights.pad == 0.1
+    assert config.loss.class_loss_weights.end == pytest.approx(24.633333333333333)
+    assert config.loss.class_loss_weights.win_loss == 1.0
 
 
 def test_local_profiles_extend_default_with_profile_specific_self_conditioning() -> None:
@@ -159,7 +168,7 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert overfit.train.warmup == 40
     assert overfit.train.warmup < 34 * overfit.train.epochs
     # max_steps 0 is what makes the cosine horizon DERIVED rather than fixed:
-    # train_pipeline injects len(train_loader) * epochs as train.max_steps, which
+    # train_pipeline injects optimizer_steps_per_epoch * epochs, which
     # is the horizon _lr_multiplier decays over. A non-zero value here would pin
     # the schedule to a step count unrelated to the configured epoch budget.
     assert overfit.train.max_steps == 0
@@ -178,10 +187,11 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert overfit_v2.train.interval_train_evaluation is False
     assert load_config(DEFAULT_CONFIG).train.interval_train_evaluation is True
     assert full.train.interval_train_evaluation is True
-    # overfit / overfit_v2 are PRE-TRAINING profiles (data.debut_mode=false,
-    # inherited from config/default.yaml): class_loss_weights is a
-    # fine-tuning-only section and must be None here, not populated.
-    assert overfit.loss.class_loss_weights is None
+    # Historical profiles explicitly pin their original unit pretraining
+    # weights so the new canonical defaults do not rewrite old experiments.
+    assert overfit.loss.class_loss_weights is not None
+    assert overfit.loss.class_loss_weights.pad == 1.0
+    assert overfit.loss.class_loss_weights.end == 1.0
     assert overfit.fog is not None
     assert overfit.train.max_cuda_reserved_gb == 7.5
     assert overfit.model.gradient_checkpointing is True
@@ -195,18 +205,19 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     # shallower-than-cosine slope and end at a lower floor (0.03 * 3.0e-4 =
     # 9.0e-6 instead of 3.0e-5), to stop the late-training loss curve hovering
     # around a minimum. Warmup is unchanged, so only the decay differs.
-    assert overfit_v2.train.lr_decay_shape == "linear"
+    assert overfit_v2.train.lr_schedule == "linear"
     assert overfit_v2.train.lr_floor_ratio == 0.03
     assert overfit_v2.train.warmup == overfit.train.warmup
     # local_overfit.yaml (V1) and local_full.yaml keep the inherited cosine/0.1.
-    assert overfit.train.lr_decay_shape == "cosine"
+    assert overfit.train.lr_schedule == "cosine"
     assert overfit.train.lr_floor_ratio == 0.1
-    assert full.train.lr_decay_shape == "cosine"
+    assert full.train.lr_schedule == "cosine"
     assert full.train.lr_floor_ratio == 0.1
     # V2 inherits the explicit selection unchanged; only output paths differ.
     assert overfit_v2.pipeline.train_replay_ids == overfit.pipeline.train_replay_ids
     assert overfit_v2.pipeline.dev_replay_ids == overfit.pipeline.dev_replay_ids
-    assert overfit_v2.loss.class_loss_weights is None
+    assert overfit_v2.loss.class_loss_weights is not None
+    assert overfit_v2.loss.class_loss_weights.pad == 1.0
     assert overfit_v2.fog is not None
     assert overfit_v2.storage.checkpoint_uri == "checkpoints/local-overfitV2"
     assert overfit_v2.storage.log_uri == "tests/output/overfitV2"
@@ -231,17 +242,16 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert full.eval.debut_max_examples == 0
     for config in (overfit, overfit_v2, full):
         assert config.diffusion.process == "uniform"
+        assert config.diffusion.schedule.t_distribution == "uniform"
+        assert config.diffusion.schedule.t_distribution_power == 1.0
         assert config.diffusion.schedule.t_one_fraction == 0.0
+        assert config.fog.rate_distribution.name == "uniform"
+        assert config.fog.rate_distribution.power == 1.0
         assert config.model.self_conditioning is True
         assert config.train.self_cond_prob == 0.5
         assert config.train.confidence_loss_weight == 0.0
-
     # local_overfit_v2_finetune.yaml is the FINE-TUNING profile
-    # (data.debut_mode=true): the opposite requirement applies -- `fog` and
-    # `loss.class_loss_weights` must be POPULATED (required, not merely
-    # allowed), carrying forward the old pre-refactor effective values
-    # (including the pad: 0.2 override that used to live in
-    # local_overfit_v2.yaml before pre-training dropped class weighting).
+    # (data.debut_mode=true), preserving its historical pad: 0.2 override.
     finetune = load_config(root / "configs" / "local_overfit_v2_finetune.yaml")
     assert finetune.data.debut_mode is True
     assert finetune.fog is not None
@@ -287,8 +297,48 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     assert ablation_baseline.storage.log_uri == overfit_v2.storage.log_uri
     # Everything else about the baseline arm is V2's, unchanged.
     assert ablation_baseline.train.epochs == overfit_v2.train.epochs
-    assert ablation_baseline.train.lr_decay_shape == overfit_v2.train.lr_decay_shape
+    assert ablation_baseline.train.lr_schedule == overfit_v2.train.lr_schedule
     assert ablation_baseline.pipeline.train_replay_ids == overfit_v2.pipeline.train_replay_ids
+
+
+def test_small_training_v3_owns_the_full_run_contract() -> None:
+    config = load_config(DEFAULT_CONFIG.parents[1] / "configs" / "smallTrainingTestV3.yaml")
+
+    assert (config.model.d_model, config.model.layers, config.model.heads, config.model.ffn) == (
+        384,
+        12,
+        6,
+        1536,
+    )
+    assert config.model.d_model // config.model.heads == 64
+    assert config.train.lr == pytest.approx(3e-4)
+    assert config.train.lr_floor_ratio == pytest.approx(0.01)
+    assert config.train.lr_schedule == "wsd"
+    assert (
+        config.train.lr_warmup_ratio,
+        config.train.lr_stable_ratio,
+        config.train.lr_decay_ratio,
+    ) == pytest.approx((0.10, 0.70, 0.20))
+    assert config.train.epochs == 50
+    assert config.train.early_stopping_patience_epochs == 10
+    assert config.train.accumulation_steps == 5
+    assert config.train.target_effective_batch_tokens == 0
+    assert config.train.checkpoint_interval == 100
+    assert config.train.resume_checkpoint_subdir == "resume"
+    assert config.train.best_checkpoint_subdir == "best"
+    assert config.train.durable_checkpoint_subdir == "durable"
+    assert config.train.durable_checkpoint_interval_epochs == 5
+    assert config.train.interval_dev_evaluation is False
+    assert config.train.interval_train_evaluation is False
+    assert config.fog.rate_distribution.name == "power"
+    assert config.fog.rate_distribution.power == 2.0
+    assert config.diffusion.schedule.t_distribution == "power"
+    assert config.diffusion.schedule.t_distribution_power == 2.0
+    assert config.diffusion.schedule.t_one_fraction == pytest.approx(0.05)
+    assert config.loss.class_loss_weights.pad == pytest.approx(0.1)
+    assert config.loss.class_loss_weights.end == pytest.approx(42862 / 1740)
+    assert config.storage.checkpoint_uri == "tests/output/smallTrainingTestV3/checkpoints"
+    assert config.storage.log_uri == "tests/output/smallTrainingTestV3/metrics"
 
 
 #: The five ablation arm profiles, in sweep order. Each extends
@@ -324,7 +374,7 @@ def test_ablation_arms_inherit_the_overfit_v2_run_length_and_lr_schedule() -> No
         assert arm.train.max_steps == 0, name
         assert arm.train.lr == baseline.train.lr, name
         assert arm.train.warmup == baseline.train.warmup, name
-        assert arm.train.lr_decay_shape == baseline.train.lr_decay_shape, name
+        assert arm.train.lr_schedule == baseline.train.lr_schedule, name
         assert arm.train.lr_floor_ratio == baseline.train.lr_floor_ratio, name
         assert arm.train.ema_decay == baseline.train.ema_decay, name
         assert arm.train.ema_horizon_ratio == baseline.train.ema_horizon_ratio, name
@@ -423,7 +473,7 @@ def test_memorization_arms_isolate_their_knobs_against_the_shared_v2_schedule() 
         assert arm.train.max_steps == 0, name
         assert arm.train.lr == baseline.train.lr, name
         assert arm.train.warmup == baseline.train.warmup, name
-        assert arm.train.lr_decay_shape == baseline.train.lr_decay_shape, name
+        assert arm.train.lr_schedule == baseline.train.lr_schedule, name
         assert arm.train.lr_floor_ratio == baseline.train.lr_floor_ratio, name
         assert arm.train.ema_decay == baseline.train.ema_decay, name
         assert arm.train.ema_horizon_ratio == baseline.train.ema_horizon_ratio, name
@@ -553,7 +603,7 @@ def test_memorization_sweep_driver_step_constants_match_the_configured_run_lengt
     assert not any("--max-steps" in line for line in launch), "\n".join(launch)
 
 
-def test_lr_decay_shape_and_ema_horizon_are_range_checked(tmp_path: Path) -> None:
+def test_lr_schedule_wsd_ratios_and_ema_horizon_are_range_checked(tmp_path: Path) -> None:
     """An unusable schedule value must fail at load, not mid-run."""
 
     # The whole default config is dumped standalone (no `extends`), so the probe
@@ -566,17 +616,18 @@ def test_lr_decay_shape_and_ema_horizon_are_range_checked(tmp_path: Path) -> Non
         path.write_text(yaml.safe_dump(raw), encoding="utf-8")
         load_config(path)
 
-    with pytest.raises(ConfigError, match="lr_decay_shape"):
-        load_with(lr_decay_shape="exponential")
+    with pytest.raises(ConfigError, match="lr_schedule"):
+        load_with(lr_schedule="exponential")
     with pytest.raises(ConfigError, match="ema_horizon_ratio"):
         load_with(ema_horizon_ratio=0.0)
     with pytest.raises(ConfigError, match="ema_horizon_ratio"):
         load_with(ema_horizon_ratio=1.5)
     with pytest.raises(ConfigError, match="lr_floor_ratio"):
         load_with(lr_floor_ratio=-0.1)
-    # Both legal shapes must load.
-    load_with(lr_decay_shape="linear")
-    load_with(lr_decay_shape="cosine")
+    with pytest.raises(ConfigError, match="phase ratios"):
+        load_with(lr_warmup_ratio=0.2)
+    for schedule in ("linear", "cosine", "wsd"):
+        load_with(lr_schedule=schedule)
 
 
 def test_toggle_fingerprint_is_empty_at_baseline_and_sorted_when_enabled() -> None:
@@ -642,10 +693,10 @@ def test_toggle_fingerprint_is_empty_at_baseline_and_sorted_when_enabled() -> No
     assert "baseline" + toggle_fingerprint(baseline) == "baseline"
 
 
-def test_fog_is_required_in_both_modes_and_pretraining_rejects_class_weights(
+def test_fog_and_class_weights_are_required_in_both_modes(
     tmp_path: Path,
 ) -> None:
-    """Fog is shared; only configurable class weighting stays fine-tune-only."""
+    """Fog and class weighting are shared by pretraining and fine-tuning."""
 
     base = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
     assert base["data"]["debut_mode"] is False
@@ -657,23 +708,11 @@ def test_fog_is_required_in_both_modes_and_pretraining_rejects_class_weights(
     with pytest.raises(ConfigError, match=r"config\.fog is required"):
         load_config(fog_path)
 
-    # Pre-training config carrying `loss.class_loss_weights` -> rejected.
-    with_weights = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
-    with_weights["loss"]["class_loss_weights"] = {
-        "enemy_observed_reconstruction": 1.0,
-        "enemy_fogged_reconstruction": 1.0,
-        "enemy_future_prediction": 1.0,
-        "delimiter": 1.0,
-        "end": 1.0,
-        "pad": 0.2,
-        "win_loss": 1.0,
-    }
-    weights_path = tmp_path / "pretrain_with_weights.yaml"
-    weights_path.write_text(yaml.safe_dump(with_weights), encoding="utf-8")
-    with pytest.raises(
-        ConfigError,
-        match=r"config\.loss\.class_loss_weights must not be set when data\.debut_mode=false",
-    ):
+    missing_weights = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    missing_weights["loss"].pop("class_loss_weights")
+    weights_path = tmp_path / "pretrain_missing_weights.yaml"
+    weights_path.write_text(yaml.safe_dump(missing_weights), encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"class_loss_weights is required"):
         load_config(weights_path)
 
     # Debut mode also requires fog plus its class weights.
@@ -687,14 +726,15 @@ def test_fog_is_required_in_both_modes_and_pretraining_rejects_class_weights(
 
     debut_missing_weights = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
     debut_missing_weights["data"]["debut_mode"] = True
+    debut_missing_weights["loss"].pop("class_loss_weights")
     debut_missing_weights["fog"] = {
-        "rate_distribution": {"name": "uniform", "min": 0.0, "max": 0.8}
+        "rate_distribution": {"name": "uniform", "min": 0.0, "max": 0.8, "power": 1.0}
     }
     debut_weights_path = tmp_path / "debut_missing_weights.yaml"
     debut_weights_path.write_text(yaml.safe_dump(debut_missing_weights), encoding="utf-8")
     with pytest.raises(
         ConfigError,
-        match=r"config\.loss\.class_loss_weights is required when data\.debut_mode=true",
+        match=r"class_loss_weights is required",
     ):
         load_config(debut_weights_path)
 

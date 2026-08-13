@@ -11,6 +11,10 @@ def test_windows_launchers_are_thin_config_driven_wrappers() -> None:
         # was reworked (no-input pre-training); its output dir is versioned too
         # so old smallTrainingTest results are never mixed with new runs.
         "smallTrainingTestV2.bat": ("configs\\local_full.yaml", "smalltrainingtestv2"),
+        "smallTrainingTestV3.bat": (
+            "configs\\smallTrainingTestV3.yaml",
+            "smalltrainingtestv3",
+        ),
     }
     for filename, (config_path, output_dir) in expected.items():
         text = (ROOT / "tests" / filename).read_text(encoding="utf-8").lower()

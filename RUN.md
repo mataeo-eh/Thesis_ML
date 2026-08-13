@@ -44,6 +44,10 @@ uv run thesis-ml-train --config configs/local_overfit_v2.yaml
 uv run thesis-ml-train --config configs/local_full.yaml
 ```
 
+The current full-corpus V3 run is launched on Windows with
+`tests\smallTrainingTestV3.bat`; its console log, metrics, cache, and checkpoint
+families are isolated below `tests\output\smallTrainingTestV3\`.
+
 On Windows, equivalent thin launchers write console output and run artifacts to
 `tests\output\overfitV2\` and `tests\output\smallTrainingTestV2\`:
 
@@ -83,7 +87,7 @@ All input/output locations are in `config/default.yaml`:
 - `pipeline.prepare_feature_statistics`: explicit permission to compute or
   replace the feature-statistics artifact; default `false` fails if it is absent.
 - `fog.rate_distribution`: one enemy-content omission rate sampled per example
-  for the clamped input in both pre-training and fine-tuning.
+  for the clamped input; `power: 2` is a scaled `Beta(2,1)` draw favoring high omission.
 - Debut fine-tuning uses a separate manifest: input windows tile whole
   timesteps under `input_budget_tokens` only, while each output runs from its
   input-window start to replay end or the canvas budget and may overlap the
@@ -91,7 +95,9 @@ All input/output locations are in `config/default.yaml`:
 - `pipeline.replay_subset_size`: seeded training-replay subset (`0` means all).
 - `pipeline.train_replay_count`: when positive, use an exact count split with this many train replays, `validation_replay_count` dev replays, and every remainder in test; `0` keeps fraction-based splitting.
 - `train.epochs`: used when `train.max_steps` is `0`.
-- `train.early_stopping_patience_epochs`: consecutive sub-threshold epochs before stopping (`0` disables).
+- `train.lr_schedule`: `wsd`, `cosine`, or `linear`; WSD phase ratios and floor are separately configurable.
+- `train.accumulation_steps`: microbatches per optimizer step; epoch-derived horizons count optimizer steps.
+- `train.early_stopping_patience_epochs`: consecutive dev-loss epochs below the relative-improvement threshold before stopping (`0` disables).
 - `train.early_stopping_min_relative_improvement`: relative improvement required to reset patience.
 - `train.max_cuda_reserved_gb`: reclaim-first CUDA allocator reservation ceiling (`0` disables). Reaching it releases unused cached blocks and aborts only if the post-trim reservation remains at or above the limit; the overfit profile uses 7.5 GiB.
 - `model.gradient_checkpointing`: recompute transformer blocks during backward to bound saved-activation memory; enabled for the local overfit profile after measured RTX 3070 spillover.
@@ -130,11 +136,13 @@ For training:
 uv run thesis-ml-train --config config/default.yaml
 ```
 
-Spot instances are safe to use: every `train.checkpoint_interval` steps the run
-overwrites and uploads `last.pt` to `storage.checkpoint_uri`, and on startup it
-pulls `last.pt` back from that URI before falling back to a local checkpoint. A
+Spot instances are safe to use: every `train.checkpoint_interval` optimizer steps the run
+overwrites and uploads `resume/last.pt` below `storage.checkpoint_uri`, and on startup it
+pulls that file back before falling back to a local checkpoint. A
 fresh replacement instance pointed at the same S3 prefix therefore resumes where
-the preempted one left off, losing at most one checkpoint interval. Set
+the preempted one left off, losing at most one checkpoint interval. Best-dev
+epoch checkpoints and durable epoch milestones occupy separately configured
+`best/` and `durable/` subdirectories. Set
 `train.keep_step_checkpoints: true` to also retain timestamped `step-N.pt`
 snapshots (otherwise only the rolling `last.pt` is kept, so disk/S3 stays flat).
 

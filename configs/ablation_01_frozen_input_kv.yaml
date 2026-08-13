@@ -22,7 +22,7 @@ extends: local_overfit_v2.yaml
 #
 #   - The LR horizon is DERIVED from the config, not from a cap. With
 #     `max_steps: 0` inherited, train_pipeline injects
-#     len(train_loader) * train.epochs = 3400 as train.max_steps, and the linear
+#     optimizer_steps_per_epoch * train.epochs = 3400 as train.max_steps, and the linear
 #     decay runs from the 3.0e-4 peak down to the 0.03 * 3.0e-4 = 9.0e-6 floor
 #     across exactly those 3400 steps. A `--max-steps 3400` cap on a 150-epoch
 #     config (the previous arrangement, matching a baseline that had itself been

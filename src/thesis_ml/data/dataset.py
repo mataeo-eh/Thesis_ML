@@ -259,9 +259,14 @@ class SC2DiffusionDataset(Dataset[DatasetExample]):
         if self.fog_rate_override is not None:
             return self.fog_rate_override
         distribution = self.config.fog.rate_distribution
-        if distribution.name != "uniform":
+        unit_draw = float(rng.random())
+        if distribution.name == "uniform":
+            shaped = unit_draw
+        elif distribution.name == "power":
+            shaped = unit_draw ** (1.0 / distribution.power)
+        else:
             raise ValueError(f"unsupported fog distribution: {distribution.name}")
-        return float(rng.uniform(distribution.min, distribution.max))
+        return float(distribution.min + shaped * (distribution.max - distribution.min))
 
 
 def _build_artifact_input(

@@ -1,9 +1,9 @@
 """Typed project configuration loaded from YAML."""
 
-import types
+import math
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
-from typing import Any, TypeVar, Union, get_args, get_origin, get_type_hints
+from typing import Any, TypeVar, get_type_hints
 
 import yaml
 
@@ -15,10 +15,20 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True)
-class UniformDistributionConfig:
+class RateDistributionConfig:
     name: str
     min: float
     max: float
+    # Shape parameter for the configurable high-end-skewed ``power`` law.
+    # ``power=2`` is Beta(2, 1): x = U ** (1 / power). Uniform sampling ignores
+    # this field, but it remains explicit so every merged YAML has one schema.
+    power: float = 1.0
+
+
+# Backward-compatible import name for direct test/utility construction. The
+# runtime type is no longer uniform-only, but external callers from before the
+# configurable power law should not break merely because the schema widened.
+UniformDistributionConfig = RateDistributionConfig
 
 
 @dataclass(frozen=True)
@@ -41,7 +51,7 @@ class DataConfig:
 
 @dataclass(frozen=True)
 class FogConfig:
-    rate_distribution: UniformDistributionConfig
+    rate_distribution: RateDistributionConfig
 
 
 @dataclass(frozen=True)
@@ -101,10 +111,11 @@ class DiffusionScheduleConfig:
     # Fraction of training examples that get OVERSAMPLED to t=1.0 exactly each
     # epoch, applied per-example as an independent Bernoulli draw (so this is
     # the fraction "in expectation", not an exact per-batch count). The
-    # remaining (1 - t_one_fraction) of examples keep the existing uniform
+    # remaining (1 - t_one_fraction) of examples keep the configured continuous
     # draw over [min, max]. Must be a probability, so it is range-checked to
     # [0, 1] by `_validate_diffusion` after the config tree is built.
     t_one_fraction: float
+    t_distribution_power: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -201,24 +212,13 @@ class TrainConfig:
     adam_eps: float
     warmup: int
     lr_floor_ratio: float
-    # Shape of the post-warmup learning-rate decay, from the peak `lr` down to
-    # `lr * lr_floor_ratio` over the run's derived step horizon (see
-    # `TrainingLoop._lr_multiplier`). Both shapes start at the peak and land on
-    # the floor at exactly the last step; they differ in HOW they get there.
-    #
-    #   "cosine" -- half-cosine. Lingers near the peak for the first ~15% of the
-    #               decay, drops fastest through the middle (its steepest slope
-    #               is pi/2 ~= 1.57x the straight-line slope), then flattens into
-    #               a long tail at the floor.
-    #   "linear" -- one constant slope. Leaves the peak immediately, so less of
-    #               the run is spent at the highest rate, and that same constant
-    #               slope is SHALLOWER through the middle of training than the
-    #               cosine's steepest section. Pair it with a lower
-    #               `lr_floor_ratio` to also end the run at a smaller rate; the
-    #               combination is the intended remedy for a loss curve that
-    #               hovers around a minimum instead of settling into it, because
-    #               the end-of-run gradient-noise floor scales with the final lr.
-    lr_decay_shape: str
+    # Complete scheduler choice. ``cosine`` and ``linear`` retain the legacy
+    # step-count warmup followed immediately by decay. ``wsd`` instead divides
+    # the optimizer-step horizon into the three configurable ratios below.
+    lr_schedule: str
+    lr_warmup_ratio: float
+    lr_stable_ratio: float
+    lr_decay_ratio: float
     grad_clip: float
     accum: str
     accumulation_steps: int
@@ -269,6 +269,11 @@ class TrainConfig:
     interval_train_evaluation: bool
     checkpoint_interval: int
     checkpoint_dir: str
+    resume_checkpoint_subdir: str
+    best_checkpoint_subdir: str
+    durable_checkpoint_subdir: str
+    save_best_checkpoint: bool
+    durable_checkpoint_interval_epochs: int
     # When False (default), each periodic checkpoint overwrites a single
     # `last.pt` so disk/S3 usage stays flat over a multi-day run. When True,
     # every interval also keeps a timestamped `step-N.pt` snapshot.
@@ -356,20 +361,15 @@ class ClassLossWeightsConfig:
     delimiter: float
     end: float
     pad: float
-    # Fine-tune win/loss outcome class weight (class id 6). Pretraining also
-    # emits class id 6 but uses its fixed uniform weighting instead.
+    # Win/loss outcome class weight (class id 6) in both training modes.
     win_loss: float
 
 
 @dataclass(frozen=True)
 class LossConfig:
     use_fused_cross_entropy: bool
-    # Per-class loss weighting is a FINE-TUNING-ONLY concern (pre-training uses
-    # uniform published-style MDLM loss with no dead knobs). Optional here so a
-    # pre-training config can omit the `class_loss_weights` section entirely;
-    # `_validate_debut_mode_sections` enforces presence/absence based on
-    # `data.debut_mode` after the config tree is built.
-    class_loss_weights: ClassLossWeightsConfig | None
+    # Shared pretraining/fine-tuning class weights.
+    class_loss_weights: ClassLossWeightsConfig
 
 
 @dataclass(frozen=True)
@@ -395,7 +395,7 @@ def load_config(path: str | Path) -> ProjectConfig:
     _validate_train(config)
     _validate_diffusion(config)
     _validate_sampler(config)
-    _validate_debut_mode_sections(config)
+    _validate_shared_training_sections(config)
     return config
 
 
@@ -499,50 +499,11 @@ def _build_dataclass(cls: type[T], raw: Any, path: str) -> T:
     for field in fields(cls):
         field_path = f"{path}.{field.name}"
         expected_type = hints[field.name]
-        # Fine-tuning-only sections (e.g. `fog`, `loss.class_loss_weights`) are
-        # typed `X | None` so a config file may omit the key entirely (missing
-        # from `raw`) instead of the caller being forced to write an unused
-        # placeholder. A field is only ALLOWED to be missing when its type
-        # says so; every other field keeps the old strict "required" behavior.
-        # Presence/absence relative to `data.debut_mode` is enforced
-        # separately by `_validate_debut_mode_sections` after the whole
-        # config tree is built (that check needs sibling fields, which are
-        # not available yet at this per-field build step).
-        is_optional, inner_type = _optional_inner_type(expected_type)
         if field.name not in raw:
-            if is_optional:
-                values[field.name] = None
-                continue
             raise ConfigError(f"{field_path} is required")
-        value = raw[field.name]
-        if is_optional and value is None:
-            values[field.name] = None
-            continue
-        values[field.name] = _validate_value(inner_type, value, field_path)
+        values[field.name] = _validate_value(expected_type, raw[field.name], field_path)
 
     return cls(**values)
-
-
-def _optional_inner_type(expected_type: Any) -> tuple[bool, Any]:
-    """Detect an `X | None` (i.e. Optional[X]) type hint.
-
-    Dataclass field annotations written as `X | None` are resolved by
-    `get_type_hints` to a `types.UnionType` (PEP 604 syntax), which is a
-    DIFFERENT object from `typing.Union` (what `Optional[X]` resolves to).
-    Both spellings are checked here so either would work; this project uses
-    the `X | None` spelling.
-
-    Returns (True, X) if expected_type is exactly a two-armed union with
-    NoneType as one arm; otherwise returns (False, expected_type) unchanged so
-    every other field type is validated exactly as before.
-    """
-    origin = get_origin(expected_type)
-    if origin is Union or origin is types.UnionType:
-        args = get_args(expected_type)
-        non_none = [arg for arg in args if arg is not type(None)]
-        if len(args) == 2 and len(non_none) == 1:
-            return True, non_none[0]
-    return False, expected_type
 
 
 # Plain dataclasses plus manual validation keeps this early config contract stable.
@@ -573,20 +534,16 @@ def _validate_value(expected_type: type[Any], value: Any, path: str) -> Any:
     raise TypeError(f"unsupported config field type at {path}: {expected_type!r}")
 
 
-#: The learning-rate decay shapes `TrainingLoop._lr_multiplier` knows how to
-#: build. Kept here so a typo in YAML fails at config load with the list of
-#: legal values, rather than silently falling through to a default shape
-#: hundreds of optimizer steps into a run.
-LR_DECAY_SHAPES = ("cosine", "linear")
+#: Complete learning-rate schedules `TrainingLoop._lr_multiplier` implements.
+LR_SCHEDULES = ("cosine", "linear", "wsd")
 
 
 def _validate_train(config: ProjectConfig) -> None:
-    """Range-check the learning-rate decay shape and the EMA horizon knobs.
+    """Range-check the learning-rate schedule, accumulation, and run controls.
 
-    Both settings are read once per run by `TrainingLoop` -- the decay shape by
-    `_lr_multiplier` and the EMA horizon by `_resolve_ema_decay` -- and neither
-    has a meaningful fallback, so an out-of-range value must stop the launch
-    instead of quietly changing what the run trains at.
+    These settings are read once per run by `TrainingLoop` and have no meaningful
+    fallback, so invalid values must stop the launch instead of quietly changing
+    what the run trains at.
 
     Parameters:
         config: the fully built `ProjectConfig` to check.
@@ -598,10 +555,10 @@ def _validate_train(config: ProjectConfig) -> None:
     """
 
     train = config.train
-    if train.lr_decay_shape not in LR_DECAY_SHAPES:
+    if train.lr_schedule not in LR_SCHEDULES:
         raise ConfigError(
-            "train.lr_decay_shape must be one of "
-            f"{list(LR_DECAY_SHAPES)}, got {train.lr_decay_shape!r}"
+            "train.lr_schedule must be one of "
+            f"{list(LR_SCHEDULES)}, got {train.lr_schedule!r}"
         )
     if not (0.0 <= train.lr_floor_ratio <= 1.0):
         raise ConfigError(
@@ -614,6 +571,49 @@ def _validate_train(config: ProjectConfig) -> None:
         )
     if not (0.0 <= train.ema_decay <= 1.0):
         raise ConfigError(f"train.ema_decay must be in [0, 1], got {train.ema_decay}")
+    ratios = (train.lr_warmup_ratio, train.lr_stable_ratio, train.lr_decay_ratio)
+    if any(value < 0.0 or value > 1.0 for value in ratios):
+        raise ConfigError("train WSD phase ratios must each be in [0, 1]")
+    if train.lr_schedule == "wsd" and not math.isclose(sum(ratios), 1.0, abs_tol=1e-9):
+        raise ConfigError(
+            "train WSD phase ratios must sum to 1.0, got "
+            f"{sum(ratios):.12g}"
+        )
+    if train.accumulation_steps < 1:
+        raise ConfigError("train.accumulation_steps must be >= 1")
+    if train.target_effective_batch_tokens < 0:
+        raise ConfigError("train.target_effective_batch_tokens must be >= 0")
+    if train.early_stopping_patience_epochs < 0:
+        raise ConfigError("train.early_stopping_patience_epochs must be >= 0")
+    if not (0.0 <= train.early_stopping_min_relative_improvement < 1.0):
+        raise ConfigError(
+            "train.early_stopping_min_relative_improvement must be in [0, 1)"
+        )
+    if train.durable_checkpoint_interval_epochs < 0:
+        raise ConfigError("train.durable_checkpoint_interval_epochs must be >= 0")
+    for field_name in (
+        "resume_checkpoint_subdir",
+        "best_checkpoint_subdir",
+        "durable_checkpoint_subdir",
+    ):
+        value = getattr(train, field_name)
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise ConfigError(f"train.{field_name} must be a safe relative path")
+    active_checkpoint_dirs = [train.resume_checkpoint_subdir.strip()]
+    if train.save_best_checkpoint:
+        if not train.best_checkpoint_subdir.strip():
+            raise ConfigError("train.best_checkpoint_subdir is required when saving best checkpoints")
+        active_checkpoint_dirs.append(train.best_checkpoint_subdir.strip())
+    if train.durable_checkpoint_interval_epochs > 0:
+        if not train.durable_checkpoint_subdir.strip():
+            raise ConfigError(
+                "train.durable_checkpoint_subdir is required when retaining durable checkpoints"
+            )
+        active_checkpoint_dirs.append(train.durable_checkpoint_subdir.strip())
+    nonempty_checkpoint_dirs = [value for value in active_checkpoint_dirs if value]
+    if len(set(nonempty_checkpoint_dirs)) != len(nonempty_checkpoint_dirs):
+        raise ConfigError("active train checkpoint subdirectories must be distinct")
 
 
 def _validate_diffusion(config: ProjectConfig) -> None:
@@ -627,11 +627,13 @@ def _validate_diffusion(config: ProjectConfig) -> None:
     schedule = config.diffusion.schedule
     if schedule.name != "linear":
         raise ConfigError(f"diffusion.schedule.name must be 'linear', got {schedule.name!r}")
-    if schedule.t_distribution != "uniform":
+    if schedule.t_distribution not in {"uniform", "power"}:
         raise ConfigError(
-            "diffusion.schedule.t_distribution must be 'uniform', "
+            "diffusion.schedule.t_distribution must be 'uniform' or 'power', "
             f"got {schedule.t_distribution!r}"
         )
+    if schedule.t_distribution_power <= 0.0:
+        raise ConfigError("diffusion.schedule.t_distribution_power must be > 0")
     if not (0.0 <= schedule.min <= schedule.max <= 1.0):
         raise ConfigError(
             "diffusion.schedule min/max must satisfy 0 <= min <= max <= 1, "
@@ -662,27 +664,17 @@ def _validate_sampler(config: ProjectConfig) -> None:
         raise ConfigError("sampler.stability_steps must be at least 1")
 
 
-def _validate_debut_mode_sections(config: ProjectConfig) -> None:
-    """Enforce mode-specific loss weights; fog is shared by both modes.
+def _validate_shared_training_sections(config: ProjectConfig) -> None:
+    """Validate shared fog and class-weight distributions for both modes."""
 
-    Pre-training uses the shared fog distribution but keeps uniform loss
-    weighting. Fine-tuning additionally requires per-class weights.
-
-    This is a small, explicit, mode-conditional cross-field check -- there is
-    no existing conditional validation machinery in this module to extend, so
-    it is added as its own post-construction step run once from
-    `load_config`, after `fog` and `class_loss_weights` have already been
-    parsed as Optional (see `_optional_inner_type`).
-    """
-
-    debut_mode = config.data.debut_mode
-    if debut_mode:
-        if config.loss.class_loss_weights is None:
-            raise ConfigError(
-                "config.loss.class_loss_weights is required when data.debut_mode=true"
-            )
-    else:
-        if config.loss.class_loss_weights is not None:
-            raise ConfigError(
-                "config.loss.class_loss_weights must not be set when data.debut_mode=false"
-            )
+    distribution = config.fog.rate_distribution
+    if distribution.name not in {"uniform", "power"}:
+        raise ConfigError("fog.rate_distribution.name must be 'uniform' or 'power'")
+    if not (0.0 <= distribution.min <= distribution.max <= 1.0):
+        raise ConfigError("fog.rate_distribution must satisfy 0 <= min <= max <= 1")
+    if distribution.power <= 0.0:
+        raise ConfigError("fog.rate_distribution.power must be > 0")
+    weights = config.loss.class_loss_weights
+    for field in fields(weights):
+        if getattr(weights, field.name) < 0.0:
+            raise ConfigError(f"loss.class_loss_weights.{field.name} must be >= 0")

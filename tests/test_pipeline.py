@@ -30,7 +30,7 @@ def test_master_pipeline_smoke_run_writes_checkpoint_and_resumes(tmp_path: Path)
     first = run_training_pipeline(config_path)
     second = run_training_pipeline(config_path)
 
-    checkpoint = tmp_path / "checkpoints" / "last.pt"
+    checkpoint = tmp_path / "checkpoints" / "resume" / "last.pt"
     assert checkpoint.exists()
     assert first.resumed is False
     assert second.resumed is True
@@ -190,7 +190,7 @@ def test_real_manifest_pipeline_uses_workers_and_resumes(tmp_path: Path) -> None
     assert second.resumed is True
     assert second.steps == 1
     assert (tmp_path / "manifest.jsonl").exists()
-    assert (tmp_path / "real-checkpoints" / "last.pt").exists()
+    assert (tmp_path / "real-checkpoints" / "resume" / "last.pt").exists()
     assert (tmp_path / "real-logs" / "epoch_metrics.csv").exists()
     assert (tmp_path / "real-logs" / "replay_selection.json").exists()
 

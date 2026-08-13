@@ -191,6 +191,16 @@ class IntervalMetrics:
     wall_clock_elapsed_seconds: float
 
 
+def optimizer_steps_per_epoch(batches_per_epoch: int, accumulation_steps: int) -> int:
+    """Return optimizer updates produced by one full dataloader epoch."""
+
+    if batches_per_epoch < 0:
+        raise ValueError("batches_per_epoch must be >= 0")
+    if accumulation_steps < 1:
+        raise ValueError("accumulation_steps must be >= 1")
+    return math.ceil(batches_per_epoch / accumulation_steps)
+
+
 def interval_boundaries(batches_per_epoch: int, reports: int = INTERVAL_REPORTS_PER_EPOCH) -> list[int]:
     """Batch indices at which an intra-epoch report fires.
 
@@ -294,7 +304,11 @@ class TrainingLoop:
         # from batch 1. Reset to 0 at each epoch boundary. See fit() for how it
         # drives the resumable batch sampler's skip-ahead.
         self.batches_completed_in_epoch = 0
-        self.best_train_loss = math.inf
+        # `best_dev_loss` owns best-so-far checkpoint replacement. Early
+        # stopping uses a separate thresholded best so any strict improvement
+        # can be retained without letting negligible noise reset patience.
+        self.best_dev_loss = math.inf
+        self.early_stopping_best_dev_loss = math.inf
         self.epochs_without_improvement = 0
         self.elapsed_wall_seconds = 0.0
         self.total_tokens_ingested = 0
@@ -351,14 +365,23 @@ class TrainingLoop:
             batches_per_epoch = len(dataloader)  # type: ignore[arg-type]
         except TypeError as exc:
             raise ValueError("training requires a sized dataloader for progress reporting") from exc
+        optimizer_steps_in_epoch = optimizer_steps_per_epoch(
+            batches_per_epoch,
+            self.config.train.accumulation_steps,
+        )
         if configured_steps > 0:
             target_steps = configured_steps
-            epoch_limit = max(epoch_count, math.ceil(target_steps / max(1, batches_per_epoch)))
+            epoch_limit = max(
+                epoch_count,
+                math.ceil(target_steps / max(1, optimizer_steps_in_epoch)),
+            )
         else:
             if epoch_count < 1:
                 raise ValueError("train.epochs must be >= 1 when train.max_steps is 0")
-            target_steps = batches_per_epoch * epoch_count
+            target_steps = optimizer_steps_in_epoch * epoch_count
             epoch_limit = epoch_count
+        if self.config.train.early_stopping_patience_epochs > 0 and val_dataloader is None:
+            raise ValueError("dev-loss early stopping requires a validation dataloader")
         # Re-fit the EMA averaging window to the step budget THIS run will
         # actually train through, now that it is known. target_steps is used
         # rather than config.train.max_steps so that a run bounded by an explicit
@@ -383,18 +406,18 @@ class TrainingLoop:
         # tiny fraction of base_lr. warmup_end_lr shows the lr at the first step
         # AFTER warmup; if it is far below base_lr, warmup is eating the run.
         base_lr = self.config.train.lr
-        warmup = max(1, self.config.train.warmup)
+        warmup, stable, decay = self._schedule_phase_steps(target_steps)
         print(
-            f"lr_schedule base_lr={base_lr:.3e} warmup_steps={warmup} "
+            f"lr_schedule name={self.config.train.lr_schedule} base_lr={base_lr:.3e} "
+            f"warmup_steps={warmup} stable_steps={stable} decay_steps={decay} "
             f"target_steps={target_steps} "
-            f"decay_shape={self.config.train.lr_decay_shape} "
             f"effective_lr_at_step_1={base_lr * self._lr_multiplier(0):.3e} "
             f"effective_lr_after_warmup={base_lr * self._lr_multiplier(warmup):.3e} "
             f"effective_lr_at_final_step={base_lr * self._lr_multiplier(target_steps):.3e}"
             + (
                 "  [WARNING: warmup >= target_steps -> the run never leaves warmup; "
                 "lower train.warmup]"
-                if warmup >= target_steps
+                if self.config.train.lr_schedule != "wsd" and warmup >= target_steps
                 else ""
             ),
             flush=True,
@@ -1086,12 +1109,17 @@ class TrainingLoop:
                 ),
             )
             self._write_epoch_metrics(epoch_metrics)
+            should_stop = (
+                epoch_metrics.dev_loss is not None
+                and self._should_stop_early(epoch_metrics.dev_loss)
+            )
+            self._save_epoch_checkpoints(epoch_metrics.dev_loss)
             if self.device.type == "cuda" and self.config.train.empty_cuda_cache_after_epoch:
                 torch.cuda.empty_cache()
-            if self._should_stop_early(epoch_metrics.train_loss):
+            if should_stop:
                 print(
                     f"early_stopping=triggered epoch={self.completed_epochs} "
-                    f"best_train_loss={self.best_train_loss:.6f} "
+                    f"best_dev_loss={self.early_stopping_best_dev_loss:.6f} "
                     f"patience={self.config.train.early_stopping_patience_epochs}",
                     flush=True,
                 )
@@ -1102,7 +1130,7 @@ class TrainingLoop:
         if target_steps > 0:
             # Final durable checkpoint + metrics flush so a clean finish leaves
             # the same resumable state a mid-run preemption would.
-            self.save_checkpoint(self.checkpoint_dir / "last.pt")
+            self.save_checkpoint(self.resume_checkpoint_path)
             self._publish_metrics()
         return logs
 
@@ -1215,6 +1243,12 @@ class TrainingLoop:
     def checkpoint_dir(self) -> Path:
         return Path(self.config.train.checkpoint_dir)
 
+    @property
+    def resume_checkpoint_path(self) -> Path:
+        subdir = self.config.train.resume_checkpoint_subdir.strip()
+        root = self.checkpoint_dir / subdir if subdir else self.checkpoint_dir
+        return root / "last.pt"
+
     def save_checkpoint(self, path: str | Path) -> Path:
         checkpoint_path = Path(path)
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1227,7 +1261,8 @@ class TrainingLoop:
                 "global_step": self.global_step,
                 "completed_epochs": self.completed_epochs,
                 "batches_completed_in_epoch": self.batches_completed_in_epoch,
-                "best_train_loss": self.best_train_loss,
+                "best_dev_loss": self.best_dev_loss,
+                "early_stopping_best_dev_loss": self.early_stopping_best_dev_loss,
                 "epochs_without_improvement": self.epochs_without_improvement,
                 "elapsed_wall_seconds": self.elapsed_wall_seconds,
                 "total_tokens_ingested": self.total_tokens_ingested,
@@ -1263,7 +1298,10 @@ class TrainingLoop:
         self.batches_completed_in_epoch = int(
             checkpoint.get("batches_completed_in_epoch", 0)
         )
-        self.best_train_loss = float(checkpoint.get("best_train_loss", math.inf))
+        self.best_dev_loss = float(checkpoint.get("best_dev_loss", math.inf))
+        self.early_stopping_best_dev_loss = float(
+            checkpoint.get("early_stopping_best_dev_loss", math.inf)
+        )
         self.epochs_without_improvement = int(checkpoint.get("epochs_without_improvement", 0))
         self.elapsed_wall_seconds = float(checkpoint.get("elapsed_wall_seconds", 0.0))
         self.total_tokens_ingested = int(checkpoint.get("total_tokens_ingested", 0))
@@ -1278,7 +1316,7 @@ class TrainingLoop:
         (full resume). A full resume is for continuing an interrupted run of
         the SAME training job: it restores the optimizer's momentum/variance
         buffers, the LR-schedule position (`global_step`), and every training
-        counter (`completed_epochs`, `best_train_loss`, etc.) so training
+        counter (`completed_epochs`, best-dev state, etc.) so training
         picks up exactly where it left off.
 
         A "warm start" for fine-tuning is different: we want to begin a BRAND
@@ -1321,7 +1359,7 @@ class TrainingLoop:
         # freshly constructed loop.
         self.ema_model.load_state_dict(checkpoint.get("ema_model", checkpoint["model"]))
         # NOTE: optimizer, scheduler, global_step, completed_epochs,
-        # best_train_loss, epochs_without_improvement, elapsed_wall_seconds,
+        # best-dev state, epochs_without_improvement, elapsed_wall_seconds,
         # total_tokens_ingested, and unique_token_ids_seen are intentionally
         # left untouched here -- that is what makes this a "warm start"
         # rather than a "resume".
@@ -1340,45 +1378,38 @@ class TrainingLoop:
                 f"expected {expected}, got {observed}"
             )
 
+    def _schedule_phase_steps(self, horizon: int) -> tuple[int, int, int]:
+        """Resolve warmup/stable/decay optimizer-step counts for logging/math."""
+
+        horizon = max(1, horizon)
+        if self.config.train.lr_schedule != "wsd":
+            warmup = max(1, self.config.train.warmup)
+            return warmup, 0, max(0, horizon - warmup)
+        warmup = int(round(horizon * self.config.train.lr_warmup_ratio))
+        stable = int(round(horizon * self.config.train.lr_stable_ratio))
+        warmup = max(1, min(horizon, warmup))
+        stable = max(0, min(horizon - warmup, stable))
+        decay = max(0, horizon - warmup - stable)
+        return warmup, stable, decay
+
     def _lr_multiplier(self, step_index: int) -> float:
-        """Return the factor `base_lr` is scaled by at `step_index`.
+        """Return the configured cosine, linear, or WSD LR multiplier."""
 
-        This is the `lr_lambda` handed to the `LambdaLR` scheduler built in
-        `__init__`, so it is called once per `scheduler.step()`. The schedule has
-        two phases:
-
-        1. Linear warmup over `train.warmup` steps, from `base_lr/warmup` up to
-           `base_lr`.
-        2. Decay from `base_lr` down to `base_lr * train.lr_floor_ratio`, spread
-           over the remaining steps of the run's horizon. The horizon is
-           `train.max_steps`, which `train_pipeline._run_real_pipeline` injects
-           as `len(train_loader) * train.epochs` whenever the YAML leaves
-           `max_steps: 0`, so the decay always re-fits itself to the configured
-           epoch budget rather than to a fixed step count.
-
-        `train.lr_decay_shape` selects the decay curve; see
-        `thesis_ml.config.TrainConfig.lr_decay_shape` for what each shape is for.
-
-        Parameters:
-            step_index: 0-based optimizer step the scheduler is producing a rate
-                for.
-
-        Returns:
-            A multiplier in `[lr_floor_ratio, 1.0]` during decay, or in
-            `(0, 1.0]` during warmup.
-
-        Calls: nothing beyond `math`. Reads only `self.config.train`.
-        """
-
-        warmup = max(1, self.config.train.warmup)
-        max_steps = max(warmup + 1, self.config.train.max_steps)
+        max_steps = max(1, self.config.train.max_steps)
+        warmup, stable, decay_steps = self._schedule_phase_steps(max_steps)
         if step_index < warmup:
             return float(step_index + 1) / float(warmup)
-        # `progress` walks 0.0 -> 1.0 across the decay phase, so both shapes
-        # below start exactly at the peak and land exactly on the floor.
-        progress = min(1.0, float(step_index - warmup) / float(max_steps - warmup))
+        if self.config.train.lr_schedule == "wsd":
+            decay_start = warmup + stable
+            if step_index < decay_start or decay_steps <= 0:
+                return 1.0
+            progress = min(1.0, float(step_index - decay_start) / float(decay_steps))
+            return self.config.train.lr_floor_ratio + (1.0 - self.config.train.lr_floor_ratio) * (
+                1.0 - progress
+            )
+        progress = min(1.0, float(step_index - warmup) / float(max(1, max_steps - warmup)))
         floor = self.config.train.lr_floor_ratio
-        if self.config.train.lr_decay_shape == "linear":
+        if self.config.train.lr_schedule == "linear":
             decay = 1.0 - progress
         else:
             decay = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -1487,9 +1518,11 @@ class TrainingLoop:
         interval = self.config.train.checkpoint_interval
         if interval <= 0 or self.global_step % interval != 0:
             return
-        self.save_checkpoint(self.checkpoint_dir / "last.pt")
+        self.save_checkpoint(self.resume_checkpoint_path)
         if self.config.train.keep_step_checkpoints:
-            self.save_checkpoint(self.checkpoint_dir / f"step-{self.global_step}.pt")
+            self.save_checkpoint(
+                self.resume_checkpoint_path.parent / f"step-{self.global_step}.pt"
+            )
         self._publish_metrics()
 
     def _write_metrics_line(self, log: TrainStepLog) -> None:
@@ -1763,15 +1796,43 @@ class TrainingLoop:
         self.unique_token_ids_seen.update(int(token_id) for token_id in unique_batch_tokens.tolist())
         return token_count
 
-    def _should_stop_early(self, train_loss: float) -> bool:
+    def _save_epoch_checkpoints(self, dev_loss: float | None) -> None:
+        """Retain one best-dev checkpoint and immutable epoch milestones."""
+
+        epoch = self.completed_epochs
+        if (
+            self.config.train.save_best_checkpoint
+            and dev_loss is not None
+            and math.isfinite(dev_loss)
+            and dev_loss < self.best_dev_loss
+        ):
+            best_dir = self.checkpoint_dir / self.config.train.best_checkpoint_subdir
+            best_dir.mkdir(parents=True, exist_ok=True)
+            self.best_dev_loss = dev_loss
+            current = self.save_checkpoint(best_dir / f"epoch-{epoch:04d}.pt")
+            # Write the improved checkpoint before removing its predecessor so
+            # a serialization failure never destroys the last known-good best.
+            for prior in best_dir.glob("epoch-*.pt"):
+                if prior != current:
+                    prior.unlink()
+
+        interval = self.config.train.durable_checkpoint_interval_epochs
+        if interval > 0 and epoch > 0 and epoch % interval == 0:
+            durable_dir = self.checkpoint_dir / self.config.train.durable_checkpoint_subdir
+            self.save_checkpoint(durable_dir / f"epoch-{epoch:04d}.pt")
+
+    def _should_stop_early(self, dev_loss: float) -> bool:
         patience = self.config.train.early_stopping_patience_epochs
         if patience <= 0:
             return False
         minimum = self.config.train.early_stopping_min_relative_improvement
         if not 0.0 <= minimum < 1.0:
             raise ValueError("train.early_stopping_min_relative_improvement must be in [0, 1)")
-        if not math.isfinite(self.best_train_loss) or train_loss <= self.best_train_loss * (1.0 - minimum):
-            self.best_train_loss = train_loss
+        if (
+            not math.isfinite(self.early_stopping_best_dev_loss)
+            or dev_loss <= self.early_stopping_best_dev_loss * (1.0 - minimum)
+        ):
+            self.early_stopping_best_dev_loss = dev_loss
             self.epochs_without_improvement = 0
             return False
         self.epochs_without_improvement += 1

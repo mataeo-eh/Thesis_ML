@@ -144,7 +144,7 @@ def _validate_arguments(
         raise ValueError(f"unsupported diffusion process: {process!r}")
     if schedule.name != "linear":
         raise ValueError(f"unsupported diffusion schedule: {schedule.name}")
-    if schedule.t_distribution != "uniform":
+    if schedule.t_distribution not in {"uniform", "power"}:
         raise ValueError(f"unsupported t distribution: {schedule.t_distribution}")
     if mask_token_id != 0:
         raise ValueError("uniform diffusion requires [MASK] to be vocabulary id zero")
@@ -169,8 +169,10 @@ def _resolve_t(
     batch_size = target_canvas.shape[0]
     device = target_canvas.device
     if t is None:
-        uniform_draw = torch.rand(batch_size, device=device, generator=generator)
-        sampled = schedule.min + uniform_draw * (schedule.max - schedule.min)
+        unit_draw = torch.rand(batch_size, device=device, generator=generator)
+        if schedule.t_distribution == "power":
+            unit_draw = unit_draw.pow(1.0 / schedule.t_distribution_power)
+        sampled = schedule.min + unit_draw * (schedule.max - schedule.min)
         if schedule.t_one_fraction > 0.0:
             oversample_draw = torch.rand(batch_size, device=device, generator=generator)
             sampled = torch.where(
