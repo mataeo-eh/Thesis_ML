@@ -8,6 +8,8 @@
 
 - `estimate_context_window.py` owns dataset context-window analysis: it streams parquet metadata plus the two upgrade columns and writes token-length reports to `scripts/output/`.
 - `gpu_smoke_test.py` owns the pre-flight GPU fit/throughput check that fabricates a correctly-shaped random batch (no dataset required) and reports peak VRAM and per-step time.
+- `batch_interference_probe.py` owns the batch-versus-batch interference diagnostic: it restores a finished checkpoint, takes one optimizer step on each batch of a frozen epoch in turn, and records the loss that step causes on every other batch. It writes only to `scripts/output/batch_interference/<arm>/` and never mutates the probed run.
+- `run_batch_interference_probe.sh` owns the sequential launcher that runs that probe across the three `configs/memorization_*.yaml` arms.
 - `output/` holds generated reports (not durable contract material).
 
 ## Local Contracts
@@ -15,6 +17,10 @@
 - Run scripts through `.venv\Scripts\python.exe` from the submodule root.
 - `estimate_context_window.py` derives the default parquet location from the repository layout and must not embed or emit a machine-specific path; prefer repository-relative `--input-dir`/`--pattern`/`--output` overrides.
 - Token accounting stays consistent with the model contract in both modes: input counts self + zero-fog enemy content plus one delimiter per timestep and one terminal `[EOS]`; output counts the `[BOS]`/outcome prefix, enemy content, per-timestep delimiters, and one terminal `[END]`; padding excluded.
+- `batch_interference_probe.py` must stay non-destructive with respect to the run it probes: it constructs its `TrainingLoop` with no metrics paths and no publishers, never calls `fit`, `save_checkpoint`, `scheduler.step`, or the EMA update, and restores a deep-copied model/optimizer snapshot before every probe step. Its restore is verified at the end of each run and the resulting `restore_max_abs_drift` is recorded in `batch_interference_meta.json`; a non-zero drift invalidates the deltas.
+- `batch_interference_probe.py` builds its dataset, split, and batch order by calling `pipeline.train_pipeline`'s own helpers rather than reimplementing them, so the frozen batches match what the run trained on. It loads feature statistics but never recomputes them.
+- Loss measurement defaults to fp32 while the probe's optimizer step keeps the run's configured precision: the step must be faithful, and bf16 cannot resolve the loss change a single late-schedule step produces.
+- Probe console output and JSON provenance render paths inside the checkout relative to the submodule root so captured evidence does not embed machine-specific checkout paths.
 - `gpu_smoke_test.py` requires a visible CUDA device; never infer VRAM from a CPU run. Its fabricated batch must use terminal input `[EOS]`, clamped canvas `[BOS]`, mutable position-1 `[WIN]`/`[LOSS]`, and the same loss mask as production. It derives the live vocabulary width from the configured dictionary unless `--vocab-size` explicitly overrides it.
 
 ## Work Guidance

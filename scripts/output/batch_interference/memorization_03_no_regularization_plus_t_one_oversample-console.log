@@ -1,0 +1,43 @@
+replay_selection=explicit train=10 dev=3 test=930
+batch_cache=cuda bytes=1.78GiB
+probe arm=memorization_03_no_regularization_plus_t_one_oversample checkpoint=checkpoints\memorization\03-no-regularization-plus-t-one\last.pt global_step=3400 completed_epochs=100 batches=34 epoch_index=100 device=cuda resume_lr=9.000e-06 probe_lr=9.000e-06 step_precision=bf16 eval_precision=fp32
+baseline_loss mean=0.467177 min=0.036436 max=1.193644
+step_batch=0/33 self_delta=+2.967715e-04 mean_other_delta=-1.488671e-05 others_hurt=14/33 elapsed=316s
+step_batch=1/33 self_delta=+7.887781e-04 mean_other_delta=-1.396555e-05 others_hurt=14/33 elapsed=412s
+step_batch=2/33 self_delta=+6.265342e-04 mean_other_delta=-1.068741e-05 others_hurt=17/33 elapsed=509s
+step_batch=3/33 self_delta=+5.897582e-04 mean_other_delta=-3.679277e-05 others_hurt=16/33 elapsed=605s
+step_batch=4/33 self_delta=+1.029313e-03 mean_other_delta=-1.912575e-05 others_hurt=16/33 elapsed=702s
+step_batch=5/33 self_delta=+5.718470e-04 mean_other_delta=-2.422308e-05 others_hurt=16/33 elapsed=798s
+step_batch=6/33 self_delta=+1.780242e-04 mean_other_delta=-1.728117e-05 others_hurt=17/33 elapsed=895s
+step_batch=7/33 self_delta=+2.214313e-04 mean_other_delta=-1.554123e-06 others_hurt=15/33 elapsed=991s
+step_batch=8/33 self_delta=+8.769035e-04 mean_other_delta=-4.502318e-05 others_hurt=16/33 elapsed=1088s
+step_batch=9/33 self_delta=+2.028853e-03 mean_other_delta=-1.713114e-05 others_hurt=14/33 elapsed=1185s
+step_batch=10/33 self_delta=+1.384676e-03 mean_other_delta=+1.303095e-05 others_hurt=14/33 elapsed=1281s
+step_batch=11/33 self_delta=+2.665818e-04 mean_other_delta=-1.417868e-06 others_hurt=17/33 elapsed=1378s
+step_batch=12/33 self_delta=+3.713727e-03 mean_other_delta=+1.665984e-05 others_hurt=12/33 elapsed=1474s
+step_batch=13/33 self_delta=+9.004772e-04 mean_other_delta=-3.007574e-05 others_hurt=16/33 elapsed=1571s
+step_batch=14/33 self_delta=+4.606843e-04 mean_other_delta=-5.054993e-06 others_hurt=13/33 elapsed=1668s
+step_batch=15/33 self_delta=+4.027486e-04 mean_other_delta=+3.279497e-06 others_hurt=14/33 elapsed=1764s
+step_batch=16/33 self_delta=+2.012908e-03 mean_other_delta=-7.329114e-06 others_hurt=17/33 elapsed=1861s
+step_batch=17/33 self_delta=+5.176961e-04 mean_other_delta=-1.533928e-05 others_hurt=16/33 elapsed=1958s
+step_batch=18/33 self_delta=+9.215176e-04 mean_other_delta=+1.176571e-05 others_hurt=16/33 elapsed=2054s
+step_batch=19/33 self_delta=+3.182590e-04 mean_other_delta=-1.542011e-05 others_hurt=15/33 elapsed=2151s
+step_batch=20/33 self_delta=+1.147017e-04 mean_other_delta=-1.467087e-05 others_hurt=15/33 elapsed=2248s
+step_batch=21/33 self_delta=+1.049757e-03 mean_other_delta=-5.082086e-06 others_hurt=14/33 elapsed=2344s
+step_batch=22/33 self_delta=+5.345345e-04 mean_other_delta=-3.416396e-05 others_hurt=15/33 elapsed=2441s
+step_batch=23/33 self_delta=+5.344450e-04 mean_other_delta=-7.495002e-05 others_hurt=16/33 elapsed=2538s
+step_batch=24/33 self_delta=+9.558499e-04 mean_other_delta=-2.663199e-05 others_hurt=18/33 elapsed=2634s
+step_batch=25/33 self_delta=+4.717112e-04 mean_other_delta=-1.925038e-05 others_hurt=15/33 elapsed=2731s
+step_batch=26/33 self_delta=+1.944542e-03 mean_other_delta=-6.913123e-06 others_hurt=16/33 elapsed=2827s
+step_batch=27/33 self_delta=+8.725524e-04 mean_other_delta=-2.840590e-06 others_hurt=15/33 elapsed=2924s
+step_batch=28/33 self_delta=+7.047653e-04 mean_other_delta=+1.125230e-05 others_hurt=13/33 elapsed=3021s
+step_batch=29/33 self_delta=+3.166497e-04 mean_other_delta=-7.212162e-06 others_hurt=14/33 elapsed=3117s
+step_batch=30/33 self_delta=+4.708469e-04 mean_other_delta=-2.165444e-05 others_hurt=14/33 elapsed=3214s
+step_batch=31/33 self_delta=+1.568973e-03 mean_other_delta=-1.879714e-05 others_hurt=13/33 elapsed=3311s
+step_batch=32/33 self_delta=+4.963279e-04 mean_other_delta=+1.366820e-05 others_hurt=13/33 elapsed=3407s
+step_batch=33/33 self_delta=+1.532197e-03 mean_other_delta=-1.005320e-05 others_hurt=18/33 elapsed=3502s
+restore_check max_abs_drift=0.000e+00
+wrote scripts\output\batch_interference\memorization_03_no_regularization_plus_t_one_oversample\batch_interference_long.csv
+wrote scripts\output\batch_interference\memorization_03_no_regularization_plus_t_one_oversample\batch_interference_matrix.csv
+wrote scripts\output\batch_interference\memorization_03_no_regularization_plus_t_one_oversample\batch_interference_summary.csv
+done wall_seconds=3596
