@@ -95,7 +95,7 @@ All input/output locations are in `config/default.yaml`:
 - `pipeline.replay_subset_size`: seeded training-replay subset (`0` means all).
 - `pipeline.train_replay_count`: when positive, use an exact count split with this many train replays, `validation_replay_count` dev replays, and every remainder in test; `0` keeps fraction-based splitting.
 - `train.epochs`: used when `train.max_steps` is `0`.
-- `train.lr_schedule`: `wsd`, `cosine`, or `linear`; WSD phase ratios and floor are separately configurable.
+- `train.lr_schedule`: `wsd`, `cosine`, or `linear`; all use the configurable fixed `train.warmup` optimizer-step count, while WSD separately configures its final decay ratio and floor and fills the intervening steps with its stable phase.
 - `train.accumulation_steps`: microbatches per optimizer step; epoch-derived horizons count optimizer steps.
 - `train.early_stopping_patience_epochs`: consecutive dev-loss epochs below the relative-improvement threshold before stopping (`0` disables).
 - `train.early_stopping_min_relative_improvement`: relative improvement required to reset patience.

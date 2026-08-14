@@ -1385,11 +1385,13 @@ class TrainingLoop:
         if self.config.train.lr_schedule != "wsd":
             warmup = max(1, self.config.train.warmup)
             return warmup, 0, max(0, horizon - warmup)
-        warmup = int(round(horizon * self.config.train.lr_warmup_ratio))
-        stable = int(round(horizon * self.config.train.lr_stable_ratio))
-        warmup = max(1, min(horizon, warmup))
-        stable = max(0, min(horizon - warmup, stable))
-        decay = max(0, horizon - warmup - stable)
+        # WSD literature treats warmup as a fixed step-count phase, independent
+        # of the eventual run horizon. The final decay remains horizon-relative;
+        # stable training owns every optimizer step between those two phases.
+        warmup = max(1, min(horizon, self.config.train.warmup))
+        decay = int(round(horizon * self.config.train.lr_decay_ratio))
+        decay = max(0, min(horizon - warmup, decay))
+        stable = horizon - warmup - decay
         return warmup, stable, decay
 
     def _lr_multiplier(self, step_index: int) -> float:

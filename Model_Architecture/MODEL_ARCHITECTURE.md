@@ -65,7 +65,7 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 | AdamW betas | 0.9, 0.95 |
 | AdamW epsilon | 1e-8 |
 | Weight decay | 0.1 |
-| LR schedule | WSD: 10% warmup / 70% stable / 20% linear decay |
+| LR schedule | WSD: 500-step warmup / stable remainder / final 20% linear decay |
 | LR floor | 0.01 × peak = 3e-6 |
 | Gradient clipping | 1.0 |
 | Accumulation steps | 5 |
@@ -85,7 +85,7 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 
 `train.max_steps: 0` is resolved by the pipeline to `ceil(len(train_loader) / accumulation_steps) × train.epochs` before the scheduler is constructed. With the current 4,763 training batches per epoch, V3 plans 953 optimizer steps per epoch and 47,650 over 50 epochs. That resolved optimizer-step horizon drives both the learning-rate schedule and EMA window.
 
-The default `wsd` multiplier uses exactly 4,765 warmup, 33,355 stable, and 9,530 decay optimizer steps at the current horizon. The LR rises linearly to `3e-4`, remains there for 70% of training, then decays linearly to `3e-6` over the final 20%. `train.lr_schedule` can also select the legacy `cosine` or `linear` post-warmup schedules; historical profiles pin those choices explicitly.
+The default `wsd` multiplier uses exactly 500 warmup, 37,620 stable, and 9,530 decay optimizer steps at the current horizon. The LR rises linearly to `3e-4` over a fixed number of optimizer updates, remains there for the intervening 78.95% of this run, then decays linearly to `3e-6` over the final 20%. Warmup no longer expands when the epoch budget grows: `train.warmup` owns its absolute optimizer-step count, `train.lr_decay_ratio` owns the terminal share, and the stable phase fills the remainder. This follows the original WSD formulation, where warmup ends at a fixed step `W` and the decay budget is studied separately. `train.lr_schedule` can also select the legacy `cosine` or `linear` post-warmup schedules; historical profiles pin those choices explicitly.
 
 ## Vocabulary and learned state space
 
@@ -591,7 +591,7 @@ There is no special no-decay group, so embeddings, RMSNorm scales, and biases re
 
 ### Schedule and optimization
 
-- WSD with 10% linear warmup, 70% stable at peak, and 20% linear decay.
+- WSD with 500 fixed linear-warmup optimizer steps, a stable peak phase filling the middle, and a final 20% linear decay.
 - Peak `3e-4`; final learning-rate multiplier 0.01, giving `3e-6`.
 - Gradient norm clipping at 1.0.
 - Five microbatches per optimizer step (`accumulation_steps=5`, dynamic token target disabled), approximately 270k–285k valid input-plus-canvas tokens from the measured 54k–57k per microbatch.

@@ -10,7 +10,7 @@
 - `local_overfit_v2.yaml` owns the historical learnability probe and ablation control surface: isolated paths, 100 epochs (34 optimizer steps/epoch = 3400 steps), `lr_schedule: linear`, `lr_floor_ratio: 0.03`, uniform fog/time sampling, no terminal oversampling, and unit class weights. Everything about its subset and model scale comes from `local_overfit.yaml` unchanged.
 - `ablation_01..05_*.yaml` each extend `local_overfit_v2.yaml` and differ from it ONLY by the toggle(s) they enable and by their redirected storage paths. They must not restate any schedule knob: `tests/run_ablation_sweep.sh` passes no `--max-steps`, so each arm runs the inherited 100 epochs and completes both the linear LR decay and the derived EMA window. `tests/test_config.py` asserts this inheritance arm by arm.
 - `local_overfit_v2_finetune.yaml` owns the debut/outcome fine-tuning variant of the V2 profile.
-- `local_full.yaml` preserves the historical eight-epoch full-corpus V2 profile. `smallTrainingTestV3.yaml` owns the current 50-epoch-cap full-corpus run, expanded 384/12/6/1536 model, high-noise power sampling, five-batch accumulation, WSD schedule, weighted PAD/END loss, dev early stopping, and three checkpoint families.
+- `local_full.yaml` preserves the historical eight-epoch full-corpus V2 profile. `smallTrainingTestV3.yaml` owns the current 50-epoch-cap full-corpus run, expanded 384/12/6/1536 model, high-noise power sampling, five-batch accumulation, WSD with 500 fixed warmup optimizer steps and a final 20% decay, weighted PAD/END loss, dev early stopping, and three checkpoint families.
 
 ## Local Contracts
 

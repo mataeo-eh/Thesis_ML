@@ -138,13 +138,11 @@ train:
   beta2: 0.95
   weight_decay: 0.1
   adam_eps: 0.00000001
-  # `warmup` is the absolute step warmup retained by the legacy cosine/linear
-  # schedules. WSD uses the three horizon ratios below instead.
-  warmup: 2000
+  # Fixed optimizer-step warmup shared by every schedule. For WSD the stable
+  # phase fills the remainder before the final horizon-relative decay.
+  warmup: 500
   lr_floor_ratio: 0.01
   lr_schedule: wsd
-  lr_warmup_ratio: 0.10
-  lr_stable_ratio: 0.70
   lr_decay_ratio: 0.20
   grad_clip: 1.0
   accum: as-needed

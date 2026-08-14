@@ -719,7 +719,7 @@ def test_lr_schedule_selects_linear_or_cosine_and_both_land_on_the_floor(
             assert series[step + 1] <= series[step] + 1e-12
 
 
-def test_wsd_schedule_holds_peak_for_seventy_percent_then_linearly_decays(
+def test_wsd_schedule_uses_fixed_warmup_then_holds_peak_until_linear_decay(
     tmp_path: Path,
 ) -> None:
     base = _small_config(tmp_path)
@@ -731,8 +731,7 @@ def test_wsd_schedule_holds_peak_for_seventy_percent_then_linearly_decays(
             max_steps=horizon,
             lr_schedule="wsd",
             lr_floor_ratio=0.01,
-            lr_warmup_ratio=0.10,
-            lr_stable_ratio=0.70,
+            warmup=100,
             lr_decay_ratio=0.20,
         ),
     )
@@ -745,6 +744,9 @@ def test_wsd_schedule_holds_peak_for_seventy_percent_then_linearly_decays(
     assert loop._lr_multiplier(800) == pytest.approx(1.0)
     assert loop._lr_multiplier(900) == pytest.approx(0.505)
     assert loop._lr_multiplier(1000) == pytest.approx(0.01)
+    # Extending the run does not silently lengthen warmup; stable absorbs the
+    # extra horizon while the final decay remains 20% of total steps.
+    assert loop._schedule_phase_steps(2000) == (100, 1500, 400)
 
 
 def test_confidence_loss_is_weighted_and_disableable(tmp_path: Path) -> None:

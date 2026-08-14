@@ -21,7 +21,7 @@
 - `model.frozen_input_kv` is **`true` here — that promotion already happened** (owner decision 2026-08-09, on ablation arm 01's evidence: no meaningful loss difference, much faster inference). Do not "restore" it to `false` as a supposed baseline; the baseline moved. `toggle_fingerprint` is intentionally left un-rebased, so the default-derived `architecture_identity` is `dense-multinomial-SC2-v2+frozen_input_kv` and pre-promotion checkpoints fail closed rather than loading silently. `configs/ablation_00_baseline.yaml` is the one profile that opts back out, and it exists to keep the finished sweep's baseline arm loadable.
 - Note `config.py` rejects unknown YAML keys AND ignores dataclass defaults, so each of the three toggles needs its explicit entry here or config loading fails.
 - `diffusion.process` defaults to `uniform`; `absorbing` is the only supported ablation. The default time distribution is `Beta(2,1)` power sampling plus 5% exact `t=1`, and fog mirrors that power law over 0–0.8. Confidence sharpening remains `0.0`; sampler maximum steps is `64` with the published temperature, entropy-bound, and adaptive-stop defaults.
-- The default optimizer uses five-batch accumulation and a WSD schedule: 10% warmup, 70% stable at `3e-4`, then 20% linear decay to `3e-6`. Checkpoint family paths and retention are config-owned.
+- The default optimizer uses five-batch accumulation and a WSD schedule: 500 fixed warmup optimizer steps, a stable phase at `3e-4` filling the middle, then a final 20% linear decay to `3e-6`. Checkpoint family paths and retention are config-owned.
 
 ## Work Guidance
 

@@ -1,6 +1,5 @@
 """Typed project configuration loaded from YAML."""
 
-import math
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, TypeVar, get_type_hints
@@ -212,12 +211,10 @@ class TrainConfig:
     adam_eps: float
     warmup: int
     lr_floor_ratio: float
-    # Complete scheduler choice. ``cosine`` and ``linear`` retain the legacy
-    # step-count warmup followed immediately by decay. ``wsd`` instead divides
-    # the optimizer-step horizon into the three configurable ratios below.
+    # Complete scheduler choice. Every schedule uses the same fixed optimizer-
+    # step warmup. ``cosine`` and ``linear`` decay immediately afterwards;
+    # ``wsd`` holds the peak until the final configured decay fraction.
     lr_schedule: str
-    lr_warmup_ratio: float
-    lr_stable_ratio: float
     lr_decay_ratio: float
     grad_clip: float
     accum: str
@@ -571,13 +568,12 @@ def _validate_train(config: ProjectConfig) -> None:
         )
     if not (0.0 <= train.ema_decay <= 1.0):
         raise ConfigError(f"train.ema_decay must be in [0, 1], got {train.ema_decay}")
-    ratios = (train.lr_warmup_ratio, train.lr_stable_ratio, train.lr_decay_ratio)
-    if any(value < 0.0 or value > 1.0 for value in ratios):
-        raise ConfigError("train WSD phase ratios must each be in [0, 1]")
-    if train.lr_schedule == "wsd" and not math.isclose(sum(ratios), 1.0, abs_tol=1e-9):
+    if train.warmup < 1:
+        raise ConfigError("train.warmup must be >= 1")
+    if not (0.0 <= train.lr_decay_ratio <= 1.0):
         raise ConfigError(
-            "train WSD phase ratios must sum to 1.0, got "
-            f"{sum(ratios):.12g}"
+            "train.lr_decay_ratio must be in [0, 1], got "
+            f"{train.lr_decay_ratio}"
         )
     if train.accumulation_steps < 1:
         raise ConfigError("train.accumulation_steps must be >= 1")

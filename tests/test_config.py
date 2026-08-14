@@ -78,11 +78,9 @@ def test_valid_config_loads() -> None:
     assert config.train.beta2 == 0.95
     assert config.train.weight_decay == 0.1
     assert config.train.adam_eps == 1e-8
-    assert config.train.warmup == 2000
+    assert config.train.warmup == 500
     assert config.train.lr_floor_ratio == 0.01
     assert config.train.lr_schedule == "wsd"
-    assert config.train.lr_warmup_ratio == 0.10
-    assert config.train.lr_stable_ratio == 0.70
     assert config.train.lr_decay_ratio == 0.20
     assert config.train.grad_clip == 1.0
     assert config.train.accum == "as-needed"
@@ -314,11 +312,8 @@ def test_small_training_v3_owns_the_full_run_contract() -> None:
     assert config.train.lr == pytest.approx(3e-4)
     assert config.train.lr_floor_ratio == pytest.approx(0.01)
     assert config.train.lr_schedule == "wsd"
-    assert (
-        config.train.lr_warmup_ratio,
-        config.train.lr_stable_ratio,
-        config.train.lr_decay_ratio,
-    ) == pytest.approx((0.10, 0.70, 0.20))
+    assert config.train.warmup == 500
+    assert config.train.lr_decay_ratio == pytest.approx(0.20)
     assert config.train.epochs == 50
     assert config.train.early_stopping_patience_epochs == 10
     assert config.train.accumulation_steps == 5
@@ -603,7 +598,7 @@ def test_memorization_sweep_driver_step_constants_match_the_configured_run_lengt
     assert not any("--max-steps" in line for line in launch), "\n".join(launch)
 
 
-def test_lr_schedule_wsd_ratios_and_ema_horizon_are_range_checked(tmp_path: Path) -> None:
+def test_lr_schedule_wsd_decay_and_ema_horizon_are_range_checked(tmp_path: Path) -> None:
     """An unusable schedule value must fail at load, not mid-run."""
 
     # The whole default config is dumped standalone (no `extends`), so the probe
@@ -624,8 +619,10 @@ def test_lr_schedule_wsd_ratios_and_ema_horizon_are_range_checked(tmp_path: Path
         load_with(ema_horizon_ratio=1.5)
     with pytest.raises(ConfigError, match="lr_floor_ratio"):
         load_with(lr_floor_ratio=-0.1)
-    with pytest.raises(ConfigError, match="phase ratios"):
-        load_with(lr_warmup_ratio=0.2)
+    with pytest.raises(ConfigError, match="train.warmup"):
+        load_with(warmup=0)
+    with pytest.raises(ConfigError, match="lr_decay_ratio"):
+        load_with(lr_decay_ratio=1.1)
     for schedule in ("linear", "cosine", "wsd"):
         load_with(lr_schedule=schedule)
 
