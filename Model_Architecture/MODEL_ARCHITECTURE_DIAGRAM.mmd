@@ -23,5 +23,5 @@ flowchart TD
     FN --> OH["Untied output head<br/>384 → 291"]
     OH --> FULL["Full logits<br/>[B, Li + 4096, 291]"]
     FULL --> SLICE["Canvas slice<br/>[B, 4096, 291]"]
-    SLICE --> LOSS["Weighted clean-state cross-entropy<br/>PAD 0.1 · END 24.6333"]
+    SLICE --> LOSS["Weighted clean-state cross-entropy<br/>6 rows × 7 accumulations = 42 windows/update<br/>PAD 0.1 · END 24.6333"]
     LOSS --> DEC["Read-only decompositions<br/>7 classes · 4 t-buckets<br/>preserved vs noised · p1/p2<br/>5 future-distance buckets"]

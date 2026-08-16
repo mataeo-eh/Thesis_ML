@@ -15,7 +15,7 @@ Unless a section explicitly says otherwise, exact run-profile values refer to th
 - Attention: **6** heads × **64** dimensions per head.
 - Dense GeGLU width: **1,536**.
 - Vocabulary tensor width: **291** IDs.
-- Local-full batch size: **9**.
+- V3 training microbatch size: **6** rows.
 - Input budget: at most **4,096** served tokens per row.
 - Canvas size: exactly **4,096** target tokens per row in the production builders.
 - Maximum concatenated model sequence: **8,192** positions.
@@ -56,7 +56,7 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 | `data.canvas_budget_tokens` | 4,096 |
 | `data.canvas_recon_fraction` | 0.5 |
 | Derived reconstruction limit | 2,048 tokens |
-| `pipeline.batch_size` | 9 |
+| `pipeline.batch_size` | 6 |
 | `diffusion.process` | `uniform` |
 | Diffusion time distribution | `Beta(2,1)`, implemented as `U**0.5` over `[0,1]` |
 | Exact-`t=1` oversampling | 0.05 |
@@ -68,8 +68,9 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 | LR schedule | WSD: 500-step warmup / stable remainder / final 20% linear decay |
 | LR floor | 0.01 × peak = 3e-6 |
 | Gradient clipping | 1.0 |
-| Accumulation steps | 5 |
+| Accumulation steps | 7 |
 | Effective-token accumulation target | disabled (`0`) |
+| Reclaim-first CUDA reservation ceiling | 6.5 GiB |
 | Epochs | 50 maximum; dev-loss early stopping patience 10 |
 | Checkpoints | resume every 100 optimizer steps; best-dev per improved epoch; durable every 5 epochs |
 | EMA decay | derived per run; ceiling 0.9999 |
@@ -83,9 +84,9 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 | Adaptive entropy threshold | 0.005 |
 | Required stable passes | 2 |
 
-`train.max_steps: 0` is resolved by the pipeline to `ceil(len(train_loader) / accumulation_steps) × train.epochs` before the scheduler is constructed. With the current 4,763 training batches per epoch, V3 plans 953 optimizer steps per epoch and 47,650 over 50 epochs. That resolved optimizer-step horizon drives both the learning-rate schedule and EMA window.
+`train.max_steps: 0` is resolved by the pipeline to `ceil(len(train_loader) / accumulation_steps) × train.epochs` before the scheduler is constructed. With the current 7,144 training microbatches per epoch, V3 plans 1,021 optimizer steps per epoch and 51,050 over 50 epochs. That resolved optimizer-step horizon drives both the learning-rate schedule and EMA window.
 
-The default `wsd` multiplier uses exactly 500 warmup, 37,620 stable, and 9,530 decay optimizer steps at the current horizon. The LR rises linearly to `3e-4` over a fixed number of optimizer updates, remains there for the intervening 78.95% of this run, then decays linearly to `3e-6` over the final 20%. Warmup no longer expands when the epoch budget grows: `train.warmup` owns its absolute optimizer-step count, `train.lr_decay_ratio` owns the terminal share, and the stable phase fills the remainder. This follows the original WSD formulation, where warmup ends at a fixed step `W` and the decay budget is studied separately. `train.lr_schedule` can also select the legacy `cosine` or `linear` post-warmup schedules; historical profiles pin those choices explicitly.
+The default `wsd` multiplier uses exactly 500 warmup, 40,340 stable, and 10,210 decay optimizer steps at the current horizon. The LR rises linearly to `3e-4` over a fixed number of optimizer updates, remains there for the intervening 79.02% of this run, then decays linearly to `3e-6` over the final 20%. Warmup no longer expands when the epoch budget grows: `train.warmup` owns its absolute optimizer-step count, `train.lr_decay_ratio` owns the terminal share, and the stable phase fills the remainder. This follows the original WSD formulation, where warmup ends at a fixed step `W` and the decay budget is studied separately. `train.lr_schedule` can also select the legacy `cosine` or `linear` post-warmup schedules; historical profiles pin those choices explicitly.
 
 ## Vocabulary and learned state space
 
@@ -284,7 +285,7 @@ X_0 = [X_{input}; X_{canvas}]
 For a maximum-size V3 batch:
 
 \[
-X_0 \in \mathbb{R}^{9 \times 8192 \times 384}.
+X_0 \in \mathbb{R}^{6 \times 8192 \times 384}.
 \]
 
 The combined boolean mask is `[input_attention_mask; canvas_attention_mask]`. Attention is fully bidirectional and non-causal. The mask is a broadcast key mask shaped internally as `[B, 1, 1, L]`; it masks invalid keys, not query computation. Input logits and padded-query hidden states may be computed, but only canvas positions enter the loss.
@@ -440,10 +441,10 @@ W_{out} \in \mathbb{R}^{291 \times 384},
 logits \in \mathbb{R}^{B \times (L_i + 4096) \times 291}.
 \]
 
-At the maximum V3 shape this is `[9, 8192, 291]`. Training discards the input-region logits and scores:
+At the maximum V3 shape this is `[6, 8192, 291]`. Training discards the input-region logits and scores:
 
 \[
-canvas\_logits \in \mathbb{R}^{9 \times 4096 \times 291}.
+canvas\_logits \in \mathbb{R}^{6 \times 4096 \times 291}.
 \]
 
 Uniform-mode training uses clean-target cross-entropy over every position selected by `canvas_loss_mask`: positions 1–4095 for a full production row, including unchanged positions, changed positions, replacements equal to the target, the outcome token, delimiters, `[END]`, and semantic `[PAD]`. BOS at position 0 is attended but absent from the loss mask. The objective applies neither inverse-time weighting nor corruption-mask restriction.
@@ -594,7 +595,7 @@ There is no special no-decay group, so embeddings, RMSNorm scales, and biases re
 - WSD with 500 fixed linear-warmup optimizer steps, a stable peak phase filling the middle, and a final 20% linear decay.
 - Peak `3e-4`; final learning-rate multiplier 0.01, giving `3e-6`.
 - Gradient norm clipping at 1.0.
-- Five microbatches per optimizer step (`accumulation_steps=5`, dynamic token target disabled), approximately 270k–285k valid input-plus-canvas tokens from the measured 54k–57k per microbatch.
+- Seven six-row microbatches per optimizer step (`accumulation_steps=7`, dynamic token target disabled): 42 windows and a measured mean of about 275k valid input-plus-canvas tokens per update (262k–285k over the 20-step RTX 3070 validation).
 - BF16 autocast compute on CPU/CUDA; parameters are not converted to BF16 and remain FP32.
 
 The resume checkpoint is overwritten every 100 optimizer steps under `checkpoints/resume/last.pt`. A single epoch-numbered checkpoint under `checkpoints/best/` is replaced on any strict dev-loss improvement. Immutable `checkpoints/durable/epoch-NNNN.pt` milestones are retained every five epochs. Dev-based early stopping uses 0.1% relative improvement to reset a ten-epoch patience counter; this threshold does not prevent a smaller strict improvement from becoming the best checkpoint.
@@ -634,6 +635,12 @@ For 29,318,720 FP32 parameters:
 | **Model + EMA + Adam moments + gradients** | **559.210 MiB** |
 
 These figures deliberately exclude activations, saved tensors, SDPA workspaces, input batches, allocator fragmentation/reservation, and checkpoint serialization. They are not a GPU peak-memory prediction.
+
+### Measured RTX 3070 training memory
+
+The canonical six-row microbatch was selected with the real full-corpus V3 pipeline, 4,096/4,096 token budgets, BF16 autocast, frozen input K/V, self-conditioning, activation checkpointing, ten persistent workers, and the local RTX 3070. Across a resumed 20-optimizer-step validation, peak live PyTorch allocation was **3.845 GiB**, allocator reservation was at most **4.980 GiB**, and total device use was at most **6.083 GiB**. Warm throughput averaged **13.7k valid tokens/s**.
+
+The displaced nine-row/five-accumulation profile reached **5.470 GiB** live allocation, **7.262 GiB** reserved, and **8.000 GiB** total device use over four steps, leaving no physical headroom and invoking WDDM shared-memory behavior. The current `max_cuda_reserved_gb: 6.5` ceiling is reclaim-first protection against later allocator growth; it is above the healthy measured reservation and therefore does not trim the normal path.
 
 ## Sampling machinery
 

@@ -46,7 +46,10 @@ uv run thesis-ml-train --config configs/local_full.yaml
 
 The current full-corpus V3 run is launched on Windows with
 `tests\smallTrainingTestV3.bat`; its console log, metrics, cache, and checkpoint
-families are isolated below `tests\output\smallTrainingTestV3\`.
+families are isolated below `tests\output\smallTrainingTestV3\`. The V3 profile
+uses six-row microbatches and seven-batch accumulation (42 windows and roughly
+275k valid tokens per optimizer step), with a 6.5 GiB reclaim-first reservation
+ceiling for the 8 GiB RTX 3070.
 
 On Windows, equivalent thin launchers write console output and run artifacts to
 `tests\output\overfitV2\` and `tests\output\smallTrainingTestV2\`:
@@ -99,7 +102,7 @@ All input/output locations are in `config/default.yaml`:
 - `train.accumulation_steps`: microbatches per optimizer step; epoch-derived horizons count optimizer steps.
 - `train.early_stopping_patience_epochs`: consecutive dev-loss epochs below the relative-improvement threshold before stopping (`0` disables).
 - `train.early_stopping_min_relative_improvement`: relative improvement required to reset patience.
-- `train.max_cuda_reserved_gb`: reclaim-first CUDA allocator reservation ceiling (`0` disables). Reaching it releases unused cached blocks and aborts only if the post-trim reservation remains at or above the limit; the overfit profile uses 7.5 GiB.
+- `train.max_cuda_reserved_gb`: reclaim-first CUDA allocator reservation ceiling (`0` disables). Reaching it releases unused cached blocks and aborts only if the post-trim reservation remains at or above the limit; the overfit profile uses 7.5 GiB and full-corpus V3 uses 6.5 GiB.
 - `model.gradient_checkpointing`: recompute transformer blocks during backward to bound saved-activation memory; enabled for the local overfit profile after measured RTX 3070 spillover.
 
 `s3://bucket/prefix` is supported for data, checkpoints, and logs through the same resolver as local paths. AWS credentials must come from the normal AWS environment/instance profile chain.

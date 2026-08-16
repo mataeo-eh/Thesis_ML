@@ -316,8 +316,10 @@ def test_small_training_v3_owns_the_full_run_contract() -> None:
     assert config.train.lr_decay_ratio == pytest.approx(0.20)
     assert config.train.epochs == 50
     assert config.train.early_stopping_patience_epochs == 10
-    assert config.train.accumulation_steps == 5
+    assert config.pipeline.batch_size == 6
+    assert config.train.accumulation_steps == 7
     assert config.train.target_effective_batch_tokens == 0
+    assert config.train.max_cuda_reserved_gb == pytest.approx(6.5)
     assert config.train.checkpoint_interval == 100
     assert config.train.resume_checkpoint_subdir == "resume"
     assert config.train.best_checkpoint_subdir == "best"

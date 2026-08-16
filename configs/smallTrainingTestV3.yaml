@@ -15,6 +15,12 @@ model:
   self_conditioning: true
   gradient_checkpointing: true
 
+pipeline:
+  # Measured on the local RTX 3070: batch 9 saturated the 8 GiB device and
+  # spilled through WDDM, while batch 6 preserved throughput with >2 GiB of
+  # physical headroom. Seven microbatches keep each update near 280k tokens.
+  batch_size: 6
+
 fog:
   rate_distribution:
     name: power
@@ -39,7 +45,7 @@ train:
   max_steps: 0
   early_stopping_patience_epochs: 10
   early_stopping_min_relative_improvement: 0.001
-  accumulation_steps: 5
+  accumulation_steps: 7
   target_effective_batch_tokens: 0
   checkpoint_interval: 100
   resume_checkpoint_subdir: resume
@@ -51,6 +57,10 @@ train:
   val_interval: 0
   interval_dev_evaluation: false
   interval_train_evaluation: false
+  # Reclaim cached allocator blocks before reservation plus Windows/display
+  # use can force this 8 GiB card into shared memory. Normal measured reserve
+  # is ~5.0 GiB, so this guard is inactive on the healthy path.
+  max_cuda_reserved_gb: 6.5
 
 loss:
   class_loss_weights:

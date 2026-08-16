@@ -525,6 +525,7 @@ def test_epoch_checkpoint_families_replace_best_and_retain_durable(tmp_path: Pat
 
 def test_optimizer_steps_per_epoch_accounts_for_gradient_accumulation() -> None:
     assert optimizer_steps_per_epoch(4_763, 5) == 953
+    assert optimizer_steps_per_epoch(7_144, 7) == 1_021
     assert optimizer_steps_per_epoch(10, 5) == 2
     assert optimizer_steps_per_epoch(11, 5) == 3
 
