@@ -109,10 +109,7 @@ def sample_uniform_noise(
     random noise.
     """
 
-    if vocab_size < CONTENT_TOKEN_OFFSET:
-        raise ValueError("vocab_size must include every reserved special token")
-    content_count = vocab_size - CONTENT_TOKEN_OFFSET
-    support_size = 2 + content_count
+    support_size = uniform_noise_support_size(vocab_size)
     draws = torch.randint(
         0,
         support_size,
@@ -126,6 +123,14 @@ def sample_uniform_noise(
         torch.full_like(draws, PAD_ID),
         torch.where(draws.eq(1), torch.full_like(draws, DELIMITER_ID), content_ids),
     )
+
+
+def uniform_noise_support_size(vocab_size: int) -> int:
+    """Return the live ``[PAD]`` + ``[DELIMITER]`` + content support width."""
+
+    if vocab_size < CONTENT_TOKEN_OFFSET:
+        raise ValueError("vocab_size must include every reserved special token")
+    return 2 + vocab_size - CONTENT_TOKEN_OFFSET
 
 
 def inverse_t_weights(t: torch.Tensor, canvas_len: int) -> torch.Tensor:

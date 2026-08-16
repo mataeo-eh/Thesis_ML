@@ -34,3 +34,4 @@ checkpoints/
 
 data/*
 tests/output/
+scripts/output/canvas_unigram_baseline/

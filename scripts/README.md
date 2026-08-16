@@ -2,6 +2,32 @@
 
 Run scripts through the Thesis_ML virtual environment from the submodule root.
 
+## Canvas unigram baseline
+
+```powershell
+& .\.venv\Scripts\python.exe .\scripts\canvas_unigram_baseline.py `
+    --config .\configs\smallTrainingTestV3.yaml `
+    --split train
+```
+
+This CPU-only analysis provides the floor needed to interpret the model's
+fully-corrupted (`t = 1`) canvas cross-entropy. It serves the selected manifest
+windows through the production dataset and collation path, so clamped BOS and
+batch-shape padding are excluded while semantic `[PAD]` remains scored. It
+reports the empirical unigram entropy and the best constant distribution under
+the live class weights and their sum-of-weights normalization. All seven loss
+classes include scored-position counts, conditional entropy, CE under the
+global weighted optimum, and weighted-objective contribution.
+
+The default output is a JSON artifact and matching `.summary.txt` below
+`scripts/output/canvas_unigram_baseline/`. Both include config/manifest/token
+dictionary hashes, the split, window and scored-position counts, vocabulary
+width, and active class weights. Use `--max-windows N` for a cheap smoke pass,
+repeat `--manifest-filter '<pattern>'` to select manifest entries, and use
+`--dataset-epoch N` when reproducing a particular deterministic fog serving.
+The optional position-conditional floor is enabled by default and can be
+disabled with `--no-position-conditional`.
+
 ## Context-window estimator
 
 ```powershell
