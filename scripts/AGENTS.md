@@ -28,6 +28,7 @@
 
 - Keep these utilities read-only against source data and side-effect-bounded to `scripts/output/`.
 - Canvas baseline class membership uses the dataset's deterministic per-serving fog draw for the selected epoch; overall target counts do not depend on fog, while the observed/fogged class split does. Its weighted baseline must derive weights from `CanvasCrossEntropyLoss` and normalize by their scored-position sum.
+- Canvas baseline serving reuses the production sequential DataLoader and worker-side collation. `--num-workers` overrides the profile worker count, and `0` is the bounded-memory single-process fallback; worker shutdown must remain explicit on completion, interruption, or failure.
 
 ## Verification
 

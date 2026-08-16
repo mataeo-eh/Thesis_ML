@@ -7,7 +7,8 @@ Run scripts through the Thesis_ML virtual environment from the submodule root.
 ```powershell
 & .\.venv\Scripts\python.exe .\scripts\canvas_unigram_baseline.py `
     --config .\configs\smallTrainingTestV3.yaml `
-    --split train
+    --split train `
+    --num-workers 10
 ```
 
 This CPU-only analysis provides the floor needed to interpret the model's
@@ -27,6 +28,14 @@ repeat `--manifest-filter '<pattern>'` to select manifest entries, and use
 `--dataset-epoch N` when reproducing a particular deterministic fog serving.
 The optional position-conditional floor is enabled by default and can be
 disabled with `--no-position-conditional`.
+
+Dataset construction and collation run through the same sequential production
+DataLoader used for evaluation. `--num-workers` defaults to the selected
+profile's `pipeline.num_workers` (10 for `smallTrainingTestV3`); lower it if
+worker processes create memory pressure, or pass `--num-workers 0` for the
+single-process fallback. Progress is printed immediately and every 100 windows
+with elapsed time, throughput, and ETA. Interrupting the script shuts down its
+worker processes, but a partial scan is not resumable.
 
 ## Context-window estimator
 

@@ -6,7 +6,12 @@ from pathlib import Path
 
 import torch
 
-from scripts.canvas_unigram_baseline import UnigramAccumulator, summarize_counts
+from scripts.canvas_unigram_baseline import (
+    UnigramAccumulator,
+    _progress_line,
+    parse_args,
+    summarize_counts,
+)
 from thesis_ml.config import load_config
 from thesis_ml.data.collate import collate_diffusion_examples
 from thesis_ml.data.dataset import (
@@ -21,6 +26,14 @@ from thesis_ml.vocab.special_tokens import BOS_ID, CONTENT_TOKEN_OFFSET, PAD_ID
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_worker_override_and_progress_reporting() -> None:
+    args = parse_args(["--config", "config/default.yaml", "--num-workers", "7"])
+    assert args.num_workers == 7
+    assert _progress_line(processed=100, total=400, elapsed_seconds=20.0) == (
+        "processed_windows=100/400 elapsed=20s rate=5.00_windows_per_s eta=1m00s"
+    )
 
 
 def test_weighted_optimal_constant_has_known_closed_form() -> None:

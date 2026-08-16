@@ -13,6 +13,7 @@ No checkpoint, model forward pass, or GPU is used.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime, timezone
 import fnmatch
 import hashlib
@@ -20,12 +21,13 @@ import json
 import math
 from pathlib import Path
 import sys
+import time
 from typing import Iterable, Sequence
 
 import numpy as np
 
 from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.collate import DiffusionBatch, collate_diffusion_examples
+from thesis_ml.data.collate import DiffusionBatch
 from thesis_ml.data.dataset import SC2DiffusionDataset
 from thesis_ml.data.split import split_replays
 from thesis_ml.data.windowing import (
@@ -38,9 +40,11 @@ from thesis_ml.pipeline.storage import StorageResolver
 from thesis_ml.pipeline.train_pipeline import (
     _ensure_window_manifest,
     _explicit_replay_selection,
+    _make_dataloader,
     _materialize_file,
     _materialize_replay_paths,
     _select_replays,
+    _shutdown_dataloader,
 )
 from thesis_ml.train.corruption import uniform_noise_support_size
 from thesis_ml.vocab.content_vocab import load_content_vocabulary
@@ -243,6 +247,7 @@ def compute_baseline(
     max_windows: int,
     manifest_filters: Sequence[str],
     dataset_epoch: int,
+    num_workers: int | None,
     include_position_conditional: bool,
 ) -> dict[str, object]:
     """Stream the selected live dataset split and return a JSON-ready report."""
@@ -286,18 +291,43 @@ def compute_baseline(
         fog_rate_override=None,
     )
     dataset.set_epoch(dataset_epoch)
-    batch_size = config.pipeline.batch_size
-    for start in range(0, len(dataset), batch_size):
-        stop = min(start + batch_size, len(dataset))
-        examples = [dataset[index] for index in range(start, stop)]
-        batch = collate_diffusion_examples(
-            examples,
-            debut_mode=config.data.debut_mode,
-            retain_metadata=False,
-        )
-        accumulator.update(batch)
-        if stop == len(dataset) or stop % 1000 < batch_size:
-            print(f"processed_windows={stop}/{len(dataset)}", file=sys.stderr, flush=True)
+    effective_num_workers = (
+        config.pipeline.num_workers if num_workers is None else num_workers
+    )
+    loader_config = replace(
+        config,
+        pipeline=replace(config.pipeline, num_workers=effective_num_workers),
+    )
+    loader = _make_dataloader(dataset, loader_config, shuffle=False, device="cpu")
+    total_windows = len(dataset)
+    print(
+        f"selected_windows={total_windows} batch_size={config.pipeline.batch_size} "
+        f"num_workers={effective_num_workers} "
+        f"prefetch_factor={config.pipeline.prefetch_factor if effective_num_workers else 0}",
+        file=sys.stderr,
+        flush=True,
+    )
+    started_at = time.perf_counter()
+    next_progress = min(100, total_windows)
+    try:
+        for batch in loader:
+            accumulator.update(batch)
+            processed = accumulator.window_count
+            if processed >= next_progress or processed == total_windows:
+                print(
+                    _progress_line(
+                        processed=processed,
+                        total=total_windows,
+                        elapsed_seconds=time.perf_counter() - started_at,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                while next_progress <= processed:
+                    next_progress += 100
+                next_progress = min(next_progress, total_windows)
+    finally:
+        _shutdown_dataloader(loader)
 
     result = summarize_counts(
         accumulator,
@@ -330,6 +360,11 @@ def compute_baseline(
         "token_dictionary_sha256": _sha256(token_dictionary),
         "canvas_length": config.data.canvas_budget_tokens,
         "batch_size": config.pipeline.batch_size,
+        "profile_num_workers": config.pipeline.num_workers,
+        "num_workers": effective_num_workers,
+        "prefetch_factor": (
+            config.pipeline.prefetch_factor if effective_num_workers else 0
+        ),
         "vocabulary_width": vocabulary.vocab_size,
         "class_weights": {
             str(class_id): {
@@ -357,7 +392,8 @@ def format_summary(report: dict[str, object]) -> str:
             f"config={provenance['config_profile']} split={provenance['split']} "
             f"windows={provenance['window_count']} "
             f"scored_positions={overall['scored_positions']} "
-            f"vocab={provenance['vocabulary_width']}"
+            f"vocab={provenance['vocabulary_width']} "
+            f"workers={provenance['num_workers']}"
         ),
         f"manifest={provenance['manifest_path']} sha256={provenance['manifest_sha256']}",
         "class_weights="
@@ -447,6 +483,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="deterministic per-serving fog epoch used for class labels (default: 0)",
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help=(
+            "DataLoader worker processes; defaults to pipeline.num_workers from "
+            "the selected profile, while 0 runs in the main process"
+        ),
+    )
+    parser.add_argument(
         "--no-position-conditional",
         action="store_true",
         help="skip the optional canvas-index-conditional entropy histogram",
@@ -462,6 +507,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--max-windows must be non-negative")
     if args.dataset_epoch < 0:
         parser.error("--dataset-epoch must be non-negative")
+    if args.num_workers is not None and args.num_workers < 0:
+        parser.error("--num-workers must be non-negative")
     return args
 
 
@@ -476,6 +523,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_windows=args.max_windows,
         manifest_filters=args.manifest_filter,
         dataset_epoch=args.dataset_epoch,
+        num_workers=args.num_workers,
         include_position_conditional=not args.no_position_conditional,
     )
     output_path = args.output
@@ -558,6 +606,31 @@ def _entropy_from_counts(counts: np.ndarray) -> float:
         raise ValueError("entropy is undefined for an empty distribution")
     probabilities = positive / positive.sum()
     return float(-np.dot(probabilities, np.log(probabilities)))
+
+
+def _progress_line(*, processed: int, total: int, elapsed_seconds: float) -> str:
+    rate = processed / max(elapsed_seconds, 1e-9)
+    remaining = max(0, total - processed)
+    eta_seconds = remaining / rate if rate > 0.0 else math.inf
+    return (
+        f"processed_windows={processed}/{total} "
+        f"elapsed={_format_duration(elapsed_seconds)} "
+        f"rate={rate:.2f}_windows_per_s "
+        f"eta={_format_duration(eta_seconds)}"
+    )
+
+
+def _format_duration(seconds: float) -> str:
+    if not math.isfinite(seconds):
+        return "unknown"
+    rounded = max(0, int(round(seconds)))
+    hours, remainder = divmod(rounded, 3600)
+    minutes, seconds_part = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds_part:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds_part:02d}s"
+    return f"{seconds_part}s"
 
 
 def _cross_entropy_from_counts(
