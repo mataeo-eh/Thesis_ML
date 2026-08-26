@@ -193,6 +193,30 @@ CSV writes retry transient Windows locks. If a viewer or sync process keeps the
 configured epoch/interval CSV locked, training copies all readable history plus
 the current row into a timestamped `*-continued-*.csv`, logs the redirection, and
 uses that continuation for later rows, publishing, and process resumes.
+Checkpoints written mid-fit store the live cumulative wall-clock total. A
+replacement process restores that value as its baseline, so later epoch and
+interval rows measure the whole resumed run rather than restarting elapsed time
+from zero.
+
+### Publish a finished training summary
+
+Raw launcher output under `tests\output\` remains ignored because it includes
+large checkpoint families, step-level logs, and caches. After a run creates its
+`checkpoints\finished\finished_metadata.json`, prepare a compact tracked evidence
+bundle with:
+
+```powershell
+& .\.venv\Scripts\python.exe .\scripts\prepare_training_report.py `
+  tests\output\smallTrainingTestV3
+```
+
+The command accepts only a completed or early-stopped run, validates the stamped
+architecture identity, extracts first/best/final epoch facts, renders the loss
+curve, and copies only small textual evidence into
+`reports\training-runs\<date>-<run-name>\`. It never copies `.pt` or
+`.safetensors` weights, the step JSONL, console logs, or caches. Invoke the
+repository's `training-run-summary` skill in Codex or Claude with the same run
+directory to write the short chair-facing `SUMMARY.md` from that evidence.
 
 `configs/local_full.yaml` runs the full debut/outcome task for eight epochs with
 870 train replays, 50 dev replays, and all 23 remaining quickstart replays held

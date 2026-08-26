@@ -1,0 +1,164 @@
+{
+  "data": {
+    "canvas_budget_tokens": 4096,
+    "canvas_recon_fraction": 0.5,
+    "debut_mode": false,
+    "feature_statistics_path": "data/processed/local/full_feature_statistics.v1.json",
+    "input_budget_tokens": 4096,
+    "sampling_interval_s": 1,
+    "tokenized_replay_dir": "data/processed/local/tokenized_replays",
+    "window_manifest_path": "data/processed/local/full_window_manifest.jsonl",
+    "within_type_tiebreak": "unit_id"
+  },
+  "data_source": {
+    "extractor_command": "python quickstart.py",
+    "extractor_path": "../SC2-gamestate-extractor",
+    "kaggle_dataset": "mataeoanderson/sc2-replay-data",
+    "kaggle_key_env": "KAGGLE_KEY",
+    "kaggle_username_env": "KAGGLE_USERNAME",
+    "source": "kaggle",
+    "workers": 4
+  },
+  "diffusion": {
+    "process": "uniform",
+    "schedule": {
+      "max": 1.0,
+      "min": 0.0,
+      "name": "linear",
+      "t_distribution": "power",
+      "t_distribution_power": 2.0,
+      "t_one_fraction": 0.05
+    }
+  },
+  "eval": {
+    "debut_fog_bucket_edges": "0.3,0.7",
+    "debut_max_examples": 0,
+    "debut_minute_buckets": "1,3,5,7,10",
+    "fog_rate": 0.0,
+    "heldout_split": "test",
+    "timing_tolerance_buckets": 1
+  },
+  "fog": {
+    "rate_distribution": {
+      "max": 0.8,
+      "min": 0.0,
+      "name": "power",
+      "power": 2.0
+    }
+  },
+  "loss": {
+    "class_loss_weights": {
+      "delimiter": 1.0,
+      "end": 24.633333333333333,
+      "enemy_fogged_reconstruction": 1.0,
+      "enemy_future_prediction": 1.0,
+      "enemy_observed_reconstruction": 1.0,
+      "pad": 0.1,
+      "win_loss": 1.0
+    },
+    "use_fused_cross_entropy": false
+  },
+  "model": {
+    "d_model": 384,
+    "ffn": 1536,
+    "frozen_input_kv": true,
+    "gradient_checkpointing": true,
+    "heads": 6,
+    "layers": 12,
+    "per_segment_positions": false,
+    "qk_norm": true,
+    "rope_scaling": {
+      "factor": 8.0,
+      "high_freq_factor": 4.0,
+      "low_freq_factor": 1.0,
+      "original_max_position_embeddings": 8192,
+      "rope_type": "llama3"
+    },
+    "rope_theta": 500000.0,
+    "segment_embeddings": false,
+    "self_conditioning": true
+  },
+  "pipeline": {
+    "auto_acquire": false,
+    "batch_size": 6,
+    "cache_ram_fraction": 0.5,
+    "dev_fraction": 0.1,
+    "dev_replay_ids": "",
+    "num_workers": 10,
+    "persistent_workers": true,
+    "perspectives": "p1,p2",
+    "prefetch_factor": 4,
+    "prepare_feature_statistics": false,
+    "preprocess_if_missing": true,
+    "rebuild_manifest": false,
+    "replay_glob": "*.parquet",
+    "replay_subset_size": 0,
+    "seed": 2718,
+    "smoke": false,
+    "smoke_steps": 2,
+    "split_seed": 2718,
+    "test_fraction": 0.15,
+    "token_dictionary_uri": "data/Token_Dictionary.json",
+    "train_replay_count": 870,
+    "train_replay_ids": "",
+    "validation_replay_count": 50
+  },
+  "sampler": {
+    "adaptive_stop": true,
+    "entropy_bound": 0.1,
+    "entropy_threshold": 0.005,
+    "max_steps": 64,
+    "stability_steps": 2,
+    "temperature": {
+      "end": 0.4,
+      "exponent": 1.0,
+      "start": 0.8
+    }
+  },
+  "storage": {
+    "checkpoint_uri": "tests/output/smallTrainingTestV3/checkpoints",
+    "data_uri": "../data/quickstart/parquet",
+    "local_cache_dir": "tests/output/smallTrainingTestV3/cache",
+    "log_uri": "tests/output/smallTrainingTestV3/metrics",
+    "raw_uri": "data/raw/replays"
+  },
+  "train": {
+    "accum": "as-needed",
+    "accumulation_steps": 7,
+    "adam_eps": 1e-08,
+    "best_checkpoint_subdir": "best",
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "checkpoint_dir": "tests\\output\\smallTrainingTestV3\\checkpoints",
+    "checkpoint_interval": 100,
+    "confidence_loss_weight": 0.0,
+    "durable_checkpoint_interval_epochs": 5,
+    "durable_checkpoint_subdir": "durable",
+    "early_stopping_min_relative_improvement": 0.001,
+    "early_stopping_patience_epochs": 10,
+    "ema_decay": 0.9999,
+    "ema_horizon_ratio": 0.1,
+    "empty_cuda_cache_after_epoch": true,
+    "epochs": 50,
+    "grad_clip": 1.0,
+    "init_from_checkpoint": "",
+    "interval_dev_evaluation": false,
+    "interval_train_evaluation": false,
+    "keep_step_checkpoints": false,
+    "lr": 0.0003,
+    "lr_decay_ratio": 0.2,
+    "lr_floor_ratio": 0.01,
+    "lr_schedule": "wsd",
+    "max_cuda_reserved_gb": 6.5,
+    "max_steps": 51050,
+    "precision": "bf16",
+    "require_cuda": true,
+    "resume_checkpoint_subdir": "resume",
+    "save_best_checkpoint": true,
+    "self_cond_prob": 0.5,
+    "target_effective_batch_tokens": 0,
+    "val_interval": 0,
+    "warmup": 500,
+    "weight_decay": 0.1
+  }
+}

@@ -10,6 +10,7 @@
 - `gpu_smoke_test.py` owns the pre-flight GPU fit/throughput check that fabricates a correctly-shaped random batch (no dataset required) and reports peak VRAM and per-step time.
 - `batch_interference_probe.py` owns the batch-versus-batch interference diagnostic: it restores a finished checkpoint, takes one optimizer step on each batch of a frozen epoch in turn, and records the loss that step causes on every other batch. It writes only to `scripts/output/batch_interference/<arm>/` and never mutates the probed run.
 - `canvas_unigram_baseline.py` owns the CPU-only constant-predictor baseline for scored canvas targets. It streams config-derived manifest splits through the production dataset/collation mask, reports unweighted and live-weighted baselines overall and by all seven loss classes, and writes JSON plus a text summary under `scripts/output/canvas_unigram_baseline/`.
+- `prepare_training_report.py` owns read-only validation and extraction of a finished local run into a compact tracked bundle below `reports/training-runs/`. It reads metadata and epoch metrics but never checkpoint tensor payloads.
 - `run_batch_interference_probe.sh` owns the sequential launcher that runs that probe across the three `configs/memorization_*.yaml` arms.
 - `output/` holds generated reports (not durable contract material).
 
@@ -23,10 +24,13 @@
 - Loss measurement defaults to fp32 while the probe's optimizer step keeps the run's configured precision: the step must be faithful, and bf16 cannot resolve the loss change a single late-schedule step produces.
 - Probe console output and JSON provenance render paths inside the checkout relative to the submodule root so captured evidence does not embed machine-specific checkout paths.
 - `gpu_smoke_test.py` requires a visible CUDA device; never infer VRAM from a CPU run. Its fabricated batch must use terminal input `[EOS]`, clamped canvas `[BOS]`, mutable position-1 `[WIN]`/`[LOSS]`, and the same loss mask as production. It derives the live vocabulary width from the configured dictionary unless `--vocab-size` explicitly overrides it.
+- Training-report preparation accepts only `completed_all_epochs` or `early_stopping`, requires the final valid epoch to match finished metadata, blocks architecture-identity drift, copies only the documented textual allowlist, rejects files above 10 MiB, and verifies that every produced report file is visible to Git.
+- The report preparer detects legacy non-monotonic wall-clock resets across resumed processes. It sums segment terminal values as completed recorded fit time while explicitly marking that value as a lower bound; monotonic post-fix runs retain an exact cumulative total.
 
 ## Work Guidance
 
 - Keep these utilities read-only against source data and side-effect-bounded to `scripts/output/`.
+- The training-report preparer is the exception to the `scripts/output/` boundary: it writes only its deliberately durable allowlisted bundle beneath `reports/training-runs/` and leaves the source run untouched.
 - Canvas baseline class membership uses the dataset's deterministic per-serving fog draw for the selected epoch; overall target counts do not depend on fog, while the observed/fogged class split does. Its weighted baseline must derive weights from `CanvasCrossEntropyLoss` and normalize by their scored-position sum.
 - Canvas baseline serving reuses the production sequential DataLoader and worker-side collation. `--num-workers` overrides the profile worker count, and `0` is the bounded-memory single-process fallback; worker shutdown must remain explicit on completion, interruption, or failure.
 
@@ -34,6 +38,7 @@
 
 - `tests/test_context_window_estimator.py` covers the context-window estimator; `tests/test_gpu_smoke_script.py` covers the fabricated benchmark batch grammar without requiring CUDA.
 - `tests/test_canvas_unigram_baseline.py` pins the closed-form weighted optimum and proves that semantic `[PAD]`, clamped BOS, and batch-shape padding match the live loss mask/reduction.
+- `tests/test_training_report.py` covers finish validation, first/best/final extraction, anomalous-row reporting, architecture matching, and exclusion of weights/checkpoints.
 
 ## Child DOX Index
 

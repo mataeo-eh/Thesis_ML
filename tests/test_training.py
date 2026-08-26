@@ -468,6 +468,92 @@ def test_checkpoint_roundtrip_restores_model_optimizer_and_step(tmp_path: Path) 
     assert logs
 
 
+def _fit_keeping_step_checkpoints(tmp_path: Path, *, seed: int) -> tuple[TrainingLoop, DataLoader]:
+    """Run a short fit() that leaves behind per-step `step-N.pt` snapshots.
+
+    Those snapshots are the faithful stand-in for a preempted run: unlike
+    `last.pt` (which fit() rewrites on a clean return) they are written by
+    `_maybe_checkpoint` while fit() is still in flight and are never touched
+    again. Resuming from one is exactly what happens after a process is killed
+    mid-epoch.
+
+    Args:
+        tmp_path: pytest temp dir, used for the checkpoint directory.
+        seed: training seed for the loop.
+
+    Returns:
+        `(loop, dataloader)` -- the finished loop and the loader it trained on,
+        so a caller can resume into a fresh loop over the same data.
+
+    Depends on: `_small_config`, `make_synthetic_examples`, `_collate_pretrain`.
+    """
+
+    base = _small_config(tmp_path)
+    config = replace(
+        base,
+        train=replace(base.train, checkpoint_interval=1, keep_step_checkpoints=True),
+    )
+    examples = make_synthetic_examples(config, count=2)
+    loader = DataLoader(examples, batch_size=2, shuffle=False, collate_fn=_collate_pretrain)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=seed)
+    loop.fit(loader, max_steps=2, epochs=1, fixed_t=1.0)
+    return loop, loader
+
+
+def test_mid_run_checkpoint_records_live_wall_clock_not_the_value_at_process_start(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint written DURING fit() must carry the running elapsed time.
+
+    Regression test. `elapsed_wall_seconds` is only folded forward when fit()
+    returns, so checkpoints written mid-run used to serialize the value as of
+    this process's startup -- 0.0 on a fresh run. A run killed mid-fit then
+    resumed from such a checkpoint restarted its wall clock from zero, which is
+    why the metrics files showed the elapsed column resetting at every resume
+    point. Asserting on a `step-N.pt` snapshot rather than `last.pt` matters:
+    a clean fit() return rewrites `last.pt` with the correct folded total, so
+    only the never-rewritten mid-run snapshot exposes the bug.
+    """
+
+    loop, _ = _fit_keeping_step_checkpoints(tmp_path, seed=23)
+
+    mid_run_path = loop.resume_checkpoint_path.parent / "step-2.pt"
+    assert mid_run_path.exists()
+    mid_run = torch.load(mid_run_path, map_location="cpu", weights_only=False)
+    assert mid_run["elapsed_wall_seconds"] > 0.0
+
+
+def test_wall_clock_accumulates_across_a_resume_instead_of_restarting(tmp_path: Path) -> None:
+    """The elapsed column must keep climbing after a resume, not rewind to ~0.
+
+    Simulates a preempted run end to end: train, then resume a fresh loop from
+    a snapshot written mid-fit (what a killed process leaves behind) and train
+    again. The second process has to pick the clock up where the first one was
+    cut off, so the newest metrics row is a true cumulative total for the whole
+    run instead of just the latest process's slice.
+    """
+
+    first, loader = _fit_keeping_step_checkpoints(tmp_path, seed=24)
+    total_after_first_process = first.elapsed_wall_seconds
+    assert total_after_first_process > 0.0
+
+    resumed_model = SC2StrategyDiffusionModel(config=first.config, vocab_size=128)
+    resumed = TrainingLoop(model=resumed_model, config=first.config, seed=24)
+    resumed.load_checkpoint(first.resume_checkpoint_path.parent / "step-2.pt")
+
+    # The restored baseline is the time the first process had banked when it
+    # was cut off -- non-zero, and no larger than that process's final total.
+    assert resumed.elapsed_wall_seconds > 0.0
+    assert resumed.elapsed_wall_seconds <= total_after_first_process
+
+    restored_baseline = resumed.elapsed_wall_seconds
+    resumed.fit(loader, max_steps=4, epochs=1, fixed_t=1.0)
+    # Second process's time is ADDED to the inherited baseline, not counted
+    # from zero.
+    assert resumed.elapsed_wall_seconds > restored_baseline
+
+
 def test_epoch_checkpoint_families_replace_best_and_retain_durable(tmp_path: Path) -> None:
     base = _small_config(tmp_path)
     config = replace(

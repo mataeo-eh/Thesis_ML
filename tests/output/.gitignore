@@ -1,0 +1,5 @@
+# All launcher output is generated runtime state. Publish selected finished-run
+# evidence through scripts/prepare_training_report.py instead of unignoring a
+# run directory containing checkpoints, step logs, and caches.
+*
+!.gitignore

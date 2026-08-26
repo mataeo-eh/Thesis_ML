@@ -310,7 +310,17 @@ class TrainingLoop:
         self.best_dev_loss = math.inf
         self.early_stopping_best_dev_loss = math.inf
         self.epochs_without_improvement = 0
+        # Wall-clock seconds accumulated by *previously finished* fit()
+        # calls (restored from the checkpoint on resume). This is a
+        # baseline, NOT the live total: time spent inside the currently
+        # running fit() is not folded in here until that fit() returns.
+        # Read `_cumulative_wall_seconds()` whenever you need the true
+        # running total.
         self.elapsed_wall_seconds = 0.0
+        # `time.perf_counter()` reading taken when the in-flight fit()
+        # started, or None when no fit() is running. Paired with
+        # `elapsed_wall_seconds` by `_cumulative_wall_seconds()`.
+        self._fit_started_at: float | None = None
         self.total_tokens_ingested = 0
         self.unique_token_ids_seen: set[int] = set()
         # Lazily-built cache of (float ema tensors, float raw tensors, non-float
@@ -398,6 +408,12 @@ class TrainingLoop:
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
         fit_started = time.perf_counter()
+        # Fold in any time from an earlier fit() that raised before it
+        # could close its own window, then mark this fit() as in flight so
+        # checkpoints written mid-run record the true cumulative elapsed
+        # time rather than the value as of this process's startup.
+        self.elapsed_wall_seconds = self._cumulative_wall_seconds()
+        self._fit_started_at = fit_started
 
         # Surface the effective LR schedule up front so a run never silently
         # trains at a near-zero rate. base_lr is the peak; the linear warmup
@@ -849,10 +865,7 @@ class TrainingLoop:
                                     else {}
                                 ),
                                 lr=record["lr"],
-                                wall_clock_elapsed_seconds=(
-                                    self.elapsed_wall_seconds
-                                    + (time.perf_counter() - fit_started)
-                                ),
+                                wall_clock_elapsed_seconds=self._cumulative_wall_seconds(),
                             )
                         )
                     # Scope the NEXT row to the next slice only. Done regardless
@@ -1100,7 +1113,7 @@ class TrainingLoop:
                 total_tokens_ingested=self.total_tokens_ingested,
                 total_unique_tokens_seen=len(self.unique_token_ids_seen),
                 tokens_per_second=epoch_tokens / epoch_training_duration,
-                wall_clock_elapsed_seconds=self.elapsed_wall_seconds + (time.perf_counter() - fit_started),
+                wall_clock_elapsed_seconds=self._cumulative_wall_seconds(),
                 average_cuda_device_memory_used_bytes=(
                     epoch_cuda_device_memory_used / epoch_cuda_memory_samples
                 ),
@@ -1125,7 +1138,11 @@ class TrainingLoop:
                 )
                 break
 
-        self.elapsed_wall_seconds += time.perf_counter() - fit_started
+        # Close this fit()'s window: fold its duration into the baseline so
+        # the next fit() (or the final save below) starts from the right
+        # total without double-counting the window.
+        self.elapsed_wall_seconds = self._cumulative_wall_seconds()
+        self._fit_started_at = None
 
         if target_steps > 0:
             # Final durable checkpoint + metrics flush so a clean finish leaves
@@ -1249,6 +1266,28 @@ class TrainingLoop:
         root = self.checkpoint_dir / subdir if subdir else self.checkpoint_dir
         return root / "last.pt"
 
+    def _cumulative_wall_seconds(self) -> float:
+        """Total wall-clock seconds this training run has spent in fit().
+
+        Spans resumes: `elapsed_wall_seconds` carries the total accrued by
+        every previous process (restored by `load_checkpoint`), and this
+        adds the time the currently-running fit() has been going. The two
+        must never be added together by hand -- callers use this method so
+        the "is a fit in flight?" test lives in exactly one place.
+
+        Returns:
+            Seconds since the run first began training, counting all
+            resumes. Equals `elapsed_wall_seconds` when no fit() is
+            running (e.g. before the first one, or after the last).
+
+        Depends on: `_fit_started_at` / `elapsed_wall_seconds`, both set by
+        `__init__`, updated by `fit`, and restored by `load_checkpoint`.
+        """
+
+        if self._fit_started_at is None:
+            return self.elapsed_wall_seconds
+        return self.elapsed_wall_seconds + (time.perf_counter() - self._fit_started_at)
+
     def save_checkpoint(self, path: str | Path) -> Path:
         checkpoint_path = Path(path)
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1264,7 +1303,10 @@ class TrainingLoop:
                 "best_dev_loss": self.best_dev_loss,
                 "early_stopping_best_dev_loss": self.early_stopping_best_dev_loss,
                 "epochs_without_improvement": self.epochs_without_improvement,
-                "elapsed_wall_seconds": self.elapsed_wall_seconds,
+                # The LIVE cumulative total, so a run killed mid-fit()
+                # resumes with its wall clock intact instead of rewinding
+                # to whatever it was when this process started.
+                "elapsed_wall_seconds": self._cumulative_wall_seconds(),
                 "total_tokens_ingested": self.total_tokens_ingested,
                 "unique_token_ids_seen": sorted(self.unique_token_ids_seen),
                 "config": self.config,
@@ -1304,6 +1346,10 @@ class TrainingLoop:
         )
         self.epochs_without_improvement = int(checkpoint.get("epochs_without_improvement", 0))
         self.elapsed_wall_seconds = float(checkpoint.get("elapsed_wall_seconds", 0.0))
+        # A full restore replaces every counter, so any in-flight fit()
+        # window belongs to the state we just discarded. Clearing it keeps
+        # the restored total from being inflated by that stale window.
+        self._fit_started_at = None
         self.total_tokens_ingested = int(checkpoint.get("total_tokens_ingested", 0))
         self.unique_token_ids_seen = {
             int(token_id) for token_id in checkpoint.get("unique_token_ids_seen", [])

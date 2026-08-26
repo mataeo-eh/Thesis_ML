@@ -15,6 +15,8 @@
 - `config/default.yaml` owns canonical defaults; versioned overrides in `configs/` own reproducible local run profiles.
 - `tests/overfit.bat`, `tests/smallTrainingTestV2.bat`, and `tests/smallTrainingTestV3.bat` are thin Windows launchers; training behavior remains owned by YAML and Python entry points.
 - `tests/overfit.bat` launches `local_overfit_v2.yaml` and mirrors flushed training progress to both its visible terminal and `tests/output/overfitV2/console.log`.
+- `scripts/prepare_training_report.py` owns deterministic, size-bounded evidence bundles for finished runs; `reports/training-runs/` owns their tracked chair-facing summaries and curated evidence.
+- `prompts/training-run-summary/` owns the provider-neutral reporting workflow; `.agents/skills/training-run-summary/` and `.claude/skills/training-run-summary/` are thin discovery adapters to that one workflow.
 
 ## Local Contracts
 
@@ -44,6 +46,7 @@
 - The overfit loader uses four persistent workers with four batches prefetched per worker; training batches drop raw metadata after worker-side feature construction, pin their custom batch tensors, and use non-blocking CUDA copies.
 - Model scale, token budgets, paths, subset selection, epochs, schedule, accumulation, class weights, early stopping, and checkpoint intervals/subdirectories remain config-owned.
 - Local runs write epoch CSV metrics, ten-per-epoch interval CSV metrics, and replay selections under their configured `tests/output/<run_name>/` log directory. A transient CSV writer lock is retried; a persistent lock redirects logging to a timestamped `*-continued-*.csv` containing readable prior history, and later resumes keep using the newest continuation instead of terminating training. In both modes, epoch metrics include mean and p50/p90/p95 input/future timestep counts, future-token loss bucketed at 1, 2-5, 6-10, 11-30, and 31+ prediction timesteps, cumulative attention-valid training tokens, cumulative distinct token IDs, average device-wide VRAM use, and average device-minus-PyTorch-reserved gap; batch-shape padding is excluded.
+- Raw `tests/output/` state remains ignored and may contain multi-gigabyte checkpoints. Publish completed-run results only through the allowlisted report preparer: tracked bundles contain the finished config/metadata, epoch CSV, replay selection, compact derived facts, and loss curve, never tensor weights, step JSONL, console logs, caches, replay data, or absolute workstation paths.
 - Canvas loss reports six read-only decompositions in both pipelines: seven per-class losses, four corruption buckets (`t_eq_1`, `[0.75,1)`, `[0.25,0.75)`, `[0,0.25)`), a ground-truth-preserved vs noised split keyed on token inequality rather than the corruption flag, p1/p2 perspective, future-distance buckets, and a rare-class-by-corruption cross of {win/loss, `[END]`, `[DELIMITER]`} x the four corruption buckets. `interval_metrics.csv` emits all of them ten times per epoch, each row scoped to its own slice; `epoch_metrics.csv` emits the same loss columns once per epoch.
 - The rare-class cross emits 12 loss columns and 12 scored-position count columns per split. It is returned as an unreduced sum/count pair and pooled by total scored positions, never as a mean of per-microbatch means. Its count columns always carry every cell including explicit zeros, because a bucket containing no `[END]` token is the observation; only its loss columns follow the blank-when-empty convention.
 - `train.interval_dev_evaluation` and `train.interval_train_evaluation` independently gate the dev and train halves of the interval rows, and both default to true. A disabled half leaves its columns blank and is reported once per epoch instead. Both disabled writes no interval row at all and creates no `interval_metrics.csv`, with the accumulation wiring left intact. The overfit profiles set both false; the overfitV2 fine-tune pins `interval_train_evaluation` back to true.
@@ -85,6 +88,7 @@
 - `scripts/AGENTS.md`: standalone context-window analysis and GPU pre-flight utilities.
 - `tests/AGENTS.md`: pytest suite, owner-provided extractor fixtures, and thin Windows launchers.
 - `prompts/AGENTS.md`: executable task prompts and the completed-prompt archive.
+- `reports/AGENTS.md`: durable, size-bounded finished-run evidence bundles and thesis-chair summaries.
 - `plans/AGENTS.md`: implementation plans derived from accepted prompts and current contracts.
 - `research/AGENTS.md`: source-attributed research outputs, including the dated DiffusionGemma uniform-migration evidence, that inform but do not override project contracts.
 - `diagnostics/AGENTS.md`: reproducible audits, investigations, and failure analyses.

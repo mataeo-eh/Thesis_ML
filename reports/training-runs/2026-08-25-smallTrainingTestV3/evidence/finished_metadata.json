@@ -1,0 +1,19 @@
+{
+  "architecture_identity": "dense-multinomial-SC2-v2+frozen_input_kv",
+  "completed_epochs": 43,
+  "config_file": "config.json",
+  "configured_epochs": 50,
+  "created_utc": "2026-08-25T19:46:29.015188+00:00",
+  "default_serving_weights": "ema",
+  "diffusion_process": "uniform",
+  "feature_statistics_identity": "90f84aebb1e81872e23954b4428de3cbdab7408f235ba9cb506b52ecd281c4f8",
+  "global_step": 43903,
+  "self_conditioning": true,
+  "stop_reason": "early_stopping",
+  "torch_bundle": "finished.pt",
+  "vocab_size": 291,
+  "weights": {
+    "ema": "model.ema.safetensors",
+    "raw": "model.raw.safetensors"
+  }
+}

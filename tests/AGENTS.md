@@ -8,11 +8,13 @@
 
 - `test_*.py` own package regression coverage (config, serialization, windowing, dataset, model, training, sampler, eval, pipeline, fine-tune report, launcher checks). `test_diffusion_integration.py` owns bounded real-model checks spanning corruption/loss/backward, self-conditioning, sampling, and checkpoint transfer between training and inference.
 - `test_canvas_unigram_baseline.py` owns the closed-form entropy/weighted-optimum baseline and exact equivalence with production canvas-loss mask selection and normalization.
+- `test_training_report.py` owns the finished-run report preparer's validation, metric summarization, architecture matching, and artifact allowlist.
 - `fixtures/` owns owner-provided sample extractor parquet (`match_*_game_state.parquet`); it is the ground truth for schema-dependent tests.
 - `overfit.bat`, `smallTrainingTestV2.bat`, `smallTrainingTestV3.bat`, and `overfit-fine-tune.BAT` are thin launchers; training behavior stays owned by YAML and the Python entry points.
 - `test_gpu_smoke_script.py` keeps the standalone full-size GPU benchmark fixture aligned with the production EOS/BOS/outcome grammar without requiring a GPU.
 - `run_ablation_sweep.sh` is a thin sequential launcher for the representational-toggle ablation sweep (`configs/ablation_0*.yaml`). It owns run ORDER and restart bookkeeping only; every training knob stays in YAML. It is restartable: each arm's own `last.pt` `global_step` is the resume state, so a finished arm is skipped without launching Python and an interrupted arm resumes through `train_pipeline._try_resume`. An unreadable checkpoint is skipped with a warning rather than silently retrained.
 - `output/` holds per-run launcher artifacts and console logs (generated; not durable contract material). If an epoch/interval CSV is persistently write-locked by a viewer or sync process, training emits a full-history timestamped `*-continued-*.csv` beside it and continues there.
+- `output/` remains ignored even when selected evidence is published. Durable copies are created only below `reports/training-runs/` by `scripts/prepare_training_report.py`.
 
 ## Local Contracts
 
