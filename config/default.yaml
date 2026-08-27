@@ -203,7 +203,6 @@ sampler:
   entropy_bound: 0.1
   adaptive_stop: true
   entropy_threshold: 0.005
-  stability_steps: 2
 
 eval:
   heldout_split: validation

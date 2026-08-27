@@ -6,20 +6,23 @@
 
 ## Ownership
 
-- `sampler.py` owns DiffusionGemma-style nonmonotonic uniform EB sampling (`sample_canvas`), coherent absorbing EB ablation sampling, diagnostics-only one-pass denoising (`denoise_canvas_once`), temperature shaping, adaptive stopping, checkpoint loading, and sampler result types.
+- `sampler.py` owns DiffusionGemma-style nonmonotonic uniform EB sampling (`sample_canvas`), coherent absorbing EB ablation sampling, diagnostics-only one-pass denoising (`denoise_canvas_once`), temperature shaping, stopping-state validation, terminal-pass finalization, checkpoint loading, and sampler result types.
 - `decode.py` owns grammar validation and canvas decoding (`validate_canvas`, `validate_debut_canvas`, `decode_canvas`, `CanvasValidation`, `DecodedCanvas`).
 - `timing.py` owns post-sampling absolute-time recovery (`attach_absolute_times`, `TimedTimestep`).
 
 ## Local Contracts
 
-- Default uniform sampling clamps canvas position-0 `[BOS]` and initializes every other eligible position independently from `[PAD]`, `[DELIMITER]`, or a content ID. Each pass samples categorical clean-state candidates, accepts the exact entropy-bounded prefix, and replaces every nonaccepted eligible position with fresh allowed noise. Acceptance is transient and recomputed from scratch, so earlier eligible positions may be renoised and revised.
+- Default uniform sampling clamps canvas position-0 `[BOS]` and initializes every other eligible position independently from `[PAD]`, `[DELIMITER]`, or a content ID. Each non-terminal pass samples categorical clean-state candidates, accepts the exact entropy-bounded prefix, and replaces every nonaccepted eligible position with fresh allowed noise. Acceptance is transient and recomputed from scratch, so earlier eligible positions may be renoised and revised. Canvas position 1 (`[WIN]`/`[LOSS]`) is denoised jointly with every other mutable position; only `[BOS]` is clamped and no position-ordering rule exists.
 - Load EMA weights for sampling and evaluation.
 - Sampling validates the checkpoint's feature-statistics identity against the model before loading EMA weights; missing or mismatched identities are incompatible rather than silently accepted.
 - A valid canvas starts `[BOS] [WIN|LOSS]`, followed by `(timestep-tokens [DELIMITER])+`, then either `[END] [PAD]*` or `[PAD]*`. Reject `[EOS]`, extra BOS/outcome tokens, and partial final timesteps; debut mode also permits empty timestep groups represented by a bare delimiter.
 - The model never emits time. Absolute timing is recovered externally by arithmetic (last input-frame clock + `sampling_interval_s × timestep index`) and stays metadata only.
 - The uniform EB rule sorts eligible entropies ascending and accepts positions where `cumsum(sorted_entropy) - sorted_entropy <= entropy_bound`. Candidate tokens are categorical samples from temperature-shaped logits with `[MASK]` suppressed; every nonaccepted position is fully renoised from the `[PAD]`/`[DELIMITER]`/content distribution.
 - Uniform defaults are `max_steps=64`, linear temperature `0.8 -> 0.4`, and `entropy_bound=0.1`. There is no minimum step count, commit-gating path, persistent acceptance mask, or position-dependent token restriction.
-- Adaptive stopping requires both mean entropy below `0.005` over eligible positions and unchanged argmax predictions across two consecutive passes. Done rows freeze; unfinished rows continue to the hard ceiling.
+- Adaptive stopping requires both mean entropy below `0.005` over eligible positions and a **denoiser fixed point** on the same pass: the clean-state argmax equals the canvas that pass read at every mutable position. The stability half is a predicate on the STATE, matching the reference `TokenStabilityEarlyStop`; an argmax-versus-argmax test never inspects the canvas and can certify a row whose renoised positions all disagree with the model. Done rows freeze; unfinished rows continue to the hard ceiling.
+- **Terminal-pass finalization.** A pass is terminal for a row when its adaptive stop fires there or the 64-pass ceiling ends it there. A terminal pass does not apply the entropy budget: every eligible position takes its categorical candidate and nothing is renoised. Renoising is a mid-process transition, never a result. This uses the distribution already computed for that pass, so it adds no model call and no hyperparameter.
+- **Result contract.** The returned canvas is the state the stop decision validated. `SamplerOutput.finalized_steps[row]` names the pass that produced each row's canvas, and `stop_reasons[row]` states what it is certified to be: `adaptive_entropy_stability` (a certified fixed point), `max_steps` (fully committed, not certified), `absorbing_complete`, or `no_eligible`.
+- The absorbing ablation shares only the terminal-pass rule, which commits still-masked positions when the ceiling arrives so `[MASK]` never survives into a returned canvas. Nothing accepted is ever remasked, so it stays monotone.
 - The absorbing ablation initializes `[MASK]`, applies the same correct EB prefix among still-masked positions, leaves nonaccepted positions masked, never remasks accepted positions, and stops only when eligible positions are filled.
 - Uniform replacement noise excludes `[MASK]`, `[END]`, `[WIN]`, `[LOSS]`, `[BOS]`, and `[EOS]`; clean-token candidates may still predict legitimate target specials. BOS alone is position-clamped; outcome position 1 remains mutable. Validation remains the downstream grammar boundary.
 - Normal sampling performs no post-sampling model call. The diagnostics-only `return_final_logits` option performs one final forward pass conditioned on the completed canvas and returns those raw canvas logits on CPU.
@@ -44,7 +47,7 @@ Sampling participates in `model.frozen_input_kv`, which was **promoted to defaul
 
 ## Verification
 
-- Sampler changes require `tests/test_sampler.py`; position-unconstrained and nonmonotonic-renoising coverage replaces the retired positional sequencing tests. Grammar validity remains required by `SPEC.md` §16.
+- Sampler changes require `tests/test_sampler.py`; position-unconstrained, nonmonotonic-renoising, stopping-state-certificate, and terminal-pass finalization coverage replaces the retired positional sequencing tests. Grammar validity remains required by `SPEC.md` §16.
 
 ## Child DOX Index
 

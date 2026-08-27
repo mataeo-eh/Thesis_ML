@@ -25,3 +25,14 @@ flowchart TD
     FULL --> SLICE["Canvas slice<br/>[B, 4096, 291]"]
     SLICE --> LOSS["Weighted clean-state cross-entropy<br/>6 rows × 7 accumulations = 42 windows/update<br/>PAD 0.1 · END 24.6333"]
     LOSS --> DEC["Read-only decompositions<br/>7 classes · 4 t-buckets<br/>preserved vs noised · p1/p2<br/>5 future-distance buckets"]
+
+    %% Inference: nonmonotonic uniform entropy-bounded sampling, at most 64 passes.
+    %% A pass is TERMINAL when the certificate fires or the ceiling ends the row;
+    %% a terminal pass commits every eligible position and renoises nothing, so
+    %% the returned canvas is exactly the state the stop decision validated.
+    SLICE --> SAMP["Sampling pass · at most 64<br/>temperature 0.8 → 0.4<br/>[MASK] logit = −inf"]
+    SAMP --> FIX["Stop certificate<br/>argmax == canvas at every<br/>mutable position AND<br/>mean entropy &lt; 0.005"]
+    FIX --> EBA["Not terminal<br/>EB accept cumsum(h) − h ≤ 0.1<br/>renoise the rest → next pass"]
+    EBA --> SAMP
+    FIX --> TERM["Terminal pass<br/>certified, or the 64th<br/>accept EVERY eligible position<br/>no renoising"]
+    TERM --> RET["Returned canvas<br/>[B, 4096]"]

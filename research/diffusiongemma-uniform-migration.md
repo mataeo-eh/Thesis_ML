@@ -1,6 +1,8 @@
 # DiffusionGemma uniform-state migration research
 
-Research snapshot: 2026-08-05.
+Research snapshot: 2026-08-05. Sampler-stopping section re-verified and
+corrected against primary source on **2026-08-26** (see "2026-08-26 correction:
+what the reference stopping rule actually compares").
 
 This note records the evidence used to migrate `Thesis_ML` from absorbing-state
 masked diffusion to uniform-state multinomial diffusion. It separates published
@@ -74,8 +76,9 @@ or released behavior from project decisions. `SPEC.md` remains authoritative.
   Acceptance is recomputed from scratch on every step, so a position accepted on
   one step may be renoised later. There is no persistent committed mask.
 - Temperature anneals linearly from `0.8` to `0.4` by default.
-- Adaptive stopping requires both mean model entropy below `0.005` and identical
-  argmax predictions across two consecutive denoiser passes.
+- Adaptive stopping combines a mean-entropy threshold of `0.005` with a token
+  stability condition. See the 2026-08-26 correction below for exactly what that
+  stability condition compares; the 2026-08-05 snapshot recorded it incorrectly.
 - The official ceiling is 48 passes. This project changes only that ceiling to
   64 and otherwise begins from the released uniform EB behavior.
 
@@ -87,6 +90,87 @@ or released behavior from project decisions. `SPEC.md` remains authoritative.
   deployment goal.
 - Gemma 4's dense feed-forward form is GeGLU: `GELU(gate) * up`, followed by the
   down projection.
+
+## 2026-08-26 correction: what the reference stopping rule actually compares
+
+Accessed 2026-08-26. Sources re-read in full at pinned revisions:
+
+- `gemma/diffusion/_early_stopping.py` and `gemma/diffusion/_sampler.py` in
+  google-deepmind/gemma at commit `7b785991bd78626c73b317eb43fdbb6c292f7b9c`
+  (repository HEAD on this date; `_sampler.py` last changed in
+  `0360c6629acf31361ab68924d5ed4a15c6097dc0`, 2026-07-03):
+  <https://github.com/google-deepmind/gemma/tree/7b785991bd78626c73b317eb43fdbb6c292f7b9c/gemma/diffusion>
+- Entropy-Bounded Sampler, arXiv:2505.24857v1, "Accelerated Sampling from Masked
+  Diffusion Models via Entropy Bounded Unmasking", Algorithm 1.
+
+### Released behavior (read from source, not inferred)
+
+`TokenStabilityEarlyStop.should_stop` is, verbatim:
+
+```python
+most_likely_tokens = jnp.argmax(logits, axis=-1)
+return jnp.all(most_likely_tokens == previous_canvas, axis=-1)
+```
+
+The comparison is **this pass's argmax against the canvas that produced those
+logits** — a fixed-point certificate on the STATE. It is NOT a comparison of two
+consecutive argmax tensors. The 2026-08-05 snapshot in the section above recorded
+it as the latter, and that error was transcribed into this project's sampler and
+into `SPEC.md`. The two rules are not equivalent: an argmax-versus-argmax test
+never inspects the canvas, so it is satisfied while every renoised position
+disagrees with the model.
+
+`EntropyEarlyStop` is a separate mean-per-token-entropy threshold defaulting to
+`0.005`, and `ChainedEarlyStop` ANDs stoppers together. There is no
+consecutive-pass counter anywhere in the released early-stopping module; the
+stability predicate is evaluated on a single pass.
+
+`SampleFromPredictions` does renoise every nonselected position with a uniform
+random token, and `sample_next_canvas` returns `final_carry.canvas`, i.e. the
+post-renoising state. Inference from source: that is safe in the released setting
+only because the stop condition it is paired with guarantees the renoise is a
+no-op. `entropy_bound` is a budget in **total nats**, not per token, so on a
+256-token canvas from a converged model the accepted prefix covers the whole
+canvas and nothing is renoised.
+
+### EB-Sampler paper
+
+Algorithm 1 is a masked (absorbing) procedure: `while I_m != {} and not C(x)`,
+annotated "Stop if all tokens unmasked". It never renoises, and its stopping
+criterion is typed `C: S -> {True, False}` — a function of the state `x`. The
+guarantee that no noise survives into the result comes from the loop condition,
+not from the entropy rule. The entropy rule itself,
+`sum(h_U) - max(h_U) <= gamma`, is what this project already implements.
+
+### Project decision (2026-08-26)
+
+Two changes, adopted together because neither is sufficient alone:
+
+1. **Stopping-state validation.** The uniform adaptive stop now requires a
+   denoiser fixed point over mutable positions, matching
+   `TokenStabilityEarlyStop`. `sampler.stability_steps` is retired: a fixed-point
+   certificate already compares a prediction against the state that produced it,
+   and requiring it on consecutive passes is unsatisfiable whenever the entropy
+   budget leaves a nonempty renoised tail.
+
+2. **Terminal-pass full acceptance** (an intentional, documented deviation from
+   the released code). On the last pass a row will ever execute — its stop firing
+   or the ceiling — the budget is not applied and nothing is renoised. Rationale:
+   this project's canvas is 4,096 positions rather than 256, and its model is far
+   from the released model's convergence, so a fixed **total**-nats budget of
+   `0.1` accepts a much smaller fraction and leaves a real renoised tail on every
+   pass, including the last one. The released code's implicit assumption — that
+   the terminal renoise is a no-op — does not hold here. Committing on the
+   terminal pass restores the invariant the released sampler relies on, uses the
+   distribution already computed for that pass, and adds no model call and no
+   hyperparameter. Where the released assumption does hold, the two behaviors are
+   identical.
+
+Measured effect on the real held-out reproduction (checkpoint
+`smallTrainingTestV3/epoch-0033`, EMA, CUDA, seed `20260826`, three windows at
+`t=1.0`): grammar-valid canvases 1/3 -> 3/3, pooled build-order F1 0.296 -> 0.498,
+returned-versus-final-argmax disagreements 7/4/0 -> 0/0/0, at a cost of 154 -> 164
+total forward passes (+6.5%). See `diagnostics/010-uniform-sampler-final-state.md`.
 
 ## Accepted project decisions
 
@@ -107,10 +191,12 @@ or released behavior from project decisions. `SPEC.md` remains authoritative.
 - The backbone moves from SwiGLU/pre-norm-only blocks to dense GeGLU with
   pre- and post-sublayer RMSNorm. Self-conditioning moves to the released
   expected-embedding and gated-FFN path.
-- The uniform sampler follows DiffusionGemma's categorical EB selection, full
-  renoising, linear `0.8 -> 0.4` temperature, and dual-condition adaptive stop.
-  The only intentional default deviation is `max_steps = 64`; there is no
-  minimum step count.
+- The uniform sampler follows DiffusionGemma's categorical EB selection,
+  mid-process full renoising, linear `0.8 -> 0.4` temperature, and
+  dual-condition adaptive stop, with the stability half implemented as the
+  released fixed-point certificate. The intentional default deviations are
+  `max_steps = 64` and terminal-pass full acceptance (see the 2026-08-26
+  correction); there is no minimum step count.
 - `outcome_last`, confidence-threshold commits, minimum-commit fallbacks, and
   positional token restrictions are removed. Position zero is `[WIN]` or
   `[LOSS]` in ground truth, and the model learns that convention through loss.

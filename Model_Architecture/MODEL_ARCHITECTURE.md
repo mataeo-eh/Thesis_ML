@@ -491,6 +491,14 @@ Three boundaries carry meaning beyond bookkeeping:
 | `interval_metrics.csv` | `INTERVAL_REPORTS_PER_EPOCH` = 10 times per epoch | train values for every decomposition when `train.interval_train_evaluation` is true, each row scoped to that ~10% slice of the epoch, plus dev values when `train.interval_dev_evaluation` is true |
 | `epoch_metrics.csv` | once per epoch | the same loss columns plus the rare-class count columns, timestep percentiles, future-distance buckets, and memory/throughput telemetry |
 
+Both CSVs additionally carry token-level reporting for each split, immediately after that split's headline loss: `accuracy_{ground_truth_preserved,noised}`, `macro_f1_{ground_truth_preserved,noised}`, `bits_per_token`, and `perplexity`.
+
+Accuracy and macro-F1 are reported per canvas state and never pooled. A pooled accuracy would be dominated by positions whose canvas token already equals the target, which at low corruption is most of them, so the number would track the sampled corruption schedule rather than the model. Micro-averaged F1 is omitted because a single prediction per scored position makes it algebraically identical to accuracy; the macro average is the one carrying new information, since it weights a token seen five times the same as one seen five hundred thousand times and therefore falls when the model collapses onto the frequent tokens.
+
+`bits_per_token` is accumulated from a separate UNWEIGHTED cross-entropy total rather than derived from the reported loss. The loss columns are the class-weighted objective normalized by the weight sum, so `exp(loss)` is not a perplexity and is not comparable across runs with different `loss.class_loss_weights`. `perplexity` is exactly `2 ** bits_per_token`. Both average over every scored canvas position at the run's sampled corruption distribution: comparable between models sharing splits and corruption schedule, not comparable to an autoregressive LM's next-token perplexity.
+
+All four counts feeding these columns pool across microbatches by summation before any ratio is taken, for the same reason the rare-class cross does: a microbatch holding six scored positions must not weigh the same as one holding six thousand.
+
 The intra-epoch cadence exists because a corpus large enough that pretraining converges in one epoch would otherwise yield exactly one per-epoch observation and no visible trend. Report boundaries are `ceil(batches_per_epoch × k / 10)` for `k = 1..10`, so the tenth boundary always coincides with the epoch end and the two CSVs describe the same point in training.
 
 Each half of those rows is independently gated, and both knobs default to true.
@@ -649,12 +657,28 @@ Uniform inference installs clamped `[BOS]` at position 0 and initializes every o
 1. runs the same model over the clamped input and current canvas;
 2. temperature-shapes the logits using the current linear 0.8 → 0.4 schedule;
 3. sets only the `[MASK]` logit to negative infinity;
-4. samples categorical clean-state candidates;
-5. sorts eligible positions by entropy;
-6. accepts the prefix satisfying `cumsum(sorted_entropy) - sorted_entropy <= 0.1`;
-7. replaces every nonaccepted eligible position with fresh `[PAD]`/`[DELIMITER]`/content noise.
+4. evaluates the stopping-state certificate for the row (below);
+5. samples categorical clean-state candidates;
+6. sorts eligible positions by entropy;
+7. accepts the prefix satisfying `cumsum(sorted_entropy) - sorted_entropy <= 0.1`, **unless this is the row's terminal pass, in which case every eligible position is accepted**;
+8. replaces every nonaccepted eligible position with fresh `[PAD]`/`[DELIMITER]`/content noise.
 
-Acceptance is transient and recomputed on every pass; a previously plausible position can be renoised. Completed rows freeze. Adaptive stopping requires mean eligible-position entropy below 0.005 and unchanged argmax predictions across two consecutive passes.
+Acceptance is transient and recomputed on every pass; a previously plausible position can be renoised. Completed rows freeze. There is no persistent commitment mask and no position-specific ordering rule: canvas position 1 (`[WIN]`/`[LOSS]`) is denoised jointly with every other mutable position, and only `[BOS]` is clamped.
+
+### Stopping-state certificate and terminal passes
+
+Adaptive stopping requires **both** conditions on the same pass:
+
+- mean eligible-position entropy below `0.005`, and
+- a **denoiser fixed point**: the clean-state argmax equals, at every mutable position, the canvas that pass actually read.
+
+The second condition is a predicate on the STATE, matching the reference implementation's `TokenStabilityEarlyStop` (`all(argmax(logits) == previous_canvas)`) and the EB-Sampler formulation, whose stopping criterion is likewise a function `C: S → {True, False}` of the state. It replaces a retired rule that compared one pass's argmax against the previous pass's argmax; that rule never inspected the canvas, so it could certify a row as converged while every renoised position disagreed with the model. The retired `sampler.stability_steps` count went with it: a fixed-point certificate is a single-pass comparison of a prediction against the state that produced it, and requiring it on consecutive passes is unsatisfiable whenever the entropy budget leaves a nonempty renoised tail.
+
+A pass is **terminal** for a row when the certificate fires there, or when the 64-pass ceiling means no further pass will run. On a terminal pass the entropy budget is not applied: every eligible position takes its categorical candidate and nothing is renoised. The budget bounds the error of committing many positions while a later pass can still revise them; when no later pass exists, renoising injects noise the process can never remove and it would land in the returned canvas. This costs no extra model call — the distribution is already computed for that pass — and adds no hyperparameter.
+
+Consequently the returned canvas is always the state the stop decision refers to. Every mutable position holds a draw from the terminal pass's temperature-shaped clean-state distribution; no position ever holds a uniform renoise draw. `SamplerOutput.finalized_steps[row]` names the pass that produced each row's canvas, and `stop_reasons[row]` says what it is certified to be: `adaptive_entropy_stability` (a certified fixed point), `max_steps` (fully committed but not certified), `absorbing_complete`, or `no_eligible`.
+
+The absorbing ablation shares only the terminal-pass rule, which commits any positions still masked when the ceiling arrives so `[MASK]` cannot survive into a returned canvas. That is still monotone unmasking — nothing accepted is ever remasked — so the ablation stays process-compatible.
 
 Normal sampling returns a canvas `[B, 4096]`. Optional diagnostic final logits require one explicitly requested extra forward pass and have shape `[B, 4096, 291]`. The diagnostics-only one-pass path starts from the selected process's terminal prior with BOS clamped and performs exactly one denoiser call.
 

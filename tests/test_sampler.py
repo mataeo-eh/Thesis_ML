@@ -51,16 +51,128 @@ def test_exact_entropy_bounded_prefix_uses_prior_cumulative_entropy() -> None:
 
 
 def test_uniform_acceptance_is_nonmonotonic_and_unaccepted_positions_renoise() -> None:
-    config = _small_config(canvas_budget=3, max_steps=2, entropy_bound=0.0)
+    """A position accepted on one uniform pass may be renoised and revised later.
+
+    `max_steps=3` deliberately puts the renoising pass in the MIDDLE of the run.
+    The last pass a row executes is terminal and commits everything (see
+    `test_terminal_pass_commits_every_eligible_position_and_renoises_nothing`),
+    so a two-step run would have no non-terminal pass left to observe.
+    """
+
+    config = _small_config(canvas_budget=3, max_steps=3, entropy_bound=0.0)
     model = ChangingEntropyModel(config=config, canvas_len=3)
     output = sample_canvas(model, _batch(config), config)
 
     assert not output.trace[0].accepted_mask[0, 0]
     assert output.canvas[0, 0] == BOS_ID
+    # Accepted on pass 1 ...
     assert output.trace[0].accepted_mask[0, 1]
+    # ... and renoised again on pass 2, which is not this row's terminal pass.
+    assert not output.trace[1].terminal_rows[0]
     assert not output.trace[1].accepted_mask[0, 1]
     assert output.trace[1].unaccepted_mask[0, 1]
     assert output.trace[1].renoised_mask[0, 1]
+
+
+def test_terminal_pass_commits_every_eligible_position_and_renoises_nothing() -> None:
+    """The returned canvas never contains a uniform renoise draw.
+
+    This is the regression for the finalization defect: with a tight entropy
+    bound the sampler renoises a large tail on every ordinary pass, and the
+    defective sampler returned that tail verbatim. On the terminal pass the
+    budget is not applied, so every eligible position is committed.
+    """
+
+    config = _small_config(canvas_budget=3, max_steps=3, entropy_bound=0.0)
+    model = ChangingEntropyModel(config=config, canvas_len=3)
+    output = sample_canvas(model, _batch(config), config)
+
+    final = output.trace[-1]
+    assert bool(final.terminal_rows[0])
+    assert not final.renoised_mask.any()
+    assert not final.unaccepted_mask.any()
+    mutable = final.accepted_mask[0] | torch.tensor([True, False, False])
+    assert final.accepted_mask[0, 1] and final.accepted_mask[0, 2]
+    # BOS stays clamped and is never "committed".
+    assert not final.accepted_mask[0, 0]
+    assert output.canvas[0, 0] == BOS_ID
+    assert mutable.any()
+    # Every non-terminal pass DID renoise, so the terminal rule is what changed
+    # the outcome rather than the bound being loose.
+    assert any(step.renoised_mask.any() for step in output.trace[:-1])
+
+
+def test_returned_canvas_is_the_state_the_stop_decision_validated() -> None:
+    """Adaptive stop implies the returned canvas agrees with the denoiser.
+
+    The proven defect was a stop rule that compared one pass's argmax against the
+    PREVIOUS pass's argmax, never against the canvas. That can be satisfied while
+    every renoised position disagrees with the model. The repaired rule is a
+    fixed-point certificate on the state, so a row stopped this way must return a
+    canvas the denoiser endorses at every mutable position.
+    """
+
+    config = _small_config(canvas_budget=4, max_steps=8, entropy_bound=100.0)
+    config = replace(
+        config, sampler=replace(config.sampler, adaptive_stop=True, entropy_threshold=0.01)
+    )
+    target = torch.tensor([BOS_ID, WIN_ID, CONTENT_TOKEN_OFFSET, END_ID])
+    model = FixedCanvasModel(target, config=config, top_logit=50.0)
+    output = sample_canvas(model, _batch(config), config)
+
+    assert output.stop_reasons == ("adaptive_entropy_stability",)
+    finalizing = output.trace[output.finalized_steps[0] - 1]
+    assert bool(finalizing.canvas_fixed_point[0])
+    assert bool(finalizing.terminal_rows[0])
+    # The certificate is exactly "argmax equals the canvas that produced it".
+    assert torch.equal(output.canvas[0, 1:], target[1:])
+
+
+def test_no_outcome_position_special_case_exists() -> None:
+    """Canvas position 1 is denoised jointly with every other mutable position.
+
+    Only `[BOS]` at position 0 is clamped. There is no `outcome_last` rule, no
+    delayed outcome, and no position-1 exemption from acceptance or renoising.
+    """
+
+    config = _small_config(canvas_budget=4, max_steps=3, entropy_bound=0.0)
+    model = ChangingEntropyModel(config=config, canvas_len=4)
+    output = sample_canvas(model, _batch(config), config)
+
+    for step in output.trace:
+        # Position 0 is clamped in every pass; position 1 is not.
+        assert not step.accepted_mask[0, 0]
+        assert not step.renoised_mask[0, 0]
+    touched = any(
+        bool(step.accepted_mask[0, 1]) or bool(step.renoised_mask[0, 1])
+        for step in output.trace
+    )
+    assert touched, "position 1 must participate in ordinary uniform sampling"
+    # Position 1 is not sampled before or after its neighbours: it is finalized
+    # on the same terminal pass as every other mutable position.
+    final = output.trace[-1]
+    assert bool(final.accepted_mask[0, 1]) == bool(final.accepted_mask[0, 2])
+
+
+def test_hard_step_ceiling_exit_commits_without_certifying_a_fixed_point() -> None:
+    """The ceiling exit has deliberate semantics, distinct from the adaptive one."""
+
+    config = _small_config(canvas_budget=4, max_steps=3, entropy_bound=0.0)
+    config = replace(
+        config, sampler=replace(config.sampler, adaptive_stop=True, entropy_threshold=0.01)
+    )
+    model = AlternatingArgmaxModel(config=config, canvas_len=4)
+    output = sample_canvas(model, _batch(config), config)
+
+    assert output.stop_reasons == ("max_steps",)
+    assert output.steps == 3
+    assert output.finalized_steps == (3,)
+    final = output.trace[-1]
+    # Never certified as a fixed point ...
+    assert not any(bool(step.canvas_fixed_point[0]) for step in output.trace)
+    # ... but still fully committed, so no renoise reaches the result.
+    assert bool(final.terminal_rows[0])
+    assert not final.renoised_mask.any()
 
 
 def test_seeded_categorical_candidates_and_uniform_renoising_are_reproducible() -> None:
@@ -95,14 +207,27 @@ def test_optional_final_logits_are_the_only_extra_model_call() -> None:
     assert model.calls == output.steps + 1
 
 
-def test_adaptive_stop_requires_entropy_and_argmax_stability() -> None:
+def test_adaptive_stop_requires_entropy_and_a_canvas_fixed_point() -> None:
+    """Both conditions are required, and the stability half looks at the CANVAS.
+
+    The repaired stability condition is the reference implementation's
+    `TokenStabilityEarlyStop`: the clean-state argmax must equal the canvas that
+    produced it at every mutable position. The retired condition compared two
+    consecutive argmax tensors, which never inspected the canvas at all and so
+    could certify a row whose renoised positions all disagreed with the model.
+    """
+
     base = _small_config(canvas_budget=3, max_steps=3, entropy_bound=100.0)
     target = torch.tensor([BOS_ID, WIN_ID, CONTENT_TOKEN_OFFSET])
 
     both = replace(base, sampler=replace(base.sampler, adaptive_stop=True, entropy_threshold=0.01))
     both_output = sample_canvas(FixedCanvasModel(target, config=both, top_logit=50.0), _batch(both), both)
+    # Pass 1 reads the random prior (no fixed point) and writes the target;
+    # pass 2 reads the target, finds argmax == canvas, and stops.
     assert both_output.steps == 2
     assert both_output.stop_reasons == ("adaptive_entropy_stability",)
+    assert not bool(both_output.trace[0].canvas_fixed_point[0])
+    assert bool(both_output.trace[1].canvas_fixed_point[0])
 
     stability_only = replace(
         base, sampler=replace(base.sampler, adaptive_stop=True, entropy_threshold=0.0)
@@ -116,11 +241,14 @@ def test_adaptive_stop_requires_entropy_and_argmax_stability() -> None:
     assert stability_output.stop_reasons == ("max_steps",)
     assert stability_output.trace[-1].stop_reasons == ("max_steps",)
 
+    # Confident (low entropy) but never self-consistent: the argmax flips every
+    # pass, so the canvas it wrote is never what the next pass prefers.
     entropy_only_model = AlternatingArgmaxModel(config=both, canvas_len=3)
     entropy_output = sample_canvas(entropy_only_model, _batch(both), both)
     assert entropy_output.steps == 3
     assert entropy_output.stop_reasons == ("max_steps",)
     assert entropy_output.trace[-1].stop_reasons == ("max_steps",)
+    assert not any(bool(step.canvas_fixed_point[0]) for step in entropy_output.trace)
 
 
 def test_done_batch_rows_freeze_while_other_rows_continue() -> None:
@@ -138,6 +266,14 @@ def test_done_batch_rows_freeze_while_other_rows_continue() -> None:
         "adaptive_entropy_stability",
         "max_steps",
     )
+    # Each row's returned canvas is attributed to the pass that finalized it, and
+    # the two rows finalize on different passes.
+    assert output.finalized_steps == (2, 3)
+    assert bool(output.trace[1].terminal_rows[0])
+    assert not bool(output.trace[1].terminal_rows[1])
+    # The frozen row contributes no further acceptance or renoising.
+    assert not output.trace[2].accepted_mask[0].any()
+    assert not output.trace[2].renoised_mask[0].any()
 
 
 def test_absorbing_sampler_is_monotonic_and_never_renoises() -> None:
@@ -153,6 +289,32 @@ def test_absorbing_sampler_is_monotonic_and_never_renoises() -> None:
         previous_unmasked = unmasked
     assert (output.canvas != MASK_ID).all()
     assert output.stop_reasons == ("absorbing_complete",)
+
+
+def test_absorbing_ceiling_exit_commits_instead_of_returning_mask() -> None:
+    """Absorbing non-regression: `[MASK]` never survives into a returned canvas.
+
+    With a zero entropy bound only one position is unmasked per pass, so a
+    ceiling shorter than the mutable count ends the row mid-process. The terminal
+    pass commits the remainder. This is still monotone unmasking -- nothing that
+    was unmasked is ever remasked -- so the absorbing process stays intact.
+    """
+
+    base = _small_config(canvas_budget=6, max_steps=2, entropy_bound=0.0)
+    config = replace(base, diffusion=replace(base.diffusion, process="absorbing"))
+    target = torch.tensor(
+        [BOS_ID, WIN_ID, CONTENT_TOKEN_OFFSET, DELIMITER_ID, END_ID, PAD_ID]
+    )
+    output = sample_canvas(
+        FixedCanvasModel(target, config=config, top_logit=50.0), _batch(config), config
+    )
+
+    assert output.steps == 2
+    assert output.stop_reasons == ("max_steps",)
+    assert not (output.canvas == MASK_ID).any()
+    for step in output.trace:
+        assert not step.renoised_mask.any()
+    assert bool(output.trace[-1].terminal_rows[0])
 
 
 def test_infill_revealed_positions_are_clamped_and_excluded() -> None:

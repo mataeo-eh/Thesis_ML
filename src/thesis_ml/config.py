@@ -322,7 +322,6 @@ class SamplerConfig:
     entropy_bound: float
     adaptive_stop: bool
     entropy_threshold: float
-    stability_steps: int
 
 
 @dataclass(frozen=True)
@@ -656,8 +655,6 @@ def _validate_sampler(config: ProjectConfig) -> None:
         raise ConfigError("sampler.entropy_bound must be non-negative")
     if sampler.entropy_threshold < 0:
         raise ConfigError("sampler.entropy_threshold must be non-negative")
-    if sampler.stability_steps < 1:
-        raise ConfigError("sampler.stability_steps must be at least 1")
 
 
 def _validate_shared_training_sections(config: ProjectConfig) -> None:

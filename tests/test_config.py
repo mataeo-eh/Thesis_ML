@@ -115,7 +115,6 @@ def test_valid_config_loads() -> None:
     assert config.sampler.entropy_bound == 0.1
     assert config.sampler.adaptive_stop is True
     assert config.sampler.entropy_threshold == 0.005
-    assert config.sampler.stability_steps == 2
     assert not hasattr(config.sampler, "confidence_threshold")
     assert not hasattr(config.sampler, "min_commit_per_step")
     assert not hasattr(config.sampler, "outcome_last")

@@ -31,9 +31,20 @@ class SamplerStep:
     entropy: torch.Tensor
     mean_entropy: torch.Tensor
     argmax_predictions: torch.Tensor
-    argmax_stable: torch.Tensor
+    # Per row: did the denoiser's clean-state argmax equal, at EVERY mutable
+    # position, the canvas this pass actually read? This is the stopping-state
+    # certificate (see `sample_canvas`): a row for which it is True sits on a
+    # fixed point of the denoiser, so the state is self-consistent with what the
+    # model says about it. It is NOT "the argmax repeated itself", which can be
+    # true while every renoised position disagrees with the canvas.
+    canvas_fixed_point: torch.Tensor
     done_rows: torch.Tensor
     stop_reasons: tuple[str | None, ...]
+    # Per row: was this the row's TERMINAL pass, i.e. the last pass it will ever
+    # execute (its adaptive stop fired here, or the step ceiling ends it here)?
+    # A terminal pass commits every eligible position and renoises nothing, so
+    # the canvas below is the row's returned result.
+    terminal_rows: torch.Tensor
     canvas: torch.Tensor
     # --- per-step forward telemetry ------------------------------------------
     # Wall time of THIS step's single model forward call, in seconds (the unit
@@ -52,6 +63,40 @@ class SamplerStep:
 
 @dataclass(frozen=True)
 class SamplerOutput:
+    """The finished sampling result and the state that explains it.
+
+    Result contract (uniform process; see `sample_canvas` for the algorithm):
+
+    - `canvas` is each row's FINALIZED canvas. Every mutable position in it holds
+      a categorical draw from the temperature-shaped clean-state distribution of
+      that row's terminal pass. No position ever holds a uniform renoise draw:
+      renoising is a mid-process transition, never a result.
+    - `finalized_steps[row]` is the 1-based pass that produced `canvas[row]`, so
+      the returned canvas is always traceable to exactly one denoiser
+      distribution: `trace[finalized_steps[row] - 1]`.
+    - `stop_reasons[row]` says WHY that pass was terminal, and what the canvas is
+      certified to be:
+        * `adaptive_entropy_stability` -- the row reached a denoiser fixed point
+          (argmax equalled the canvas at every mutable position) at low mean
+          entropy, and was then committed. The strongest guarantee available.
+        * `max_steps` -- the ceiling ended the row before it reached a fixed
+          point. The canvas is a fully committed clean-state draw, but it is NOT
+          certified to be a fixed point.
+        * `absorbing_complete` -- absorbing ablation only: every eligible
+          position was unmasked before the ceiling.
+        * `no_eligible` -- the row had no mutable position to sample.
+    - `accepted_mask` is the final pass's acceptance mask. On a terminal pass
+      that is every eligible position of the finalizing rows, because the entropy
+      budget is not applied when no later pass can revise the result.
+    - The self-conditioning signal carried into a row's terminal pass is the one
+      derived from its immediately preceding pass; a row frozen as done stops
+      contributing to and consuming that state (see `sample_canvas`).
+    - `final_canvas_logits` is diagnostics-only and is the ONLY extra model call
+      the sampler ever makes. It is one additional pass over the already
+      finalized `canvas`, so it reports what the denoiser says about the returned
+      result rather than participating in producing it.
+    """
+
     canvas: torch.Tensor
     input_token_ids: torch.Tensor
     initial_input_token_ids: torch.Tensor
@@ -60,6 +105,7 @@ class SamplerOutput:
     stop_reasons: tuple[str, ...]
     steps: int
     trace: list[SamplerStep]
+    finalized_steps: tuple[int, ...] = ()
     final_canvas_logits: torch.Tensor | None = None
     revealed_mask: torch.Tensor | None = None
 
@@ -304,9 +350,12 @@ def denoise_canvas_once(
             entropy=entropy.detach().cpu(),
             mean_entropy=mean_entropy.detach().cpu(),
             argmax_predictions=predicted.detach().cpu(),
-            argmax_stable=torch.zeros_like(done_rows).cpu(),
+            # One-shot denoising installs the argmax everywhere, so the returned
+            # canvas trivially agrees with the model that produced it.
+            canvas_fixed_point=torch.ones_like(done_rows).cpu(),
             done_rows=done_rows.cpu(),
             stop_reasons=tuple("single_pass" for _ in range(input_token_ids.shape[0])),
+            terminal_rows=torch.ones_like(done_rows).cpu(),
             canvas=final_canvas.detach().cpu(),
             forward_wall_seconds=forward_timer.seconds,
             used_cached_input_kv=False,
@@ -321,6 +370,7 @@ def denoise_canvas_once(
         stop_reasons=tuple("single_pass" for _ in range(input_token_ids.shape[0])),
         steps=1,
         trace=trace,
+        finalized_steps=tuple(1 for _ in range(input_token_ids.shape[0])),
         final_canvas_logits=canvas_logits.detach().cpu() if return_final_logits else None,
         revealed_mask=revealed.detach().cpu(),
     )
@@ -336,7 +386,75 @@ def sample_canvas(
     return_final_logits: bool = False,
     noise_rate: float = 1.0,
 ) -> SamplerOutput:
-    """Sample with nonmonotonic uniform EB or monotonic absorbing EB."""
+    """Sample with nonmonotonic uniform EB or monotonic absorbing EB.
+
+    Uniform process, one pass
+    -------------------------
+    1. One model forward over the current canvas produces clean-state logits.
+    2. Those logits are temperature-shaped, `[MASK]` is removed, and the result
+       gives this pass's probabilities, per-position entropy, and argmax.
+    3. STOPPING-STATE VALIDATION. A row is finished when its clean-state argmax
+       equals, at every mutable position, the canvas this pass just read, AND its
+       mean entropy over mutable positions is below `entropy_threshold`. The
+       first half is a fixed-point certificate on the STATE, matching the
+       reference implementation's `TokenStabilityEarlyStop`
+       (`all(argmax(logits) == previous_canvas)`) and the EB-Sampler paper's
+       stopping criterion `C: S -> {True, False}`, which is likewise a predicate
+       on the state rather than on a history of predictions.
+    4. TERMINAL PASS. A pass is terminal for a row when step 3 finished it or
+       when the `max_steps` ceiling means no further pass will run. On a terminal
+       pass the entropy budget is NOT applied: every eligible position takes its
+       categorical candidate and nothing is renoised. The budget exists to bound
+       the error of committing many positions while a later pass can still revise
+       them; when no later pass exists, renoising injects noise the process can
+       never remove, and it would land in the returned result.
+    5. Otherwise the ordinary entropy-bounded transition applies: accept the
+       ascending-entropy prefix satisfying `cumsum(h) - h <= entropy_bound`, and
+       replace every nonaccepted eligible position with a fresh uniform draw.
+    6. The self-conditioning signal for the next pass is derived from this pass's
+       already-computed distribution. No extra model call is made.
+
+    The process stays nonmonotonic: acceptance is recomputed from scratch every
+    pass, there is no persistent commitment mask, and any mutable position may be
+    renoised and revised until its row's terminal pass. Only `[BOS]`,
+    infill-revealed positions, and batch-invalid positions are excluded, via
+    `mutable`.
+
+    Why step 3 and step 4 are one repair
+    ------------------------------------
+    Each alone is insufficient. Without step 3 the sampler can certify a row as
+    converged while the canvas disagrees with the model everywhere the previous
+    pass renoised, because comparing one argmax against the previous argmax never
+    looks at the canvas at all. Without step 4 a row that legitimately reaches
+    its ceiling returns the mid-process latent, uniform renoise included. Together
+    they make the returned canvas exactly the state the stop decision refers to.
+
+    Absorbing ablation
+    ------------------
+    Unchanged in kind: candidates are drawn only at still-`[MASK]` positions,
+    accepted positions are never remasked, nonaccepted positions stay masked, and
+    the row finishes when nothing eligible is masked. It shares only the terminal
+    -pass rule from step 4, which commits any positions still masked when the
+    ceiling arrives so a `[MASK]` can never survive into a returned canvas. That
+    is still monotone unmasking, so the process stays compatible.
+
+    Parameters:
+        model: the denoiser to sample from.
+        batch: the collated batch to sample a canvas for.
+        config: merged project configuration; owns every sampler parameter.
+        device: device to run on.
+        return_final_logits: when True, perform ONE extra diagnostics-only
+            forward pass over the finalized canvas. Off the normal path.
+        noise_rate: output-canvas noise level `t`; `1.0` is the terminal prior.
+
+    Returns:
+        A :class:`SamplerOutput` whose contract is documented on that class.
+
+    Calls: `_initial_canvas`, `sampler_temperature`,
+    `_sample_categorical_at_positions`, `_entropy_bounded_acceptance`,
+    `_sample_uniform_at_positions`, `_allowed_probabilities`, `_entropy`,
+    `_row_mean`, `canvas_self_conditioning_from_logits`.
+    """
 
     active_device = torch.device(device)
     model = model.to(active_device)
@@ -365,11 +483,12 @@ def sample_canvas(
     stop_reasons: list[str | None] = [
         "no_eligible" if bool(done_rows[row]) else None for row in range(batch_size)
     ]
-    previous_argmax: torch.Tensor | None = None
-    stable_counts = torch.zeros(batch_size, dtype=torch.long, device=active_device)
     canvas_self_conditioning: torch.Tensor | None = None
     accepted = torch.zeros_like(mutable)
     trace: list[SamplerStep] = []
+    # 1-based pass that produced each row's returned canvas. A row that starts
+    # out done (`no_eligible`) never executes a pass and keeps 0.
+    finalized_steps = [0] * batch_size
 
     # --- frozen input-KV reuse -----------------------------------------------
     # The input region is fixed for the whole of sampling: `input_token_ids`,
@@ -424,33 +543,39 @@ def sample_canvas(
         probs = _allowed_probabilities(raw_canvas_logits / temperature)
         entropy = _entropy(probs)
         argmax_predictions = probs.argmax(dim=-1)
+        # The state THIS pass read. Every comparison below that decides whether
+        # the row is finished is made against this, never against a previous
+        # pass's predictions, so a stop can only be declared about a canvas the
+        # model has actually seen and endorsed.
+        canvas_in = canvas
 
-        same_as_previous = torch.zeros(batch_size, dtype=torch.bool, device=active_device)
-        if previous_argmax is not None:
-            same_as_previous = active_rows & (
-                (argmax_predictions == previous_argmax) | ~mutable
-            ).all(dim=1)
-        stable_counts = torch.where(
-            active_rows,
-            torch.where(
-                same_as_previous,
-                stable_counts + 1,
-                torch.ones_like(stable_counts),
-            ),
-            stable_counts,
-        )
-        argmax_stable = stable_counts >= config.sampler.stability_steps
-        if previous_argmax is None:
-            previous_argmax = argmax_predictions.detach()
-        else:
-            previous_argmax = torch.where(
-                active_rows[:, None],
-                argmax_predictions.detach(),
-                previous_argmax,
-            )
+        # --- stopping-state validation ---------------------------------------
+        # A denoiser fixed point: at every mutable position the model's
+        # clean-state argmax IS the token already sitting there. Non-mutable
+        # positions (clamped `[BOS]`, infill-revealed, batch padding) are
+        # excluded via `~mutable` because they are not the sampler's to change.
+        canvas_fixed_point = active_rows & (
+            (argmax_predictions == canvas_in) | ~mutable
+        ).all(dim=1)
+
+        # Is this the last pass the ceiling allows? Rows still active on it will
+        # never get another chance to revise, so it is terminal for them.
+        ceiling_pass = step_index == config.sampler.max_steps - 1
 
         if config.diffusion.process == "uniform":
             selectable = mutable & active_rows[:, None]
+            mean_entropy = _row_mean(entropy, mutable)
+            newly_done = torch.zeros_like(active_rows)
+            if config.sampler.adaptive_stop:
+                newly_done = (
+                    canvas_fixed_point
+                    & (mean_entropy < config.sampler.entropy_threshold)
+                )
+            # Terminal for a row when its adaptive stop just fired, or when the
+            # ceiling ends it here. See step 4 in the docstring: a terminal pass
+            # commits every eligible position instead of applying the budget.
+            terminal_rows = active_rows & (newly_done | ceiling_pass)
+
             candidates = _sample_categorical_at_positions(
                 probs,
                 selectable,
@@ -462,7 +587,11 @@ def sample_canvas(
                 selectable,
                 config.sampler.entropy_bound,
             )
+            accepted = torch.where(terminal_rows[:, None], selectable, accepted)
             unaccepted = selectable & ~accepted
+            # Drawn unconditionally so the generator stream is identical on every
+            # pass regardless of which rows are terminal; a terminal row simply
+            # never selects it, because `unaccepted` is empty for that row.
             fresh_noise = _sample_uniform_at_positions(
                 canvas,
                 selectable,
@@ -475,18 +604,16 @@ def sample_canvas(
                 torch.where(unaccepted, fresh_noise, canvas),
             )
             renoised = unaccepted
-            mean_entropy = _row_mean(entropy, mutable)
-            if config.sampler.adaptive_stop:
-                newly_done = (
-                    active_rows
-                    & (mean_entropy < config.sampler.entropy_threshold)
-                    & argmax_stable
-                )
-                for row in torch.nonzero(newly_done, as_tuple=False).flatten().tolist():
-                    stop_reasons[row] = "adaptive_entropy_stability"
-                done_rows = done_rows | newly_done
+            for row in torch.nonzero(newly_done, as_tuple=False).flatten().tolist():
+                stop_reasons[row] = "adaptive_entropy_stability"
+            done_rows = done_rows | newly_done
         else:
             selectable = mutable & canvas.eq(MASK_ID) & active_rows[:, None]
+            # Absorbing rows finish by exhausting their masked positions, so the
+            # only terminal case here is the ceiling. Committing the remainder
+            # there keeps `[MASK]` -- which is invalid in any finished canvas --
+            # out of the returned result without remasking anything.
+            terminal_rows = active_rows & ceiling_pass
             candidates = _sample_categorical_at_positions(
                 probs,
                 selectable,
@@ -498,14 +625,24 @@ def sample_canvas(
                 selectable,
                 config.sampler.entropy_bound,
             )
+            accepted = torch.where(terminal_rows[:, None], selectable, accepted)
             unaccepted = selectable & ~accepted
             renoised = torch.zeros_like(unaccepted)
             canvas = torch.where(accepted, candidates, canvas)
             mean_entropy = _row_mean(entropy, selectable)
             newly_done = active_rows & ~(mutable & canvas.eq(MASK_ID)).any(dim=1)
-            for row in torch.nonzero(newly_done, as_tuple=False).flatten().tolist():
+            # A row the ceiling forced to completion is reported as `max_steps`,
+            # not `absorbing_complete`: it did not finish the process on its own.
+            completed = newly_done & ~terminal_rows
+            for row in torch.nonzero(completed, as_tuple=False).flatten().tolist():
                 stop_reasons[row] = "absorbing_complete"
             done_rows = done_rows | newly_done
+
+        # Every row that acted on this pass has its returned canvas produced by
+        # it; a row that is terminal here will not act again, and a row that is
+        # not will overwrite this on its next pass.
+        for row in torch.nonzero(active_rows, as_tuple=False).flatten().tolist():
+            finalized_steps[row] = step_index + 1
 
         if config.model.self_conditioning:
             next_self_conditioning = canvas_self_conditioning_from_logits(
@@ -531,9 +668,10 @@ def sample_canvas(
                 entropy=entropy.detach().cpu(),
                 mean_entropy=mean_entropy.detach().cpu(),
                 argmax_predictions=argmax_predictions.detach().cpu(),
-                argmax_stable=argmax_stable.detach().cpu(),
+                canvas_fixed_point=canvas_fixed_point.detach().cpu(),
                 done_rows=done_rows.detach().cpu(),
                 stop_reasons=tuple(stop_reasons),
+                terminal_rows=terminal_rows.detach().cpu(),
                 canvas=canvas.detach().cpu(),
                 forward_wall_seconds=forward_timer.seconds,
                 used_cached_input_kv=step_used_cached_input_kv,
@@ -578,6 +716,7 @@ def sample_canvas(
         stop_reasons=tuple(str(reason) for reason in stop_reasons),
         steps=len(trace),
         trace=trace,
+        finalized_steps=tuple(finalized_steps),
         final_canvas_logits=final_canvas_logits,
         revealed_mask=revealed.detach().cpu(),
     )

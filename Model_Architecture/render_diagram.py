@@ -57,6 +57,14 @@ POSITIONS: dict[str, tuple[float, float]] = {
     "SLICE": (0.0, -10.7),
     "LOSS": (0.0, -12.7),
     "DEC": (0.0, -14.9),
+    # Inference branch, hung off the canvas-logits slice to the right of the
+    # training column. EBA sits beside SAMP because it feeds the next pass back
+    # into it; the FIX -> TERM -> RET spine is the exit path.
+    "SAMP": (6.9, -8.7),
+    "FIX": (6.9, -10.9),
+    "EBA": (11.1, -10.9),
+    "TERM": (6.9, -13.1),
+    "RET": (6.9, -15.3),
 }
 
 COLORS: dict[str, tuple[str, str]] = {
@@ -92,6 +100,11 @@ CATEGORY = {
     "SLICE": "output",
     "LOSS": "loss",
     "DEC": "loss",
+    "SAMP": "canvas",
+    "FIX": "conditioning",
+    "EBA": "canvas",
+    "TERM": "output",
+    "RET": "output",
 }
 
 
@@ -167,8 +180,8 @@ def render() -> None:
             "svg.hashsalt": "thesis-ml-model-architecture",
         }
     )
-    fig, axis = plt.subplots(figsize=(16, 23.6), dpi=150)
-    axis.set_xlim(-7.25, 8.55)
+    fig, axis = plt.subplots(figsize=(20.8, 23.6), dpi=150)
+    axis.set_xlim(-7.25, 13.3)
     # Lower bound clears the decomposition node at y=-14.9 plus its box height
     # and leaves room for the source footer beneath it.
     axis.set_ylim(-16.7, 15.4)
@@ -197,6 +210,7 @@ def render() -> None:
     )
     axis.text(-3.4, 13.6, "CLAMPED INPUT", ha="center", fontsize=10, fontweight="bold", color="#334E7D")
     axis.text(4.85, 13.6, "DENOISING CANVAS", ha="center", fontsize=10, fontweight="bold", color="#8A4B08")
+    axis.text(8.0, -7.1, "ITERATIVE SAMPLING (INFERENCE)", ha="center", fontsize=10, fontweight="bold", color="#8A4B08")
 
     for source, target in edges:
         start = boundary_point(POSITIONS[source], sizes[source], POSITIONS[target])
