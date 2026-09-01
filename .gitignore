@@ -35,6 +35,7 @@ checkpoints/
 data/*
 scripts/output/canvas_unigram_baseline/
 scripts/output/timestep_alignment_probe/
+scripts/output/rare_token_signal_probe/
 
 # ---- Agent tooling (local, not shared) ----
 .agents/
