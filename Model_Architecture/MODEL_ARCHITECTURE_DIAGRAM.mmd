@@ -1,5 +1,8 @@
 flowchart TD
     %% Training schedule: WSD = 500-step warmup, stable middle, final 20% decay.
+    %% Default stop and schedule horizons match; the capacity suite deliberately
+    %% stops at epoch 3 while retaining each arm's 50-epoch LR/EMA horizon.
+    %% Fog/corruption/self-conditioning are paired per seed + epoch + example.
     A["Clamped input · power fog 0..0.8<br/>[B, Li], Li ≤ 4096"] --> E["Shared token embedding<br/>291 → 384"]
     AF["Input features<br/>25 values + 25 validity<br/>309 categorical + 1 allegiance<br/>= 360"] --> FM["Feature MLP<br/>360 → 32 → 32"]
     E --> JM["Joint mixer<br/>(384 + 32) → 384 → 384"]

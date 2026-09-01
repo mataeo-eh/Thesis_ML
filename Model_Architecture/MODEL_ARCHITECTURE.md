@@ -72,9 +72,10 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 | Effective-token accumulation target | disabled (`0`) |
 | Reclaim-first CUDA reservation ceiling | 6.5 GiB |
 | Epochs | 50 maximum; dev-loss early stopping patience 10 |
+| `train.schedule_horizon_epochs` | 0 (schedule follows the 50-epoch run) |
 | Checkpoints | resume every 100 optimizer steps; best-dev per improved epoch; durable every 5 epochs |
 | EMA decay | derived per run; ceiling 0.9999 |
-| EMA horizon ratio | 0.1 × the run's total optimizer steps |
+| EMA horizon ratio | 0.1 × the configured schedule steps (the current run steps here) |
 | Training self-conditioning probability | 0.5 per row |
 | Compute precision | BF16 autocast |
 | Stored parameter dtype | FP32 |
@@ -82,11 +83,28 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 | Sampler temperature | linear 0.8 → 0.4 |
 | Entropy bound | 0.1 |
 | Adaptive entropy threshold | 0.005 |
-| Required stable passes | 2 |
+| Required consecutive stable passes | none; one fixed-point certificate is sufficient |
 
 `train.max_steps: 0` is resolved by the pipeline to `ceil(len(train_loader) / accumulation_steps) × train.epochs` before the scheduler is constructed. With the current 7,144 training microbatches per epoch, V3 plans 1,021 optimizer steps per epoch and 51,050 over 50 epochs. That resolved optimizer-step horizon drives both the learning-rate schedule and EMA window.
 
 The default `wsd` multiplier uses exactly 500 warmup, 40,340 stable, and 10,210 decay optimizer steps at the current horizon. The LR rises linearly to `3e-4` over a fixed number of optimizer updates, remains there for the intervening 79.02% of this run, then decays linearly to `3e-6` over the final 20%. Warmup no longer expands when the epoch budget grows: `train.warmup` owns its absolute optimizer-step count, `train.lr_decay_ratio` owns the terminal share, and the stable phase fills the remainder. This follows the original WSD formulation, where warmup ends at a fixed step `W` and the decay budget is studied separately. `train.lr_schedule` can also select the legacy `cosine` or `linear` post-warmup schedules; historical profiles pin those choices explicitly.
+
+### Parameter-count/capacity suite
+
+`tests/SizeAblationTest.bat` runs six full-corpus profiles in ascending size order. All retain this architecture family, 64-dimensional vanilla-MHA heads, QK-norm, dense GeGLU, sandwich RMSNorm, scaled RoPE, self-conditioning, frozen input K/V, uniform diffusion, and the V3 optimizer/loss/data settings.
+
+The shape ladder uses depth and width together instead of forcing parameter targets through pathological FFN widths. The dedicated matched-width control is motivated by [MobileLLM's primary depth/width ablation](https://arxiv.org/abs/2402.14905), which found 30/42-layer sub-billion models stronger than 12-layer peers, while the retained 64-dimensional head convention is also used by the small/medium models in the [GPT-3 architecture table](https://arxiv.org/abs/2005.14165). This repository does **not** import MobileLLM's GQA, embedding sharing, or block sharing: those would violate or confound the settled Thesis_ML family. The evidence is motivation for the measured depth control, not a claim that language-model optima transfer automatically to SC2 diffusion.
+
+| Arm | Width | Blocks | Heads | GeGLU width | Parameters | Microbatch × accumulation |
+|---|---:|---:|---:|---:|---:|---:|
+| 005m | 192 | 12 | 3 | 384 | 4,750,016 | 12 × 4 = 48 |
+| 015m | 320 | 14 | 5 | 640 | 15,078,080 | 8 × 6 = 48 |
+| 030m baseline | 384 | 12 | 6 | 1,536 | 29,318,720 | 6 × 7 = 42 |
+| 030m deep | 384 | 18 | 6 | 896 | 30,213,440 | 5 × 9 = 45 |
+| 060m | 512 | 22 | 8 | 1,024 | 59,359,296 | 3 × 15 = 45 |
+| 120m | 768 | 20 | 12 | 1,536 | 121,465,152 | 1 × 45 = 45 |
+
+Each arm sets `train.epochs: 3` and `train.schedule_horizon_epochs: 50`. The first value is the hard run stop; the second is resolved from that arm's own optimizer steps per epoch and drives both WSD and EMA. Thus the three measured epochs reproduce the opening of a 50-epoch run rather than compressing warmup/stable/decay or EMA into three epochs. Because effective batches cannot match exactly, every changed arm is at or above the baseline's 42 nominal windows per update.
 
 ## Vocabulary and learned state space
 
@@ -232,6 +250,8 @@ t_b = U_b^{1/2}, \quad U_b \sim Uniform(0,1).
 \]
 
 This is `Beta(2,1)`: 43.75% of continuous draws satisfy `t>=0.75`, while 6.25% satisfy `t<0.25`. An independent branch forces exactly `t=1` for 5% of examples. Every loss-eligible canvas position independently enters the corruption branch with probability `t_b`. Selected positions are replaced uniformly with `[PAD]`, `[DELIMITER]`, or one of 283 content IDs; the replacement can equal the clean target. `[WIN]`/`[LOSS]` at position 1 are eligible for replacement even though neither token is in the replacement support. The EOS-terminated input and canvas position-0 BOS are returned unchanged.
+
+Production stochastic seeds are derived from `(pipeline.seed, epoch, manifest index)`. Fog uses a domain-separated NumPy stream; canvas time, corruption branches/replacements, and self-conditioning use per-row torch streams. The manifest order is shuffled reproducibly per epoch, and per-row streams do not depend on worker assignment or microbatch boundaries. A rolling checkpoint also stores the fallback stateful generator used by synthetic/direct callers. This pairs stochastic examples across size arms and across resume without removing randomness from any configured distribution.
 
 The model does not receive `t_b` as a scalar, embedding, token, or feature. It must infer the current noise level from the noised canvas itself.
 
@@ -601,6 +621,7 @@ There is no special no-decay group, so embeddings, RMSNorm scales, and biases re
 ### Schedule and optimization
 
 - WSD with 500 fixed linear-warmup optimizer steps, a stable peak phase filling the middle, and a final 20% linear decay.
+- `schedule_horizon_epochs: 0` makes current V3's LR/EMA horizon equal its 50-epoch stop; capacity profiles set it to 50 while stopping at epoch 3.
 - Peak `3e-4`; final learning-rate multiplier 0.01, giving `3e-6`.
 - Gradient norm clipping at 1.0.
 - Seven six-row microbatches per optimizer step (`accumulation_steps=7`, dynamic token target disabled): 42 windows and a measured mean of about 275k valid input-plus-canvas tokens per update (262k–285k over the 20-step RTX 3070 validation).
@@ -624,7 +645,7 @@ The decay \(d\) is **not** a fixed constant. An EMA with decay \(d\) averages ov
 d_{target} = \min\left(\texttt{ema\_decay},\; 1 - \frac{1}{\texttt{ema\_horizon\_ratio} \times \texttt{total\_steps}}\right).
 \]
 
-At `ema_horizon_ratio: 0.1` the window is always 10% of the run — 340 steps for a 3,400-step run, about ten full turnovers before the last step — whatever the epoch budget is. `train.ema_decay: 0.9999` acts as a ceiling, so runs of 100,000+ steps behave exactly as the old constant did. `TrainingLoop.fit` re-derives the value from the step budget it actually resolves, so an explicitly bounded run still gets an EMA that completes inside the steps it is given.
+At `ema_horizon_ratio: 0.1` the window is 10% of the configured schedule — ordinarily the actual run, so a 3,400-step run uses a 340-step window and gets about ten turnovers. `train.ema_decay: 0.9999` acts as a ceiling, so schedules of 100,000+ steps behave exactly as the old constant did. A positive `train.schedule_horizon_epochs` is the deliberate exception: the capacity suite stops after three epochs but retains a 50-epoch LR/EMA horizon, because its purpose is to compare the same early segment of the reference schedule rather than optimize an EMA specifically for a three-epoch endpoint.
 
 `_update_ema` additionally ramps the decay in as \(\min(d_{target}, (1+n)/(10+n))\) over the first updates, where \(n\) counts EMA updates so far (it is checkpointed with `global_step`, so a resumed run continues the ramp rather than restarting it). Without the ramp the EMA holds onto the random initialization it was copied from for a full window, which matters here because dev validation and every periodic checkpoint read the EMA weights rather than the raw ones.
 
@@ -754,13 +775,13 @@ These are high-consequence implementation facts that must remain explicit in fut
 
 ## Provenance boundary
 
-Older console logs and vocabulary-v1 checkpoints are historical and must not be used as the current source architecture. A current checkpoint must stamp `dense-multinomial-SC2-v2`, carry 291-row embedding/head tensors, and pass feature-statistics identity validation.
+Older console logs and vocabulary-v1 checkpoints are historical and must not be used as the current source architecture. A current default-derived checkpoint must stamp `dense-multinomial-SC2-v2+frozen_input_kv`, carry 291-row embedding/head tensors, and pass feature-statistics identity validation.
 
 ## Source-of-truth map
 
 | Concern | Owning source |
 |---|---|
-| Canonical defaults and merged profiles | `config/default.yaml`, `configs/smallTrainingTestV3.yaml`, `configs/local_full.yaml`, `src/thesis_ml/config.py` |
+| Canonical defaults and merged profiles | `config/default.yaml`, `configs/smallTrainingTestV3.yaml`, `configs/size_ablation_*.yaml`, `configs/local_full.yaml`, `src/thesis_ml/config.py` |
 | Special/content vocabulary | `src/thesis_ml/vocab/special_tokens.py`, `src/thesis_ml/vocab/content_vocab.py`, `data/Token_Dictionary.json` |
 | Raw feature codec and widths | `src/thesis_ml/data/features.py` |
 | Feature statistics | `src/thesis_ml/data/feature_stats.py` and configured statistics artifact |
@@ -782,4 +803,4 @@ Older console logs and vocabulary-v1 checkpoints are historical and must not be 
 
 When any source above or any model-facing config changes, use `UPDATE_PROMPT.md`, recompute the live values, update every affected section here, edit the canonical `.mmd`, regenerate the SVG/PNG, run the owning focused tests, and refresh the semantic indexes. Do not append a new architecture version; replace stale content in place.
 
-**Diagram scope.** `MODEL_ARCHITECTURE_DIAGRAM.mmd` depicts the training-time forward path only: embeddings, corruption, self-conditioning, region concatenation, the block stack, the head, the canvas slice, and the loss decompositions. It contains no sampling nodes, no denoising-loop edge, no forward-call-count node, and no input-KV node. It also depicts the all-toggles-off path, which is what every committed profile executes. The three ablation toggles and the sampler's frozen-KV reuse, per-pass trace fields, and `input_lengths` guard therefore changed no node, label, or edge in that graph, and the `.mmd`/SVG/PNG were correctly left unregenerated in that change. A future change that enables a toggle by default, or that alters the depicted training path, does require the full diagram pass.
+**Diagram scope.** `MODEL_ARCHITECTURE_DIAGRAM.mmd` depicts the current V3 path: embeddings, corruption, expected-embedding self-conditioning, promoted frozen input K/V plus live canvas queries, the block stack, the head, canvas slice, loss decompositions, and the iterative sampler summary. It does not expand the six size profiles into separate graphs because their topology is identical and their exact dimensions/counts are tabulated above. The canonical Mermaid source was regenerated in this change after its schedule/RNG annotations were synchronized.

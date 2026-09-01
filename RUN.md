@@ -51,6 +51,20 @@ uses six-row microbatches and seven-batch accumulation (42 windows and roughly
 275k valid tokens per optimizer step), with a 6.5 GiB reclaim-first reservation
 ceiling for the 8 GiB RTX 3070.
 
+Run the parameter-count/capacity suite with:
+
+```bat
+tests\SizeAblationTest.bat
+```
+
+It runs 005m, 015m, the current 030m baseline, the deeper 030m control, 060m,
+and 120m in that order. Re-running the launcher skips validated finished arms
+and resumes the first interrupted arm from its own rolling checkpoint; a failed
+or ambiguous arm stops the sequence before any larger model starts. Use
+`tests\SizeAblationTest.bat --dry-run` to print the decisions without launching
+training. Generated status, metrics, logs, and checkpoints live below
+`tests\output\SizeAblationTest\` and remain ignored.
+
 On Windows, equivalent thin launchers write console output and run artifacts to
 `tests\output\overfitV2\` and `tests\output\smallTrainingTestV2\`:
 
@@ -98,6 +112,9 @@ All input/output locations are in `config/default.yaml`:
 - `pipeline.replay_subset_size`: seeded training-replay subset (`0` means all).
 - `pipeline.train_replay_count`: when positive, use an exact count split with this many train replays, `validation_replay_count` dev replays, and every remainder in test; `0` keeps fraction-based splitting.
 - `train.epochs`: used when `train.max_steps` is `0`.
+- `train.schedule_horizon_epochs`: `0` fits LR/EMA to the actual run; a positive
+  value keeps those schedules on that many epochs while `train.epochs` remains
+  the stop limit. The capacity suite uses 50 and stops after epoch 3.
 - `train.lr_schedule`: `wsd`, `cosine`, or `linear`; all use the configurable fixed `train.warmup` optimizer-step count, while WSD separately configures its final decay ratio and floor and fills the intervening steps with its stable phase.
 - `train.accumulation_steps`: microbatches per optimizer step; epoch-derived horizons count optimizer steps.
 - `train.early_stopping_patience_epochs`: consecutive dev-loss epochs below the relative-improvement threshold before stopping (`0` disables).
@@ -151,10 +168,13 @@ snapshots (otherwise only the rolling `last.pt` is kept, so disk/S3 stays flat).
 
 ### Monitoring a long run
 
-Per-step metrics (loss, per-class losses, learning rate, corruption fraction, step
-wall time, tokens/sec, CUDA peak allocated bytes, CUDA reserved bytes, and
-periodic held-out validation) are appended to `metrics.jsonl` and uploaded to
-`storage.log_uri` on the checkpoint cadence. CUDA attention is restricted to
+Per-step metrics (optimizer-step mean loss, cumulative `epoch_loss_so_far`,
+per-class losses, learning rate, corruption fraction, step wall time, tokens/sec,
+CUDA memory telemetry, and periodic held-out validation) are appended to the step
+JSONL and uploaded to `storage.log_uri` on the checkpoint cadence. The terminal
+progress line prints the current and cumulative epoch loss without repeating the
+CUDA telemetry; the final cumulative value exactly matches the epoch CSV
+`train_loss`. CUDA attention is restricted to
 Flash or memory-efficient SDPA, so an incompatible mask fails instead of
 falling back to quadratic-memory math attention. Tail or parse the file to
 track a multi-day run and abort early if the loss curves go wrong. A reproducible
@@ -165,7 +185,21 @@ validation; the test split is held out for final evaluation.
 Local profiles also write `epoch_metrics.csv` with epoch train/dev loss,
 train/dev per-class losses, p50/p90/p95 input and future horizon lengths,
 train/dev future-token loss bucketed by prediction distance, cumulative token
-counts, tokens/sec, and cumulative wall-clock elapsed time. The overfit profiles
+counts, tokens/sec, and cumulative wall-clock elapsed time.
+
+Each split's headline loss is followed immediately by that split's token-level
+metrics: `accuracy` and `macro_f1` for the `ground_truth_preserved` and `noised`
+canvas states, then `bits_per_token` and `perplexity`. Read the `noised` figures
+as the denoising work proper and the `ground_truth_preserved` ones as whether the
+model leaves already-correct tokens alone; the two are reported separately
+because a single pooled accuracy would largely reflect how corrupted the sampled
+examples happened to be. `macro_f1` gives every token id one vote regardless of
+frequency, so it drops when a model buys accuracy by collapsing onto the common
+tokens. `bits_per_token` is the plain UNWEIGHTED cross entropy per scored
+position, which is why it is not `log2` of the loss column, and `perplexity` is
+`2 ** bits_per_token`. Those two are comparable across your own models whenever
+the splits and the corruption schedule match, but they are not the same quantity
+as a language model's next-token perplexity. The overfit profiles
 record their seeded 25 train and three disjoint dev replay IDs in
 `replay_selection.json` beside that CSV. `tests\overfit.bat` launches the V2
 profile, which uses an isolated output/checkpoint namespace, downweights
@@ -197,6 +231,13 @@ Checkpoints written mid-fit store the live cumulative wall-clock total. A
 replacement process restores that value as its baseline, so later epoch and
 interval rows measure the whole resumed run rather than restarting elapsed time
 from zero.
+
+Production stochastic training is paired by base seed, epoch, and manifest
+index. The shuffled example order, fog rate/omissions, diffusion time,
+corruption positions/replacements, and self-conditioning decision are therefore
+repeatable across restarts and across capacity arms even though their
+microbatch sizes differ. This pairs the data/noise realization; it does not
+claim bitwise-identical CUDA arithmetic across different model shapes.
 
 ### Publish a finished training summary
 
