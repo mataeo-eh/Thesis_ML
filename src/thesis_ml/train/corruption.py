@@ -40,6 +40,7 @@ def corrupt_batch(
     t: torch.Tensor | float | None = None,
     mask_token_id: int = MASK_ID,
     canvas_noise_mask: torch.Tensor | None = None,
+    row_seeds: torch.Tensor | None = None,
 ) -> CorruptionOutput:
     """Apply the configured linear corruption process to the canvas only.
 
@@ -50,13 +51,24 @@ def corrupt_batch(
     """
 
     _validate_arguments(process, schedule, vocab_size, mask_token_id)
-    sampled_t = _resolve_t(target_canvas, schedule, generator=generator, t=t)
+    if row_seeds is not None:
+        sampled_t, branch_draw, seeded_replacement = _row_seeded_draws(
+            target_canvas,
+            schedule,
+            vocab_size=vocab_size,
+            row_seeds=row_seeds,
+            t=t,
+            sample_replacement=process == "uniform",
+        )
+    else:
+        sampled_t = _resolve_t(target_canvas, schedule, generator=generator, t=t)
+        branch_draw = torch.rand(
+            target_canvas.shape,
+            device=target_canvas.device,
+            generator=generator,
+        )
+        seeded_replacement = None
     probabilities = sampled_t.unsqueeze(1).expand_as(target_canvas)
-    branch_draw = torch.rand(
-        target_canvas.shape,
-        device=target_canvas.device,
-        generator=generator,
-    )
     eligible = torch.ones_like(target_canvas, dtype=torch.bool)
     if canvas_noise_mask is not None:
         if canvas_noise_mask.shape != target_canvas.shape:
@@ -68,11 +80,15 @@ def corrupt_batch(
     corrupted_positions = (branch_draw < probabilities) & eligible
 
     if process == "uniform":
-        replacement = sample_uniform_noise(
-            target_canvas.shape,
-            vocab_size=vocab_size,
-            device=target_canvas.device,
-            generator=generator,
+        replacement = (
+            seeded_replacement
+            if seeded_replacement is not None
+            else sample_uniform_noise(
+                target_canvas.shape,
+                vocab_size=vocab_size,
+                device=target_canvas.device,
+                generator=generator,
+            )
         )
         noised_canvas = torch.where(corrupted_positions, replacement, target_canvas)
         position_weights = torch.ones_like(target_canvas, dtype=torch.float32)
@@ -92,6 +108,69 @@ def corrupt_batch(
         t=sampled_t,
         position_weights=position_weights,
     )
+
+
+def _row_seeded_draws(
+    target_canvas: torch.Tensor,
+    schedule: DiffusionScheduleConfig,
+    *,
+    vocab_size: int,
+    row_seeds: torch.Tensor,
+    t: torch.Tensor | float | None,
+    sample_replacement: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Draw paired randomness independently for every example row.
+
+    A fresh generator per row makes the row's draw stream invariant to
+    microbatch boundaries. That is the property a size ablation needs when
+    different models use different batch sizes: the same example still gets
+    the same t, corruption mask, and replacement tokens.
+    """
+
+    batch_size, canvas_len = target_canvas.shape
+    seeds = row_seeds.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+    if seeds.numel() != batch_size:
+        raise ValueError(f"row_seeds must have shape ({batch_size},)")
+    sampled_rows: list[torch.Tensor] = []
+    branch_rows: list[torch.Tensor] = []
+    replacement_rows: list[torch.Tensor] = []
+    for seed in seeds.tolist():
+        row_generator = torch.Generator(device=target_canvas.device)
+        row_generator.manual_seed(int(seed))
+        # Fixed draw layout per example: continuous t, exact-t=1 branch, then
+        # one Bernoulli draw per canvas position. It never depends on batch size.
+        draws = torch.rand(
+            canvas_len + 2,
+            device=target_canvas.device,
+            generator=row_generator,
+        )
+        unit_draw = draws[0]
+        if schedule.t_distribution == "power":
+            unit_draw = unit_draw.pow(1.0 / schedule.t_distribution_power)
+        sampled = schedule.min + unit_draw * (schedule.max - schedule.min)
+        if schedule.t_one_fraction > 0.0:
+            sampled = torch.where(
+                draws[1] < schedule.t_one_fraction,
+                torch.ones_like(sampled),
+                sampled,
+            )
+        sampled_rows.append(sampled)
+        branch_rows.append(draws[2:])
+        if sample_replacement:
+            replacement_rows.append(
+                sample_uniform_noise(
+                    (canvas_len,),
+                    vocab_size=vocab_size,
+                    device=target_canvas.device,
+                    generator=row_generator,
+                )
+            )
+
+    sampled_t = torch.stack(sampled_rows)
+    if t is not None:
+        sampled_t = _resolve_t(target_canvas, schedule, generator=None, t=t)
+    replacement = torch.stack(replacement_rows) if replacement_rows else None
+    return sampled_t, torch.stack(branch_rows), replacement
 
 
 def sample_uniform_noise(

@@ -26,7 +26,7 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, get_worker_info
+from torch.utils.data import Dataset
 
 from thesis_ml.config import ProjectConfig
 from thesis_ml.data.features import (
@@ -141,6 +141,10 @@ class DatasetExample:
     clean_input_token_ids: torch.Tensor | None = None
     window_end: int | None = None
     replay_id: str | None = None
+    # Stable, epoch-keyed seed for canvas corruption and self-conditioning.
+    # Production collation carries it as a tensor so stochastic draws can be
+    # paired by example across model arms with different microbatch sizes.
+    stochastic_seed: int | None = None
 
 
 class SC2DiffusionDataset(Dataset[DatasetExample]):
@@ -166,8 +170,10 @@ class SC2DiffusionDataset(Dataset[DatasetExample]):
         self.fog_rate_override = fog_rate_override
         self._artifact_path: str | None = None
         self._artifact: TokenizedReplay | None = None
-        self._serve_counts: dict[int, int] = {}
-        self._epoch = 0
+        # Shared memory is load-bearing with persistent DataLoader workers:
+        # changing a normal Python int in the parent would not update the
+        # already-spawned worker copies on Windows.
+        self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -234,10 +240,11 @@ class SC2DiffusionDataset(Dataset[DatasetExample]):
             clean_input_token_ids=torch.tensor([record.token_id for record in clean_records], dtype=torch.long),
             window_end=window.end_timestep,
             replay_id=window.replay_id,
+            stochastic_seed=self._stochastic_seed_for_index(index),
         )
 
     def set_epoch(self, epoch: int) -> None:
-        self._epoch = int(epoch)
+        self._epoch.fill_(int(epoch))
 
     def _replay(self, artifact_path: str) -> TokenizedReplay:
         if self._artifact is None or self._artifact_path != artifact_path:
@@ -246,14 +253,18 @@ class SC2DiffusionDataset(Dataset[DatasetExample]):
         return self._artifact
 
     def _rng_for_index(self, index: int) -> np.random.Generator:
-        serving = self._serve_counts.get(index, 0)
-        self._serve_counts[index] = serving + 1
-        worker = get_worker_info()
-        worker_seed = int(worker.seed) if worker is not None else 0
         base = int(self.seed) if self.seed is not None else int(np.random.SeedSequence().entropy)
-        return np.random.default_rng(
-            np.random.SeedSequence([base, self._epoch, index, serving, worker_seed & 0xFFFFFFFF])
-        )
+        return np.random.default_rng(np.random.SeedSequence([base, int(self._epoch), index, 0xF06]))
+
+    def _stochastic_seed_for_index(self, index: int) -> int | None:
+        """Return the paired canvas-randomness seed for this epoch/example."""
+
+        if self.seed is None:
+            return None
+        state = np.random.SeedSequence(
+            [int(self.seed), int(self._epoch), int(index), 0xC0A5]
+        ).generate_state(1, dtype=np.uint64)[0]
+        return int(state & np.uint64((1 << 63) - 1))
 
     def _sample_fog_rate(self, rng: np.random.Generator) -> float:
         if self.fog_rate_override is not None:

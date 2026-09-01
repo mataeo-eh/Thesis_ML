@@ -58,6 +58,9 @@ class DiffusionBatch:
     # on every forward pass. The model consumes these directly; input_records
     # is retained only for non-model tooling such as the eval harness.
     input_features: InputFeatures
+    # One deterministic seed per row, or None for synthetic/direct callers
+    # that intentionally use TrainingLoop's stateful generator.
+    stochastic_seeds: torch.Tensor | None = None
 
     def pin_memory(self) -> "DiffusionBatch":
         """Pin model-facing tensors when DataLoader pinning sees this custom type."""
@@ -76,6 +79,11 @@ class DiffusionBatch:
             truncated=self.truncated.pin_memory(),
             perspective_ids=self.perspective_ids.pin_memory(),
             canvas_prediction_distances=self.canvas_prediction_distances.pin_memory(),
+            stochastic_seeds=(
+                self.stochastic_seeds.pin_memory()
+                if self.stochastic_seeds is not None
+                else None
+            ),
             input_features=InputFeatures(
                 continuous_values=features.continuous_values.pin_memory(),
                 continuous_validity=features.continuous_validity.pin_memory(),
@@ -197,6 +205,14 @@ def collate_diffusion_examples(
             else []
         ),
         input_features=input_features,
+        stochastic_seeds=(
+            torch.tensor(
+                [int(example.stochastic_seed) for example in examples],
+                dtype=torch.int64,
+            )
+            if all(example.stochastic_seed is not None for example in examples)
+            else None
+        ),
     )
 
 
