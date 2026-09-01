@@ -1,0 +1,20 @@
+extends: size_ablation_base.yaml
+
+storage:
+  checkpoint_uri: tests/output/SizeAblationTest/120m/checkpoints
+  log_uri: tests/output/SizeAblationTest/120m/metrics
+
+model:
+  d_model: 768
+  layers: 20
+  heads: 12
+  ffn: 1536
+
+pipeline:
+  # Conservative until this arm is separately measured on the target GPU.
+  batch_size: 1
+
+train:
+  # 45 nominal windows/update.
+  accumulation_steps: 45
+

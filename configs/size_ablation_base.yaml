@@ -1,0 +1,15 @@
+extends: smallTrainingTestV3.yaml
+
+# Shared scientific contract for the parameter-count/capacity sweep. Every arm
+# sees the same full-corpus split, example order, fog/corruption distributions,
+# optimizer, and the opening of the same 50-epoch WSD/EMA schedules. Training
+# intentionally stops after epoch 3; schedule_horizon_epochs prevents that
+# short observation window from being mistaken for a three-epoch schedule.
+storage:
+  local_cache_dir: tests/output/SizeAblationTest/cache
+
+train:
+  epochs: 3
+  schedule_horizon_epochs: 50
+  max_steps: 0
+

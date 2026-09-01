@@ -33,3 +33,10 @@ def test_windows_launchers_are_thin_config_driven_wrappers() -> None:
         assert "python -c" not in text
         assert "import torch" not in text
         assert "torch." not in text
+
+
+def test_size_ablation_launcher_delegates_to_restartable_driver() -> None:
+    text = (ROOT / "tests" / "SizeAblationTest.bat").read_text(encoding="utf-8").lower()
+    assert 'set "project_root=%~dp0.."' in text
+    assert '".venv\\scripts\\python.exe" scripts\\run_size_ablation.py %*' in text
+    assert "thesis_ml.pipeline.train_pipeline" not in text

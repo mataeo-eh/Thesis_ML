@@ -1,0 +1,23 @@
+extends: size_ablation_base.yaml
+
+storage:
+  checkpoint_uri: tests/output/SizeAblationTest/030m-deep/checkpoints
+  log_uri: tests/output/SizeAblationTest/030m-deep/metrics
+
+# Matched-width depth control: the same 384 residual width and six 64-d heads
+# as V3, with 18 blocks and a narrower (but still dense GeGLU) 896 FFN. This is
+# 30,213,440 parameters: close enough to isolate shape without forcing an
+# awkward exact count.
+model:
+  d_model: 384
+  layers: 18
+  heads: 6
+  ffn: 896
+
+pipeline:
+  batch_size: 5
+
+train:
+  # 45 nominal windows/update.
+  accumulation_steps: 9
+

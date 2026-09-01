@@ -1,0 +1,19 @@
+extends: size_ablation_base.yaml
+
+storage:
+  checkpoint_uri: tests/output/SizeAblationTest/060m/checkpoints
+  log_uri: tests/output/SizeAblationTest/060m/metrics
+
+model:
+  d_model: 512
+  layers: 22
+  heads: 8
+  ffn: 1024
+
+pipeline:
+  batch_size: 3
+
+train:
+  # 45 nominal windows/update.
+  accumulation_steps: 15
+

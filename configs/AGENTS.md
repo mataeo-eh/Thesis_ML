@@ -11,6 +11,7 @@
 - `ablation_01..05_*.yaml` each extend `local_overfit_v2.yaml` and differ from it ONLY by the toggle(s) they enable and by their redirected storage paths. They must not restate any schedule knob: `tests/run_ablation_sweep.sh` passes no `--max-steps`, so each arm runs the inherited 100 epochs and completes both the linear LR decay and the derived EMA window. `tests/test_config.py` asserts this inheritance arm by arm.
 - `local_overfit_v2_finetune.yaml` owns the debut/outcome fine-tuning variant of the V2 profile.
 - `local_full.yaml` preserves the historical eight-epoch full-corpus V2 profile. `smallTrainingTestV3.yaml` owns the current 50-epoch-cap full-corpus run, expanded 384/12/6/1536 model, high-noise power sampling, six-row microbatches with seven-batch accumulation, a 6.5 GiB reclaim-first reservation ceiling, WSD with 500 fixed warmup optimizer steps and a final 20% decay, weighted PAD/END loss, dev early stopping, and three checkpoint families.
+- `size_ablation_base.yaml` and `size_ablation_{005m,015m,030m_baseline,030m_deep,060m,120m}.yaml` own the full-corpus capacity suite. They inherit V3 unchanged except model scale, isolated output namespaces, microbatch/accumulation, a three-epoch stop, and a 50-epoch LR/EMA schedule horizon. All use 64-dimensional attention heads and at least 42 nominal windows per optimizer step.
 
 ## Local Contracts
 

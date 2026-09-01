@@ -1,0 +1,20 @@
+extends: size_ablation_base.yaml
+
+storage:
+  checkpoint_uri: tests/output/SizeAblationTest/030m-baseline/checkpoints
+  log_uri: tests/output/SizeAblationTest/030m-baseline/metrics
+
+# Exact current V3 parameterization and effective batch: 29,318,720 parameters,
+# 6 x 64-dimensional heads, 42 nominal windows/update.
+model:
+  d_model: 384
+  layers: 12
+  heads: 6
+  ffn: 1536
+
+pipeline:
+  batch_size: 6
+
+train:
+  accumulation_steps: 7
+
