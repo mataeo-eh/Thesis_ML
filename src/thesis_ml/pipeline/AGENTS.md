@@ -20,6 +20,7 @@
 - The overfit profile uses `max_cuda_reserved_gb` as a reclaim-first safety ceiling: crossing it trims unused CUDA allocator cache, and the run fails only when reservation remains at or above the ceiling afterward. Timing, throughput, allocated peak, and reserved memory are logged every step.
 - Secrets (Kaggle, AWS) come from environment/config only, never hardcoded or committed.
 - Model scale, token budgets, paths, subset selection, epochs, and checkpoint intervals stay config-owned.
+- Actual run steps and LR/EMA schedule steps are resolved separately. They are identical by default; `train.schedule_horizon_epochs > 0` is the explicit capacity-ablation exception that retains a longer reference schedule while stopping after `train.epochs`.
 - Debut-mode full training evaluates the EMA model with the fine-tune report schema against the true test split; uncapped evaluation remains lazy instead of materializing every window in host RAM.
 - Both real pipelines require `pipeline.perspectives` to contain exactly `p1,p2`, canonicalize that order, and reject stale manifests that do not record both perspectives.
 - `pipeline.prepare_feature_statistics` explicitly controls artifact generation. Training computes statistics from the selected train replay artifacts only, then all production train/fine-tune/diagnostic paths strictly load `data.feature_statistics_path` and require its source split and identity to match.

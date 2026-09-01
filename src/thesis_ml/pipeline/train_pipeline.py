@@ -260,11 +260,7 @@ def _run_real_pipeline(
             fog_rate_override=None,
         )
 
-    planned_steps = config.train.max_steps
-    if planned_steps <= 0:
-        planned_steps = optimizer_steps_per_epoch(
-            len(train_loader), config.train.accumulation_steps
-        ) * config.train.epochs
+    run_steps, schedule_steps = _resolve_step_budgets(config, len(train_loader))
     # --lr overrides the base learning rate for this run without editing YAML.
     # Applied here (before the optimizer is built inside TrainingLoop) so the
     # override actually takes effect; None leaves the config value untouched.
@@ -274,7 +270,9 @@ def _run_real_pipeline(
         train=replace(
             config.train,
             checkpoint_dir=str(checkpoint_dir),
-            max_steps=planned_steps,
+            # TrainingLoop's scheduler reads this resolved horizon. fit() below
+            # receives the separate run_steps stop budget.
+            max_steps=schedule_steps,
             lr=effective_lr,
         ),
     )
@@ -309,7 +307,7 @@ def _run_real_pipeline(
     resumed = _resume_from_remote(loop, config, resolver, checkpoint_dir) or _try_resume(loop, checkpoint_dir)
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
-    requested_steps = training_config.train.max_steps if max_steps_override is None else max_steps_override
+    requested_steps = run_steps if max_steps_override is None else max_steps_override
     # Guarantee DataLoader worker teardown on EVERY exit path (normal finish,
     # exception, or Ctrl+C). With persistent_workers=True the loaders keep their
     # worker processes and prefetch threads alive in loader._iterator until that
@@ -384,6 +382,22 @@ def _run_real_pipeline(
         peak_vram_bytes=peak_vram_bytes,
         report_path=str(report_path) if report_path is not None else None,
     )
+
+
+def _resolve_step_budgets(config: ProjectConfig, train_batches: int) -> tuple[int, int]:
+    """Resolve the actual stop budget and the possibly longer schedule budget."""
+
+    steps_per_epoch = optimizer_steps_per_epoch(
+        train_batches,
+        config.train.accumulation_steps,
+    )
+    run_steps = config.train.max_steps
+    if run_steps <= 0:
+        run_steps = steps_per_epoch * config.train.epochs
+    schedule_steps = run_steps
+    if config.train.schedule_horizon_epochs > 0:
+        schedule_steps = steps_per_epoch * config.train.schedule_horizon_epochs
+    return run_steps, schedule_steps
 
 
 def _explicit_replay_selection(

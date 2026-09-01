@@ -88,6 +88,7 @@ def test_valid_config_loads() -> None:
     assert config.train.target_effective_batch_tokens == 0
     assert config.train.max_steps == 100000
     assert config.train.epochs == 6
+    assert config.train.schedule_horizon_epochs == 0
     assert config.train.early_stopping_patience_epochs == 0
     assert config.train.early_stopping_min_relative_improvement == 0.001
     assert config.train.val_interval == 1000
@@ -314,6 +315,7 @@ def test_small_training_v3_owns_the_full_run_contract() -> None:
     assert config.train.warmup == 500
     assert config.train.lr_decay_ratio == pytest.approx(0.20)
     assert config.train.epochs == 50
+    assert config.train.schedule_horizon_epochs == 0
     assert config.train.early_stopping_patience_epochs == 10
     assert config.pipeline.batch_size == 6
     assert config.train.accumulation_steps == 7

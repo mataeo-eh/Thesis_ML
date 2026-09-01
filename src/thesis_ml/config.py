@@ -222,6 +222,14 @@ class TrainConfig:
     target_effective_batch_tokens: int
     max_steps: int
     epochs: int
+    # Optional optimizer-step horizon for LR/EMA schedules, expressed in
+    # epochs of the current dataloader. Zero preserves the ordinary contract:
+    # schedules are fitted to the run's actual max_steps/epochs. A positive
+    # value deliberately decouples the schedule horizon from the stop epoch,
+    # which is useful for short learning-curve ablations that must reproduce
+    # the opening of a longer run without pretending the short run completed
+    # the schedule.
+    schedule_horizon_epochs: int
     early_stopping_patience_epochs: int
     early_stopping_min_relative_improvement: float
     val_interval: int
@@ -578,6 +586,8 @@ def _validate_train(config: ProjectConfig) -> None:
         raise ConfigError("train.accumulation_steps must be >= 1")
     if train.target_effective_batch_tokens < 0:
         raise ConfigError("train.target_effective_batch_tokens must be >= 0")
+    if train.schedule_horizon_epochs < 0:
+        raise ConfigError("train.schedule_horizon_epochs must be >= 0")
     if train.early_stopping_patience_epochs < 0:
         raise ConfigError("train.early_stopping_patience_epochs must be >= 0")
     if not (0.0 <= train.early_stopping_min_relative_improvement < 1.0):

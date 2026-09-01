@@ -150,6 +150,9 @@ train:
   target_effective_batch_tokens: 0
   max_steps: 100000
   epochs: 6
+  # 0 fits LR and EMA to the run's actual step budget. A positive value keeps
+  # those schedules on that many epochs even when train.epochs stops earlier.
+  schedule_horizon_epochs: 0
   early_stopping_patience_epochs: 0
   early_stopping_min_relative_improvement: 0.001
   val_interval: 1000
@@ -178,10 +181,9 @@ train:
   # runs get a proportionally shorter window instead of an EMA that never
   # finishes traversing its own.
   ema_decay: 0.9999
-  # EMA averaging window as a fraction of the run's total optimizer steps. 0.1
-  # means the served EMA weights always average over roughly the final 10% of
-  # training, whatever the epoch budget, and the EMA completes ~10 window
-  # lengths before the last step.
+  # EMA averaging window as a fraction of the configured schedule horizon. That
+  # is the run's total optimizer steps by default; schedule_horizon_epochs may
+  # deliberately retain a longer reference horizon for a short ablation.
   ema_horizon_ratio: 0.1
   confidence_loss_weight: 0.0
   self_cond_prob: 0.5

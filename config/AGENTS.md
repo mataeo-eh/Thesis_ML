@@ -22,6 +22,7 @@
 - Note `config.py` rejects unknown YAML keys AND ignores dataclass defaults, so each of the three toggles needs its explicit entry here or config loading fails.
 - `diffusion.process` defaults to `uniform`; `absorbing` is the only supported ablation. The default time distribution is `Beta(2,1)` power sampling plus 5% exact `t=1`, and fog mirrors that power law over 0–0.8. Confidence sharpening remains `0.0`; sampler maximum steps is `64` with the published temperature, entropy-bound, and adaptive-stop defaults.
 - The default optimizer uses five-batch accumulation and a WSD schedule: 500 fixed warmup optimizer steps, a stable phase at `3e-4` filling the middle, then a final 20% linear decay to `3e-6`. Checkpoint family paths and retention are config-owned.
+- `train.schedule_horizon_epochs` defaults to `0`, which preserves the ordinary run-fitted LR/EMA horizon. Positive values are an explicit short-ablation control: `train.epochs` still stops training, while LR and EMA retain the named longer horizon.
 
 ## Work Guidance
 
