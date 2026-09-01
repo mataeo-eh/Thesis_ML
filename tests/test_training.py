@@ -1,5 +1,7 @@
 from dataclasses import replace
 import csv
+import json
+import math
 from functools import partial
 from pathlib import Path
 import time
@@ -36,9 +38,13 @@ from thesis_ml.train.corruption import corrupt_batch, inverse_t_weights, sample_
 from thesis_ml.train.loop import (
     INTERVAL_REPORTS_PER_EPOCH,
     TrainingLoop,
+    _accumulate_token_class_counts,
     _append_csv_row,
+    _finalize_bits_per_token,
     _finalize_rare_class_t_bucket,
+    _finalize_token_metrics,
     _latest_metrics_csv_path,
+    _macro_f1_from_counts,
     auxiliary_confidence_loss,
     interval_boundaries,
     optimizer_steps_per_epoch,
@@ -1556,25 +1562,74 @@ def _make_debut_synthetic_examples(config: ProjectConfig, *, count: int) -> list
 
 
 def test_training_prints_live_epoch_and_batch_progress(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    config = _small_config(tmp_path)
-    examples = make_synthetic_examples(config, count=4)
+    base_config = _small_config(tmp_path)
+    config = replace(
+        base_config,
+        train=replace(base_config.train, accumulation_steps=2),
+    )
+    examples = make_synthetic_examples(config, count=8)
     train_loader = DataLoader(examples, batch_size=2, shuffle=False, collate_fn=_collate_pretrain)
     model = SC2StrategyDiffusionModel(config, vocab_size=128)
-    loop = TrainingLoop(model=model, config=config, seed=72)
+    step_metrics_path = tmp_path / "step_metrics.jsonl"
+    epoch_metrics_path = tmp_path / "epoch_metrics.csv"
+    loop = TrainingLoop(
+        model=model,
+        config=config,
+        seed=72,
+        metrics_path=step_metrics_path,
+        epoch_metrics_path=epoch_metrics_path,
+    )
 
     loop.fit(train_loader, max_steps=4, epochs=2, fixed_t=1.0)
 
     output = capsys.readouterr().out
-    assert "phase=train epoch=1/2 batch=1/2" in output
-    assert "phase=train epoch=1/2 batch=2/2" in output
-    assert "phase=train epoch=2/2 batch=1/2" in output
-    assert "phase=train epoch=2/2 batch=2/2" in output
+    assert "phase=train epoch=1/2 batch=1/4" in output
+    assert "phase=train epoch=1/2 batch=4/4" in output
+    assert "phase=train epoch=2/2 batch=1/4" in output
+    assert "phase=train epoch=2/2 batch=4/4" in output
     assert "step=1 step_wall_seconds=" in output
     assert "tokens_per_second=" in output
-    assert "cuda_max_memory_allocated_gb=0.000" in output
-    assert "cuda_memory_reserved_gb=0.000" in output
-    assert "cuda_device_memory_used_gb=0.000" in output
-    assert "cuda_device_memory_gap_gb=0.000" in output
+    assert "loss=" in output
+    assert "epoch_loss_so_far=" in output
+    # Routine progress stays readable; memory telemetry remains durable below.
+    assert "cuda_max_memory_allocated_gb=" not in output
+    assert "cuda_memory_reserved_gb=" not in output
+    assert "cuda_device_memory_used_gb=" not in output
+    assert "cuda_device_memory_gap_gb=" not in output
+
+    step_rows = [
+        json.loads(line)
+        for line in step_metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    with epoch_metrics_path.open(newline="", encoding="utf-8") as handle:
+        epoch_rows = list(csv.DictReader(handle))
+
+    assert len(step_rows) == 4
+    assert len(epoch_rows) == 2
+    # On the first optimizer update of each epoch, the step mean and epoch mean
+    # cover the same two accumulated microbatches and must therefore be exact.
+    assert step_rows[0]["loss"] == pytest.approx(step_rows[0]["epoch_loss_so_far"])
+    assert step_rows[2]["loss"] == pytest.approx(step_rows[2]["epoch_loss_so_far"])
+    # The cumulative value resets each epoch, then converges to the exact
+    # train_loss persisted for that epoch.
+    assert step_rows[1]["epoch_loss_so_far"] == pytest.approx(
+        float(epoch_rows[0]["train_loss"])
+    )
+    assert step_rows[3]["epoch_loss_so_far"] == pytest.approx(
+        float(epoch_rows[1]["train_loss"])
+    )
+    for row in step_rows:
+        assert row["loss"] > 0
+        assert row["epoch_loss_so_far"] > 0
+        for memory_field in (
+            "cuda_max_memory_allocated_bytes",
+            "cuda_memory_allocated_bytes",
+            "cuda_memory_reserved_bytes",
+            "cuda_inactive_split_bytes",
+            "cuda_device_memory_used_bytes",
+            "cuda_device_memory_gap_bytes",
+        ):
+            assert memory_field in row
 
 
 class _RecordingDataset(Dataset):
@@ -1693,6 +1748,52 @@ def test_resume_continues_epoch_instead_of_replaying_batches(tmp_path: Path) -> 
     assert resumed_loop.completed_epochs == 1
     assert resumed_loop.batches_completed_in_epoch == 0
     assert resumed_loop.global_step == 6
+
+
+def test_bounded_fit_preserves_partial_epoch_resume_offset(tmp_path: Path) -> None:
+    base_config = _small_config(tmp_path)
+    config = replace(
+        base_config,
+        model=replace(base_config.model, self_conditioning=False),
+        train=replace(base_config.train, checkpoint_interval=1, max_steps=0),
+    )
+    sampler_seed = 4321
+    reference = ResumableBatchSampler(dataset_size=6, batch_size=1, base_seed=sampler_seed)
+    expected_order = [batch[0] for batch in reference]
+    examples = make_synthetic_examples(config, count=6)
+
+    first_dataset = _RecordingDataset(examples)
+    first_loop = TrainingLoop(
+        model=SC2StrategyDiffusionModel(config, vocab_size=128),
+        config=config,
+        seed=9,
+    )
+    first_loop.fit(
+        _resumable_loader(first_dataset, base_seed=sampler_seed),
+        max_steps=2,
+        epochs=1,
+        fixed_t=1.0,
+    )
+    assert first_loop.completed_epochs == 0
+    assert first_loop.batches_completed_in_epoch == 2
+
+    resumed_dataset = _RecordingDataset(examples)
+    resumed_loop = TrainingLoop(
+        model=SC2StrategyDiffusionModel(config, vocab_size=128),
+        config=config,
+        seed=9,
+    )
+    resumed_loop.load_checkpoint(tmp_path / "checkpoints" / "last.pt")
+    resumed_loop.fit(
+        _resumable_loader(resumed_dataset, base_seed=sampler_seed),
+        max_steps=3,
+        epochs=1,
+        fixed_t=1.0,
+    )
+    assert resumed_dataset.served == [expected_order[2]]
+    assert resumed_loop.completed_epochs == 0
+    assert resumed_loop.batches_completed_in_epoch == 3
+    assert resumed_loop.global_step == 3
 
 
 def test_cuda_reserved_memory_limit_trims_reclaimable_cache(
@@ -1853,3 +1954,290 @@ def _assert_optimizer_states_match(first: dict, second: dict) -> None:
                 assert torch.allclose(state_value, loaded_value)
             else:
                 assert state_value == loaded_value
+
+
+# ---------------------------------------------------------------------------
+# Token-level reporting: accuracy, macro F1, bits per token, perplexity.
+#
+# These columns exist so a run can be read as something other than a loss curve.
+# Accuracy and macro F1 are split by canvas state on purpose (see
+# _finalize_token_metrics); bits-per-token and perplexity come from a SEPARATE
+# unweighted cross-entropy accumulator, not from train_loss/dev_loss, because
+# those are the class-weighted objective (see _finalize_bits_per_token).
+# ---------------------------------------------------------------------------
+
+
+def test_macro_f1_from_counts_matches_a_hand_computed_example() -> None:
+    """Verify the macro F1 arithmetic against numbers worked out by hand.
+
+    Three token ids in a 4-token vocabulary, with the fourth neither predicted
+    nor present so it must be excluded from the average entirely:
+
+      token 0: tp=2, predicted=4, target=2 -> P=0.5,  R=1.0,  F1=2/3
+      token 1: tp=1, predicted=1, target=3 -> P=1.0,  R=1/3,  F1=0.5
+      token 2: tp=0, predicted=1, target=1 -> P=0.0,  R=0.0,  F1=0.0
+      token 3: absent everywhere            -> excluded
+
+      macro F1 = (2/3 + 0.5 + 0.0) / 3
+    """
+
+    counts = torch.tensor(
+        [
+            [2, 1, 0, 0],  # true_positive
+            [4, 1, 1, 0],  # predicted
+            [2, 3, 1, 0],  # target
+        ],
+        dtype=torch.int64,
+    )
+
+    expected = ((2.0 / 3.0) + 0.5 + 0.0) / 3.0
+    assert _macro_f1_from_counts(counts) == pytest.approx(expected)
+
+
+def test_macro_f1_penalises_collapse_onto_the_common_token() -> None:
+    """Macro F1 must fall when accuracy is bought by ignoring rare tokens.
+
+    This is the property that earns macro F1 its column next to accuracy. The
+    model here predicts the dominant token for every single position: 90 of 100
+    positions come out right, so accuracy is 0.90, but it has completely given up
+    on the other two tokens and the macro average reflects that.
+    """
+
+    counts = torch.tensor(
+        [
+            [90, 0, 0],   # only the common token is ever right
+            [100, 0, 0],  # every position predicted as the common token
+            [90, 5, 5],   # the two rare tokens really do occur
+        ],
+        dtype=torch.int64,
+    )
+    accuracy, macro_f1 = _finalize_token_metrics({"noised": counts})
+
+    assert accuracy["noised"] == pytest.approx(0.90)
+    # Common token: P=0.9, R=1.0 -> F1 = 2*0.9/1.9; the two rare tokens score 0.
+    expected = (2.0 * 0.9 * 1.0 / 1.9) / 3.0
+    assert macro_f1["noised"] == pytest.approx(expected)
+    assert macro_f1["noised"] < accuracy["noised"]
+
+
+def test_finalize_token_metrics_omits_a_state_that_scored_nothing() -> None:
+    """An unscored canvas state is absent, not zero.
+
+    A zero accuracy and a state that was never evaluated are different
+    observations, and the CSV writers render an absent key as a blank cell so a
+    reader can tell them apart.
+    """
+
+    populated = torch.tensor([[1, 0], [1, 1], [2, 0]], dtype=torch.int64)
+    empty = torch.zeros(3, 2, dtype=torch.int64)
+    accuracy, macro_f1 = _finalize_token_metrics(
+        {"noised": populated, "ground_truth_preserved": empty}
+    )
+
+    assert set(accuracy) == {"noised"}
+    assert set(macro_f1) == {"noised"}
+
+
+def test_finalize_bits_per_token_converts_nats_and_matches_perplexity() -> None:
+    """bits = nats / ln 2, and perplexity is the same quantity as 2 ** bits."""
+
+    # 8 scored positions averaging ln(4) nats each -> exactly 2 bits per token,
+    # so the model is effectively choosing between 4 equally likely tokens.
+    bits, perplexity = _finalize_bits_per_token(8.0 * math.log(4.0), 8.0)
+
+    assert bits == pytest.approx(2.0)
+    assert perplexity == pytest.approx(4.0)
+    assert perplexity == pytest.approx(2.0 ** bits)
+    # Nothing scored -> nothing to report, rendered as blank cells.
+    assert _finalize_bits_per_token(0.0, 0.0) == (None, None)
+
+
+def test_bits_per_token_is_not_derived_from_the_class_weighted_loss(
+    tmp_path: Path,
+) -> None:
+    """The reported bits must come from the UNWEIGHTED cross entropy.
+
+    ``train_loss``/``dev_loss`` are normalised by the configured class weights,
+    which the project deliberately sets far from 1.0 (``end`` is boosted, ``pad``
+    is damped). Exponentiating that would not be a perplexity of any
+    distribution. Running the same data through two configs that differ ONLY in
+    those weights must therefore move the loss while leaving bits-per-token
+    alone.
+    """
+
+    def bits_and_loss(weights: ClassLossWeightsConfig, seed: int) -> tuple[float, float]:
+        config = _small_config(tmp_path)
+        config = replace(config, loss=replace(config.loss, class_loss_weights=weights))
+        examples = make_synthetic_examples(config, count=4)
+        dev_loader = DataLoader(examples, batch_size=2, collate_fn=_collate_pretrain)
+        torch.manual_seed(seed)
+        model = SC2StrategyDiffusionModel(config, vocab_size=128)
+        loop = TrainingLoop(model=model, config=config, seed=seed)
+        torch.manual_seed(seed)
+        validation = loop.validate(dev_loader, fixed_t=1.0)
+        return validation.bits_per_token, validation.loss
+
+    flat = ClassLossWeightsConfig(
+        enemy_observed_reconstruction=1.0,
+        enemy_fogged_reconstruction=1.0,
+        enemy_future_prediction=1.0,
+        delimiter=1.0,
+        end=1.0,
+        pad=1.0,
+        win_loss=1.0,
+    )
+    skewed = replace(flat, end=25.0, pad=0.1)
+
+    flat_bits, flat_loss = bits_and_loss(flat, seed=1234)
+    skewed_bits, skewed_loss = bits_and_loss(skewed, seed=1234)
+
+    # Same model, same data, same corruption draw: the unweighted information
+    # content is identical...
+    assert skewed_bits == pytest.approx(flat_bits, rel=1e-9)
+    # ...while the weighted objective genuinely moved, which is exactly why the
+    # bits column cannot be a transform of the loss column.
+    assert skewed_loss != pytest.approx(flat_loss, rel=1e-6)
+
+
+def test_epoch_metrics_csv_reports_token_accuracy_macro_f1_and_bits(
+    tmp_path: Path,
+) -> None:
+    """The epoch CSV carries the token-metric columns, ordered per split.
+
+    Column order matters to a human scanning the file: everything summarising the
+    train split sits between ``train_loss`` and ``dev_loss``, and everything
+    summarising dev follows ``dev_loss``.
+    """
+
+    config = _small_config(tmp_path)
+    examples = make_synthetic_examples(config, count=8)
+    train_loader = DataLoader(examples[:4], batch_size=2, collate_fn=_collate_pretrain)
+    dev_loader = DataLoader(examples[4:], batch_size=2, collate_fn=_collate_pretrain)
+    csv_path = tmp_path / "epoch_metrics.csv"
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(model=model, config=config, seed=71, epoch_metrics_path=csv_path)
+
+    # 4 train examples at batch_size 2 is 2 batches per epoch, so 4 steps is
+    # exactly the 2 epochs asked for. The loop derives its epoch limit from
+    # max_steps, so an over-large budget would silently run extra epochs.
+    loop.fit(train_loader, val_dataloader=dev_loader, max_steps=4, epochs=2)
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    assert len(rows) == 2
+    # Ordering: the train block sits immediately after train_loss, the dev block
+    # immediately after dev_loss.
+    assert fieldnames[:15] == [
+        "epoch",
+        "train_loss",
+        "train_accuracy_ground_truth_preserved",
+        "train_accuracy_noised",
+        "train_macro_f1_ground_truth_preserved",
+        "train_macro_f1_noised",
+        "train_bits_per_token",
+        "train_perplexity",
+        "dev_loss",
+        "dev_accuracy_ground_truth_preserved",
+        "dev_accuracy_noised",
+        "dev_macro_f1_ground_truth_preserved",
+        "dev_macro_f1_noised",
+        "dev_bits_per_token",
+        "dev_perplexity",
+    ]
+
+    for row in rows:
+        for split in ("train", "dev"):
+            bits = float(row[f"{split}_bits_per_token"])
+            perplexity = float(row[f"{split}_perplexity"])
+            assert bits > 0
+            # Perplexity is the same quantity expressed as a branching factor.
+            assert perplexity == pytest.approx(2.0 ** bits)
+            # An untrained-ish model on a 128-token vocabulary cannot be more
+            # uncertain than uniform over the vocabulary.
+            assert bits <= math.log2(128) + 1e-6
+            for state in ("ground_truth_preserved", "noised"):
+                for metric in ("accuracy", "macro_f1"):
+                    cell = row[f"{split}_{metric}_{state}"]
+                    # Blank is legitimate: a canvas state can score no positions.
+                    if cell:
+                        assert 0.0 <= float(cell) <= 1.0
+
+
+def test_interval_metrics_csv_reports_token_accuracy_macro_f1_and_bits(
+    tmp_path: Path,
+) -> None:
+    """The intra-epoch CSV mirrors the epoch CSV's token-metric columns.
+
+    On a corpus large enough that pre-training runs a single epoch, the interval
+    rows are the only place these metrics show a trend at all, so they must be
+    present here and not only in the epoch file.
+    """
+
+    config = _small_config(tmp_path)
+    examples = make_synthetic_examples(config, count=24)
+    train_loader = DataLoader(examples[:20], batch_size=2, collate_fn=_collate_pretrain)
+    dev_loader = DataLoader(examples[20:], batch_size=2, collate_fn=_collate_pretrain)
+    csv_path = tmp_path / "interval_metrics.csv"
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+    loop = TrainingLoop(
+        model=model, config=config, seed=73, interval_metrics_path=csv_path
+    )
+
+    loop.fit(train_loader, val_dataloader=dev_loader, max_steps=20, epochs=2)
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = set(reader.fieldnames or [])
+        rows = list(reader)
+
+    assert len(rows) == 2 * INTERVAL_REPORTS_PER_EPOCH
+    for split in ("train", "dev"):
+        assert f"{split}_bits_per_token" in fieldnames
+        assert f"{split}_perplexity" in fieldnames
+        for state in ("ground_truth_preserved", "noised"):
+            assert f"{split}_accuracy_{state}" in fieldnames
+            assert f"{split}_macro_f1_{state}" in fieldnames
+    for row in rows:
+        for split in ("train", "dev"):
+            bits = float(row[f"{split}_bits_per_token"])
+            assert bits > 0
+            assert float(row[f"{split}_perplexity"]) == pytest.approx(2.0 ** bits)
+
+
+def test_token_metrics_pool_by_position_not_by_averaging_batch_ratios() -> None:
+    """Counts must be summed across batches before any ratio is taken.
+
+    This is the whole reason the loss module returns raw counts instead of a
+    finished accuracy. The two batches below are deliberately lopsided: a large
+    one the model gets entirely right and a small one it gets entirely wrong.
+
+      pooled over positions : 90 correct out of 100          -> 0.90
+      averaged per batch    : (1.0 + 0.0) / 2                -> 0.50
+
+    A pooling bug would therefore be off by a wide, obvious margin rather than by
+    a rounding error, which is what makes this worth asserting.
+    """
+
+    # Batch A: 90 positions, every one correct, all on token id 0.
+    large_correct_batch = torch.tensor(
+        [[90, 0], [90, 0], [90, 0]], dtype=torch.int64
+    )
+    # Batch B: 10 positions, every one wrong -- token 1 was the target, token 0
+    # was predicted.
+    small_wrong_batch = torch.tensor([[0, 0], [10, 0], [0, 10]], dtype=torch.int64)
+
+    accumulator: dict[str, torch.Tensor] = {}
+    _accumulate_token_class_counts(accumulator, {"noised": large_correct_batch})
+    _accumulate_token_class_counts(accumulator, {"noised": small_wrong_batch})
+
+    accuracy, _ = _finalize_token_metrics(accumulator)
+
+    assert accuracy["noised"] == pytest.approx(0.90)
+    # The value an average-of-per-batch-ratios implementation would produce.
+    assert accuracy["noised"] != pytest.approx(0.50)
+    # Accumulation must not have mutated either caller-supplied tensor.
+    assert large_correct_batch[0].tolist() == [90, 0]
+    assert small_wrong_batch[1].tolist() == [10, 0]

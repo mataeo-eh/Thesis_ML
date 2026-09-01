@@ -114,6 +114,39 @@ T_BUCKET_NAMES = (
 # (the same empty-key convention ``per_class`` uses).
 CANVAS_STATE_NAMES = ("ground_truth_preserved", "noised")
 
+# Row order of the per-canvas-state token count matrices returned in
+# ``LossOutput.token_class_counts``. Each matrix has shape ``[3, vocab_size]``
+# and every column is one token id in the output vocabulary:
+#
+#   row 0 "true_positive" -> positions where the argmax prediction equalled the
+#                            target AND the target was this token id
+#   row 1 "predicted"     -> positions where the argmax prediction was this
+#                            token id, regardless of whether it was right
+#   row 2 "target"        -> positions where the target was this token id
+#                            (this token's support)
+#
+# WHY counts rather than finished accuracy/F1 numbers: counts are ADDITIVE, so
+# the training loop can pool them across microbatches, across an epoch, and
+# across a whole dev pass by plain summation and compute one set of ratios at
+# the very end. Averaging per-microbatch F1 scores would instead weight a
+# microbatch holding 6 scored positions the same as one holding 6000, which is
+# the same pooling bug ``rare_class_t_bucket_sums`` exists to avoid. From these
+# three rows both reported metrics follow directly:
+#
+#   accuracy  = true_positive.sum() / target.sum()
+#   precision = true_positive / predicted     (per token id)
+#   recall    = true_positive / target        (per token id)
+#   macro F1  = unweighted mean of the per-token-id F1 over the token ids that
+#               actually occur (see ``macro_f1_from_counts`` in train/loop.py)
+#
+# Note that micro-averaged F1 is deliberately NOT reported: with exactly one
+# prediction per scored position it is algebraically identical to accuracy, so
+# it would be a duplicate column. Macro F1 is the one that carries new
+# information, because it gives a token appearing 5 times the same weight as one
+# appearing 500,000 times -- which is precisely the signal needed to detect the
+# model collapsing onto the handful of very common tokens.
+TOKEN_COUNT_ROWS = ("true_positive", "predicted", "target")
+
 # Perspective-split loss-breakdown names. Each example is built from one player's
 # perspective (``DatasetExample.perspective_player``); "p1" means p1 is the
 # viewer and p2 is the reconstructed enemy, and vice versa for "p2". Emitted in
@@ -188,6 +221,49 @@ class LossOutput:
     # training loop's lagged finalize (not the forward pass) pays the transfer.
     rare_class_t_bucket_sums: dict[str, torch.Tensor]
     rare_class_t_bucket_counts: dict[str, torch.Tensor]
+    # ---- Token-level correctness and information-theory reporting ----------
+    #
+    # These four fields exist so the per-epoch and per-interval CSVs can report
+    # something other than a loss value: how often the model's argmax token is
+    # actually right, whether it is right across the whole vocabulary or only on
+    # the common tokens, and what the model's uncertainty costs in bits.
+    #
+    # They are REPORTING ONLY. Nothing here is differentiable, nothing here
+    # feeds the optimizer, and none of it changes ``loss``.
+    #
+    # ``unweighted_ce_sum`` / ``scored_token_count`` deliberately do NOT reuse
+    # the ``loss`` field. ``loss`` is the class-WEIGHTED training objective
+    # (config.loss.class_loss_weights currently boosts ``[END]`` by ~24.6x and
+    # damps ``[PAD]`` to 0.1x), so exp(loss) is not a perplexity of anything and
+    # is not comparable between two runs whose weights differ. These two raw
+    # accumulators give the plain, unweighted mean cross entropy in nats over
+    # every scored position, from which bits-per-token and perplexity follow:
+    #
+    #   mean_nats       = unweighted_ce_sum / scored_token_count
+    #   bits_per_token  = mean_nats / ln(2)
+    #   perplexity      = exp(mean_nats) == 2 ** bits_per_token
+    #
+    # Both are on-device, unsynchronized scalars, matching
+    # ``rare_class_t_bucket_sums``: the caller's lagged finalize pays the
+    # GPU->CPU transfer, not the forward pass.
+    unweighted_ce_sum: torch.Tensor
+    scored_token_count: torch.Tensor
+    # Per-canvas-state token count matrices, keyed by CANVAS_STATE_NAMES and
+    # shaped ``[3, vocab_size]`` with rows ordered by TOKEN_COUNT_ROWS. Absent
+    # entirely when ``changed_positions`` was not supplied (no canvas-state split
+    # is knowable then), and following the ``per_class`` emptiness convention: a
+    # state with zero scored positions is omitted rather than present-with-zeros.
+    #
+    # WHY the accuracy/F1 reporting is split by canvas state instead of pooled
+    # into one number: a scored position whose noised canvas token ALREADY equals
+    # the target only asks the model to leave a correct token alone, and at low
+    # corruption levels those positions dominate. A single pooled accuracy would
+    # therefore mostly track the sampled corruption schedule rather than the
+    # model. The "noised" half is the denoising work proper; the
+    # "ground_truth_preserved" half measures whether the model knows to keep what
+    # is already right. See CANVAS_STATE_NAMES for why the split keys on token
+    # inequality rather than on the corruption coin-flip.
+    token_class_counts: dict[str, torch.Tensor]
 
 
 class CanvasCrossEntropyLoss(nn.Module):
@@ -339,6 +415,12 @@ class CanvasCrossEntropyLoss(nn.Module):
         # there already matched the target. See CANVAS_STATE_NAMES for why this
         # uses token inequality rather than the corruption coin-flip.
         canvas_state: dict[str, torch.Tensor] = {}
+        # Declared out here (rather than inside the branch below) because the
+        # token-level accuracy/F1 counts further down split on the SAME masks and
+        # must not recompute them. Stays empty when no corruption information was
+        # supplied, which suppresses both the canvas-state losses and the
+        # canvas-state token counts together.
+        state_masks: dict[str, torch.Tensor] = {}
         if changed_positions is not None:
             changed = changed_positions.to(device=ce.device, dtype=torch.bool)
             state_masks = {
@@ -350,6 +432,63 @@ class CanvasCrossEntropyLoss(nn.Module):
                 if state_mask.any():
                     canvas_state[name] = ce[state_mask].mean()
 
+        # ---- Token-level correctness and unweighted cross entropy ------------
+        # Reporting only: nothing below is differentiable or feeds `loss`.
+        # See LossOutput.token_class_counts / .unweighted_ce_sum for the full
+        # rationale (why the split, why raw counts, why not exp(loss)).
+        active_weight = active.to(ce.dtype)
+        # Plain, UNWEIGHTED cross-entropy total in nats over every scored
+        # position, plus how many positions that was. The caller divides one by
+        # the other to get bits-per-token and perplexity. Kept separate from
+        # `aggregate` above, which is class-weighted and so cannot be
+        # exponentiated into a perplexity.
+        unweighted_ce_sum = (ce * active_weight).sum()
+        scored_token_count = active_weight.sum()
+
+        token_class_counts: dict[str, torch.Tensor] = {}
+        if state_masks:
+            vocab_size = canvas_logits.shape[-1]
+            predicted_tokens = canvas_logits.argmax(dim=-1)
+            correct_positions = predicted_tokens == target_canvas
+            # Flattened once and shared by every state below; `scatter_add_`
+            # wants the index and the source to be 1-D and the same length.
+            flat_predicted = predicted_tokens.reshape(-1)
+            flat_target = target_canvas.reshape(-1)
+            # Iterate the states the canvas_state block above found non-empty
+            # rather than re-testing `state_mask.any()` here. Two reasons: each
+            # `.any()` reads a value back to the host, and reusing that result
+            # makes it structurally impossible for the loss split and the token
+            # split to disagree about which states exist in a given batch. This
+            # also carries the `per_class` emptiness convention across for free:
+            # a state that scored nothing is absent, not a row of zeros.
+            for name in canvas_state:
+                state_mask = state_masks[name]
+                # Multiply-and-scatter rather than boolean-index-and-count, for
+                # the reason given on rare_class_t_bucket_sums: a boolean index
+                # has to read the mask's popcount back to the host to size its
+                # output, which would stall the forward pass. Masking to 0.0
+                # instead lets every position take part in the scatter while
+                # contributing nothing outside the state.
+                in_state = state_mask.to(torch.float32).reshape(-1)
+                in_state_and_correct = (
+                    (state_mask & correct_positions).to(torch.float32).reshape(-1)
+                )
+                # Scatter in float32, then hand back int64 (below). float32 is
+                # exact for integer counts under 2**24 -- ~16.7 million positions
+                # in ONE microbatch, orders of magnitude above anything this
+                # project batches -- while avoiding int64 atomics on CUDA. The
+                # int64 result is what matters to the caller, whose epoch-level
+                # totals genuinely can exceed that bound once pooled.
+                counts = torch.zeros(
+                    len(TOKEN_COUNT_ROWS), vocab_size, device=ce.device, dtype=torch.float32
+                )
+                counts[0].scatter_add_(0, flat_target, in_state_and_correct)
+                counts[1].scatter_add_(0, flat_predicted, in_state)
+                counts[2].scatter_add_(0, flat_target, in_state)
+                # Exact integers throughout, so the cast loses nothing and gives
+                # the caller a type it can pool over a whole epoch safely.
+                token_class_counts[name] = counts.to(torch.int64)
+
         return LossOutput(
             loss=aggregate,
             per_class=per_class,
@@ -360,4 +499,7 @@ class CanvasCrossEntropyLoss(nn.Module):
             canvas_state=canvas_state,
             rare_class_t_bucket_sums=rare_class_t_bucket_sums,
             rare_class_t_bucket_counts=rare_class_t_bucket_counts,
+            unweighted_ce_sum=unweighted_ce_sum,
+            scored_token_count=scored_token_count,
+            token_class_counts=token_class_counts,
         )

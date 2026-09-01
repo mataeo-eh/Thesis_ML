@@ -63,12 +63,31 @@ class ValidationLog:
     # itself a reportable observation. See loss.RARE_CLASS_T_BUCKET_NAMES.
     rare_class_t_bucket: dict[str, float]
     rare_class_t_bucket_counts: dict[str, int]
+    # ---- Token-level correctness and information-theory reporting ----------
+    # Pooled over the WHOLE dev pass, not averaged per batch. `accuracy` and
+    # `macro_f1` are keyed by canvas state ("ground_truth_preserved" / "noised"),
+    # because a single pooled figure would mostly track the sampled corruption
+    # level rather than the model -- see _finalize_token_metrics. Empty keys
+    # follow the per_class convention (absent, not zero).
+    accuracy: dict[str, float]
+    macro_f1: dict[str, float]
+    # Unweighted mean cross entropy expressed in bits per scored token, and the
+    # equivalent perplexity. Deliberately NOT derived from `loss` above, which is
+    # the class-weighted objective -- see _finalize_bits_per_token. None only if
+    # the pass scored no positions at all.
+    bits_per_token: float | None
+    perplexity: float | None
 
 
 @dataclass(frozen=True)
 class TrainStepLog:
     step: int
+    # Mean optimizer-step objective across every microbatch accumulated into the
+    # update. With accumulation=1 this is the batch loss.
     loss: float
+    # Running mean over every microbatch finalized in the current epoch. The
+    # final value is exactly the train_loss written to epoch_metrics.csv.
+    epoch_loss_so_far: float
     denoising_loss: float
     confidence_loss: float
     per_class: dict[str, float]
@@ -125,6 +144,25 @@ class EpochMetrics:
     dev_rare_class_t_bucket_loss: dict[str, float]
     train_rare_class_t_bucket_counts: dict[str, int]
     dev_rare_class_t_bucket_counts: dict[str, int]
+    # ---- Token-level correctness and information-theory reporting ----------
+    # Accuracy and macro F1 keyed by canvas state, pooled over every scored
+    # position of the epoch (train) or of the epoch-end dev pass (dev). The dev
+    # dicts are empty when the run has no dev loader, exactly as the dev loss
+    # decompositions above are. See _finalize_token_metrics for why these are
+    # split by canvas state instead of reported as one number, and
+    # _macro_f1_from_counts for what the macro average is over.
+    train_accuracy: dict[str, float]
+    dev_accuracy: dict[str, float]
+    train_macro_f1: dict[str, float]
+    dev_macro_f1: dict[str, float]
+    # Unweighted cross entropy in bits per scored token plus the equivalent
+    # perplexity, for the epoch's training positions and for the dev pass. None
+    # when that side was not evaluated. See _finalize_bits_per_token for why
+    # these cannot be derived from train_loss / dev_loss.
+    train_bits_per_token: float | None
+    dev_bits_per_token: float | None
+    train_perplexity: float | None
+    dev_perplexity: float | None
     total_tokens_ingested: int
     total_unique_tokens_seen: int
     tokens_per_second: float
@@ -187,6 +225,19 @@ class IntervalMetrics:
     dev_rare_class_t_bucket_loss: dict[str, float]
     train_rare_class_t_bucket_counts: dict[str, int]
     dev_rare_class_t_bucket_counts: dict[str, int]
+    # ---- Token-level correctness and information-theory reporting ----------
+    # Same quantities as the epoch row, but scoped to this interval's slice of
+    # the epoch (train) and to the dev pass taken at this boundary (dev). Both
+    # halves obey the same gating as every other column here: a disabled or
+    # absent side leaves empty dicts and None, which the writer renders blank.
+    train_accuracy: dict[str, float]
+    dev_accuracy: dict[str, float]
+    train_macro_f1: dict[str, float]
+    dev_macro_f1: dict[str, float]
+    train_bits_per_token: float | None
+    dev_bits_per_token: float | None
+    train_perplexity: float | None
+    dev_perplexity: float | None
     lr: float
     wall_clock_elapsed_seconds: float
 
@@ -356,6 +407,7 @@ class TrainingLoop:
             self.generator.manual_seed(seed)
         else:
             self.generator.seed()
+        self._generator_state_restored = False
 
     def fit(
         self,
@@ -392,12 +444,16 @@ class TrainingLoop:
             epoch_limit = epoch_count
         if self.config.train.early_stopping_patience_epochs > 0 and val_dataloader is None:
             raise ValueError("dev-loss early stopping requires a validation dataloader")
-        # Re-fit the EMA averaging window to the step budget THIS run will
-        # actually train through, now that it is known. target_steps is used
-        # rather than config.train.max_steps so that a run bounded by an explicit
-        # `--max-steps` cap still gets an EMA that completes inside the steps it
-        # is given. See _resolve_ema_decay.
-        self._ema_target_decay = self._resolve_ema_decay(target_steps)
+        # Normally EMA is fitted to the actual run budget. A short ablation may
+        # explicitly keep the opening of a longer schedule by setting
+        # schedule_horizon_epochs; the pipeline resolves that horizon into
+        # config.train.max_steps before constructing this loop.
+        schedule_steps = (
+            self.config.train.max_steps
+            if self.config.train.schedule_horizon_epochs > 0
+            else target_steps
+        )
+        self._ema_target_decay = self._resolve_ema_decay(schedule_steps)
         base_accumulation_steps = self.config.train.accumulation_steps
         if base_accumulation_steps < 1:
             raise ValueError("train.accumulation_steps must be >= 1")
@@ -422,14 +478,15 @@ class TrainingLoop:
         # tiny fraction of base_lr. warmup_end_lr shows the lr at the first step
         # AFTER warmup; if it is far below base_lr, warmup is eating the run.
         base_lr = self.config.train.lr
-        warmup, stable, decay = self._schedule_phase_steps(target_steps)
+        warmup, stable, decay = self._schedule_phase_steps(schedule_steps)
         print(
             f"lr_schedule name={self.config.train.lr_schedule} base_lr={base_lr:.3e} "
             f"warmup_steps={warmup} stable_steps={stable} decay_steps={decay} "
-            f"target_steps={target_steps} "
+            f"run_steps={target_steps} schedule_horizon_steps={schedule_steps} "
             f"effective_lr_at_step_1={base_lr * self._lr_multiplier(0):.3e} "
             f"effective_lr_after_warmup={base_lr * self._lr_multiplier(warmup):.3e} "
-            f"effective_lr_at_final_step={base_lr * self._lr_multiplier(target_steps):.3e}"
+            f"effective_lr_at_run_stop={base_lr * self._lr_multiplier(target_steps):.3e} "
+            f"effective_lr_at_schedule_end={base_lr * self._lr_multiplier(schedule_steps):.3e}"
             + (
                 "  [WARNING: warmup >= target_steps -> the run never leaves warmup; "
                 "lower train.warmup]"
@@ -451,8 +508,8 @@ class TrainingLoop:
             f"decay_ceiling={self.config.train.ema_decay} "
             f"effective_decay={self._ema_target_decay:.6f} "
             f"averaging_window_steps={ema_window_steps:.0f} "
-            f"target_steps={target_steps} "
-            f"windows_per_run={target_steps / ema_window_steps:.1f}",
+            f"run_steps={target_steps} schedule_horizon_steps={schedule_steps} "
+            f"windows_per_schedule={schedule_steps / ema_window_steps:.1f}",
             flush=True,
         )
 
@@ -469,8 +526,17 @@ class TrainingLoop:
             # (base_seed, epoch_index), so a resumed run reproduces the same
             # stream as an uninterrupted one (see __init__). Only reseed when a
             # seed was configured; an unseeded run stays nondeterministic.
-            if self._base_seed is not None:
+            if (
+                self._base_seed is not None
+                and not (
+                    self._generator_state_restored
+                    and self.batches_completed_in_epoch > 0
+                )
+            ):
                 self.generator.manual_seed(self._base_seed + epoch_index)
+            # A restored state is consumed exactly once. Future epoch boundaries
+            # return to the normal base_seed + epoch reseed contract.
+            self._generator_state_restored = False
 
             # ---- Deterministic ordering + mid-epoch resume ------------------
             # Seed the batch sampler for THIS epoch so its shuffle is
@@ -501,7 +567,11 @@ class TrainingLoop:
                 batch_sampler.set_start_batch(resume_skip)
 
             epoch_started = time.perf_counter()
-            epoch_losses: list[float] = []
+            # The epoch CSV and live progress use the same running sum/count, so
+            # the last step's `epoch_loss_so_far` is exactly the persisted
+            # `train_loss` without repeatedly summing an ever-growing list.
+            epoch_loss_sum = 0.0
+            epoch_loss_count = 0
             epoch_class_losses: dict[str, list[float]] = {}
             epoch_tokens = 0
             epoch_examples = 0
@@ -523,6 +593,20 @@ class TrainingLoop:
             # epoch; pooling by total scored positions is the correct reduction.
             epoch_rare_class_sums: dict[str, float] = {}
             epoch_rare_class_counts: dict[str, int] = {}
+            # Token-level accuracy / macro-F1 inputs, pooled by plain addition of
+            # the per-canvas-state [3, vocab_size] count matrices the loss module
+            # returns (see TOKEN_COUNT_ROWS in model/loss.py). Counts pool; F1
+            # scores do not, which is why the ratios are only formed at the row
+            # boundary and never averaged across microbatches.
+            epoch_token_class_counts: dict[str, torch.Tensor] = {}
+            # Unweighted cross-entropy total in nats over every scored position of
+            # the epoch, and how many positions that was. These become
+            # bits-per-token and perplexity at the row boundary. Kept apart from
+            # `epoch_losses` because that list holds the class-WEIGHTED objective,
+            # which cannot be exponentiated into a perplexity -- see
+            # _finalize_bits_per_token.
+            epoch_unweighted_ce_sum = 0.0
+            epoch_scored_token_count = 0.0
             # ---- Intra-epoch diagnostic reporting ---------------------------
             # `interval_*` accumulators mirror the epoch ones but are CLEARED
             # after every report, so each row covers only the slice of the epoch
@@ -541,6 +625,11 @@ class TrainingLoop:
             interval_canvas_state_losses: dict[str, list[float]] = {}
             interval_rare_class_sums: dict[str, float] = {}
             interval_rare_class_counts: dict[str, int] = {}
+            # Interval mirrors of the epoch token accumulators above; cleared
+            # after every interval row so each row covers only its own slice.
+            interval_token_class_counts: dict[str, torch.Tensor] = {}
+            interval_unweighted_ce_sum = 0.0
+            interval_scored_token_count = 0.0
             epoch_cuda_device_memory_used = 0
             epoch_cuda_device_memory_gap = 0
             epoch_cuda_memory_samples = 0
@@ -577,6 +666,11 @@ class TrainingLoop:
 
                 nonlocal epoch_cuda_device_memory_used, epoch_cuda_device_memory_gap
                 nonlocal epoch_cuda_memory_samples, interval_cursor
+                # The token-count dicts are mutated in place and so need no
+                # declaration; these four are plain floats that get rebound.
+                nonlocal epoch_unweighted_ce_sum, epoch_scored_token_count
+                nonlocal interval_unweighted_ce_sum, interval_scored_token_count
+                nonlocal epoch_loss_sum, epoch_loss_count
                 if self.device.type == "cuda":
                     record["end_evt"].synchronize()
                     compute_seconds = (
@@ -621,9 +715,14 @@ class TrainingLoop:
 
                 # Epoch loss/per-class/future-distance aggregation over every
                 # microbatch of the step (same values the inline loop appended).
+                step_loss_sum = 0.0
+                step_loss_count = 0
                 for mb in record["microbatches"]:
                     loss_value = float(mb["loss"].cpu())
-                    epoch_losses.append(loss_value)
+                    step_loss_sum += loss_value
+                    step_loss_count += 1
+                    epoch_loss_sum += loss_value
+                    epoch_loss_count += 1
                     interval_losses.append(loss_value)
                     for name, value in mb["per_class"].items():
                         class_value = float(value.cpu())
@@ -670,7 +769,27 @@ class TrainingLoop:
                         interval_rare_class_counts[name] = (
                             interval_rare_class_counts.get(name, 0) + count
                         )
+                    # Token-level counts pool by elementwise addition; the
+                    # unweighted CE total and its position count pool as plain
+                    # sums. None of the three is turned into a ratio here -- an
+                    # accuracy, an F1, or a bits-per-token computed per microbatch
+                    # and then averaged would weight a 6-position microbatch the
+                    # same as a 6000-position one.
+                    _accumulate_token_class_counts(
+                        epoch_token_class_counts, mb["token_class_counts"]
+                    )
+                    _accumulate_token_class_counts(
+                        interval_token_class_counts, mb["token_class_counts"]
+                    )
+                    microbatch_ce_sum = float(mb["unweighted_ce_sum"].cpu())
+                    microbatch_scored_tokens = float(mb["scored_token_count"].cpu())
+                    epoch_unweighted_ce_sum += microbatch_ce_sum
+                    interval_unweighted_ce_sum += microbatch_ce_sum
+                    epoch_scored_token_count += microbatch_scored_tokens
+                    interval_scored_token_count += microbatch_scored_tokens
 
+                step_loss = step_loss_sum / step_loss_count
+                epoch_loss_so_far = epoch_loss_sum / epoch_loss_count
                 tokens_per_second = record["step_tokens"] / step_wall_seconds
                 print(
                     f"step={record['step']} step_wall_seconds={step_wall_seconds:.3f} "
@@ -678,12 +797,8 @@ class TrainingLoop:
                     f"compute_seconds={compute_seconds:.3f} "
                     f"tokens_per_second={tokens_per_second:.1f} "
                     f"lr={record['lr']:.3e} "
-                    f"cuda_max_memory_allocated_gb={cuda_max_allocated / 1024**3:.3f} "
-                    f"cuda_memory_allocated_gb={cuda_allocated / 1024**3:.3f} "
-                    f"cuda_memory_reserved_gb={cuda_reserved / 1024**3:.3f} "
-                    f"cuda_inactive_split_gb={cuda_inactive_split / 1024**3:.3f} "
-                    f"cuda_device_memory_used_gb={cuda_device_used / 1024**3:.3f} "
-                    f"cuda_device_memory_gap_gb={cuda_device_gap / 1024**3:.3f}",
+                    f"loss={step_loss:.6f} "
+                    f"epoch_loss_so_far={epoch_loss_so_far:.6f}",
                     flush=True,
                 )
                 self._enforce_cuda_memory_limit(cuda_reserved)
@@ -694,7 +809,8 @@ class TrainingLoop:
                 last = record["microbatches"][-1]
                 step_log = self._make_log(
                     step=record["step"],
-                    loss=float(last["loss"].cpu()),
+                    loss=step_loss,
+                    epoch_loss_so_far=epoch_loss_so_far,
                     denoising_loss=float(last["denoising"].cpu()),
                     confidence_loss=float(last["confidence"].cpu()),
                     per_class={name: float(v.cpu()) for name, v in last["per_class"].items()},
@@ -864,6 +980,13 @@ class TrainingLoop:
                                     if interval_validation is not None
                                     else {}
                                 ),
+                                **_interval_token_metric_fields(
+                                    interval_token_class_counts,
+                                    interval_unweighted_ce_sum,
+                                    interval_scored_token_count,
+                                    interval_validation,
+                                    report_train=report_train,
+                                ),
                                 lr=record["lr"],
                                 wall_clock_elapsed_seconds=self._cumulative_wall_seconds(),
                             )
@@ -878,6 +1001,9 @@ class TrainingLoop:
                     interval_canvas_state_losses.clear()
                     interval_rare_class_sums.clear()
                     interval_rare_class_counts.clear()
+                    interval_token_class_counts.clear()
+                    interval_unweighted_ce_sum = 0.0
+                    interval_scored_token_count = 0.0
 
             while self.global_step < target_steps:
                 iter_top = time.perf_counter()
@@ -971,6 +1097,21 @@ class TrainingLoop:
                                 for name, value in
                                 batch_loss.loss_output.rare_class_t_bucket_counts.items()
                             },
+                            # Token-level correctness counts and the unweighted CE
+                            # total ride along as on-device tensors for the same
+                            # reason everything else here does: the lagged
+                            # finalize pays the GPU->CPU transfer, not this loop.
+                            "token_class_counts": {
+                                name: value.detach()
+                                for name, value in
+                                batch_loss.loss_output.token_class_counts.items()
+                            },
+                            "unweighted_ce_sum": (
+                                batch_loss.loss_output.unweighted_ce_sum.detach()
+                            ),
+                            "scored_token_count": (
+                                batch_loss.loss_output.scored_token_count.detach()
+                            ),
                             "t_mean": batch_loss.corruption.t.detach().mean(),
                             "noise_fraction": (
                                 batch_loss.corruption.corrupted_positions
@@ -1046,7 +1187,7 @@ class TrainingLoop:
                 )
                 pending = None
 
-            if not epoch_losses:
+            if epoch_loss_count == 0:
                 break
             # A bounded --max-steps verification may intentionally stop in the
             # middle of a very large epoch. Preserve its partial epoch metrics,
@@ -1060,13 +1201,17 @@ class TrainingLoop:
                 if val_dataloader is not None and not partial_epoch
                 else None
             )
-            self.completed_epochs = epoch_index + 1
-            # Epoch finished: the next epoch starts at batch 0. Reset before any
-            # checkpoint of the next epoch can capture a stale offset.
-            self.batches_completed_in_epoch = 0
+            if not partial_epoch:
+                self.completed_epochs = epoch_index + 1
+                # Epoch finished: the next epoch starts at batch 0. Reset before
+                # any checkpoint of the next epoch can capture a stale offset.
+                self.batches_completed_in_epoch = 0
             epoch_metrics = EpochMetrics(
-                epoch=self.completed_epochs,
-                train_loss=sum(epoch_losses) / len(epoch_losses),
+                # A bounded partial row is still labelled with the epoch it
+                # sampled, while resume state correctly retains that epoch as
+                # incomplete and keeps its batch offset.
+                epoch=epoch_index + 1,
+                train_loss=epoch_loss_sum / epoch_loss_count,
                 dev_loss=epoch_validation.loss if epoch_validation is not None else None,
                 train_per_class=_mean_of_lists(epoch_class_losses),
                 dev_per_class=epoch_validation.per_class if epoch_validation is not None else {},
@@ -1109,6 +1254,12 @@ class TrainingLoop:
                     epoch_validation.rare_class_t_bucket_counts
                     if epoch_validation is not None
                     else {}
+                ),
+                **_epoch_token_metric_fields(
+                    epoch_token_class_counts,
+                    epoch_unweighted_ce_sum,
+                    epoch_scored_token_count,
+                    epoch_validation,
                 ),
                 total_tokens_ingested=self.total_tokens_ingested,
                 total_unique_tokens_seen=len(self.unique_token_ids_seen),
@@ -1168,6 +1319,7 @@ class TrainingLoop:
             generator=self.generator,
             t=fixed_t,
             canvas_noise_mask=batch.canvas_loss_mask,
+            row_seeds=batch.stochastic_seeds,
         )
 
         if self.config.diffusion.process == "uniform":
@@ -1187,7 +1339,8 @@ class TrainingLoop:
             canvas_self_conditioning = None
             if model is None and self.config.model.self_conditioning:
                 self_conditioning_mask = self._sample_self_conditioning_rows(
-                    batch.target_canvas.shape[0]
+                    batch.target_canvas.shape[0],
+                    row_seeds=batch.stochastic_seeds,
                 )
                 with torch.no_grad():
                     estimate = active_model(
@@ -1315,6 +1468,7 @@ class TrainingLoop:
                 ),
                 "architecture_identity": getattr(self.model, "architecture_identity", None),
                 "diffusion_process": getattr(self.model, "diffusion_process", None),
+                "training_generator_state": self.generator.get_state(),
             },
             checkpoint_path,
         )
@@ -1354,6 +1508,13 @@ class TrainingLoop:
         self.unique_token_ids_seen = {
             int(token_id) for token_id in checkpoint.get("unique_token_ids_seen", [])
         }
+        generator_state = checkpoint.get("training_generator_state")
+        if generator_state is not None:
+            # torch.load(map_location=self.device) also relocates this byte
+            # tensor, but Generator.set_state requires its serialized state on
+            # CPU even when the generator itself is CUDA-backed.
+            self.generator.set_state(generator_state.to(device="cpu", dtype=torch.uint8))
+            self._generator_state_restored = True
 
     def load_model_weights(self, path: str | Path) -> None:
         """Warm-start ONLY the model weights from a checkpoint (fine-tuning).
@@ -1468,6 +1629,7 @@ class TrainingLoop:
         *,
         step: int,
         loss: float,
+        epoch_loss_so_far: float,
         denoising_loss: float,
         confidence_loss: float,
         per_class: dict[str, float],
@@ -1497,6 +1659,7 @@ class TrainingLoop:
         return TrainStepLog(
             step=step,
             loss=loss,
+            epoch_loss_so_far=epoch_loss_so_far,
             denoising_loss=denoising_loss,
             confidence_loss=confidence_loss,
             per_class=dict(sorted(per_class.items())),
@@ -1623,7 +1786,12 @@ class TrainingLoop:
         fieldnames = [
             "epoch",
             "train_loss",
+            # Token-level correctness and information-theory columns sit directly
+            # after their own split's headline loss, so a reader scanning left to
+            # right sees the whole train summary before the whole dev summary.
+            *_token_metric_fieldnames("train"),
             "dev_loss",
+            *_token_metric_fieldnames("dev"),
             *(f"train_{name}_loss" for name in class_names),
             *(f"dev_{name}_loss" for name in class_names),
             *(f"train_t_bucket_loss_{name}" for name in T_BUCKET_NAMES),
@@ -1678,6 +1846,22 @@ class TrainingLoop:
             "average_cuda_device_memory_used_bytes": metrics.average_cuda_device_memory_used_bytes,
             "average_cuda_device_memory_gap_bytes": metrics.average_cuda_device_memory_gap_bytes,
         }
+        _write_token_metric_columns(
+            row,
+            "train",
+            metrics.train_accuracy,
+            metrics.train_macro_f1,
+            metrics.train_bits_per_token,
+            metrics.train_perplexity,
+        )
+        _write_token_metric_columns(
+            row,
+            "dev",
+            metrics.dev_accuracy,
+            metrics.dev_macro_f1,
+            metrics.dev_bits_per_token,
+            metrics.dev_perplexity,
+        )
         for source_name in active_class_map.values():
             name = _metric_class_name(source_name)
             row[f"train_{name}_loss"] = metrics.train_per_class.get(source_name, "")
@@ -1758,7 +1942,9 @@ class TrainingLoop:
             "epoch_batch_index",
             "batches_in_epoch",
             "train_loss",
+            *_token_metric_fieldnames("train"),
             "dev_loss",
+            *_token_metric_fieldnames("dev"),
             *(f"train_{name}_loss" for name in class_names),
             *(f"dev_{name}_loss" for name in class_names),
             *(f"train_t_bucket_loss_{name}" for name in T_BUCKET_NAMES),
@@ -1786,6 +1972,22 @@ class TrainingLoop:
             "lr": metrics.lr,
             "wall_clock_elapsed_seconds": metrics.wall_clock_elapsed_seconds,
         }
+        _write_token_metric_columns(
+            row,
+            "train",
+            metrics.train_accuracy,
+            metrics.train_macro_f1,
+            metrics.train_bits_per_token,
+            metrics.train_perplexity,
+        )
+        _write_token_metric_columns(
+            row,
+            "dev",
+            metrics.dev_accuracy,
+            metrics.dev_macro_f1,
+            metrics.dev_bits_per_token,
+            metrics.dev_perplexity,
+        )
         for source_name in active_class_map.values():
             name = _metric_class_name(source_name)
             row[f"train_{name}_loss"] = metrics.train_per_class.get(source_name, "")
@@ -1896,7 +2098,12 @@ class TrainingLoop:
             return configured
         return max(configured, math.ceil(target_tokens / microbatch_tokens))
 
-    def _sample_self_conditioning_rows(self, batch_size: int) -> torch.Tensor:
+    def _sample_self_conditioning_rows(
+        self,
+        batch_size: int,
+        *,
+        row_seeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Choose stopped estimate conditioning independently for each row."""
 
         probability = self.config.train.self_cond_prob
@@ -1904,6 +2111,18 @@ class TrainingLoop:
             return torch.zeros(batch_size, device=self.device, dtype=torch.bool)
         if probability >= 1.0:
             return torch.ones(batch_size, device=self.device, dtype=torch.bool)
+        if row_seeds is not None:
+            seeds = row_seeds.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+            if seeds.numel() != batch_size:
+                raise ValueError(f"row_seeds must have shape ({batch_size},)")
+            draws: list[torch.Tensor] = []
+            for seed in seeds.tolist():
+                generator = torch.Generator(device=self.device)
+                # Domain separation from corruption's generator while retaining
+                # the same stable per-example source seed.
+                generator.manual_seed(int(seed) ^ 0x5C0D17)
+                draws.append(torch.rand((), device=self.device, generator=generator))
+            return torch.stack(draws) < probability
         generator_device = self.device if self.device.type in {"cpu", "cuda"} else torch.device("cpu")
         return torch.rand(
             batch_size, device=generator_device, generator=self.generator
@@ -1928,7 +2147,7 @@ class TrainingLoop:
         at a sane window rather than growing one without bound.
 
         Parameters:
-            total_steps: the run's total optimizer-step horizon. Values <= 0 are
+            total_steps: the configured optimizer-step schedule horizon. Values <= 0 are
                 treated as a 1-step horizon, which yields decay 0.0 (the EMA
                 simply mirrors the raw weights) -- the right answer for a run too
                 short to average over.
@@ -2046,6 +2265,13 @@ class TrainingLoop:
         # LossOutput.rare_class_t_bucket_sums.
         rare_class_sums: dict[str, float] = {}
         rare_class_counts: dict[str, int] = {}
+        # Token-level accuracy / macro-F1 inputs and the unweighted cross-entropy
+        # total, pooled over the WHOLE dev pass by summation rather than averaged
+        # per batch -- an F1 or a bits-per-token computed per batch and then
+        # averaged would weight a small final batch the same as a full one.
+        token_class_counts: dict[str, torch.Tensor] = {}
+        unweighted_ce_sum = 0.0
+        scored_token_count = 0.0
         for batch in dataloader:
             batch_loss = self.compute_batch_loss(batch, fixed_t=fixed_t, model=self.ema_model)
             loss_sum += float(batch_loss.loss.detach().cpu())
@@ -2077,6 +2303,12 @@ class TrainingLoop:
                 rare_class_counts[name] = (
                     rare_class_counts.get(name, 0) + int(value.detach().cpu())
                 )
+            _accumulate_token_class_counts(
+                token_class_counts,
+                batch_loss.loss_output.token_class_counts,
+            )
+            unweighted_ce_sum += float(batch_loss.loss_output.unweighted_ce_sum.detach().cpu())
+            scored_token_count += float(batch_loss.loss_output.scored_token_count.detach().cpu())
         if was_training:
             self.ema_model.train()
         if loss_count == 0:
@@ -2085,6 +2317,12 @@ class TrainingLoop:
             name: class_sums[name] / class_counts[name]
             for name in sorted(class_sums)
         }
+        # Ratios formed once, from the counts pooled over the entire pass.
+        accuracy, macro_f1 = _finalize_token_metrics(token_class_counts)
+        bits_per_token, perplexity = _finalize_bits_per_token(
+            unweighted_ce_sum,
+            scored_token_count,
+        )
         return ValidationLog(
             loss=loss_sum / loss_count,
             per_class=per_class,
@@ -2109,6 +2347,10 @@ class TrainingLoop:
                 rare_class_counts,
             ),
             rare_class_t_bucket_counts=dict(rare_class_counts),
+            accuracy=accuracy,
+            macro_f1=macro_f1,
+            bits_per_token=bits_per_token,
+            perplexity=perplexity,
         )
 
 
@@ -2361,6 +2603,367 @@ def _finalize_rare_class_t_bucket(
     }
 
 
+def _token_metric_fieldnames(split: str) -> list[str]:
+    """Return the token-metric CSV column names for one split, in emission order.
+
+    Shared by the epoch and the interval writer so the two files can never drift
+    apart in either the names or the ordering of these columns.
+
+    The accuracy and macro-F1 columns are per canvas state rather than a single
+    pooled pair. See _finalize_token_metrics for why: a pooled accuracy would
+    largely report how corrupted the sampled examples happened to be, since a
+    position whose canvas token already equals the target only asks the model to
+    leave it alone. Read ``_noised`` as the denoising work proper and
+    ``_ground_truth_preserved`` as "does the model recognise an already-correct
+    token".
+
+    Args:
+        split: either "train" or "dev"; used as the column-name prefix.
+
+    Returns:
+        A list of ``2 * len(CANVAS_STATE_NAMES) + 2`` column names.
+
+    Called by: TrainingLoop._write_epoch_metrics, TrainingLoop._write_interval_metrics.
+    """
+
+    return [
+        *(f"{split}_accuracy_{name}" for name in CANVAS_STATE_NAMES),
+        *(f"{split}_macro_f1_{name}" for name in CANVAS_STATE_NAMES),
+        f"{split}_bits_per_token",
+        f"{split}_perplexity",
+    ]
+
+
+def _write_token_metric_columns(
+    row: dict[str, object],
+    split: str,
+    accuracy: dict[str, float],
+    macro_f1: dict[str, float],
+    bits_per_token: float | None,
+    perplexity: float | None,
+) -> None:
+    """Populate one split's token-metric cells on an in-progress CSV row.
+
+    Follows the same blank-cell convention as every other breakdown in these
+    files: a canvas state that scored no positions, or a split that was not
+    evaluated at all, leaves an empty cell rather than a zero. A zero accuracy
+    and an unevaluated split are very different observations and must not look
+    alike in the CSV.
+
+    Args:
+        row: the row dict being assembled, mutated in place.
+        split: either "train" or "dev"; must match the prefix used for the
+            fieldnames from _token_metric_fieldnames.
+        accuracy: canvas state name -> accuracy, with unscored states absent.
+        macro_f1: canvas state name -> macro F1, with unscored states absent.
+        bits_per_token: unweighted cross entropy in bits per scored token, or
+            None when this split was not evaluated.
+        perplexity: the equivalent perplexity, or None on the same condition.
+
+    Returns:
+        None. ``row`` is updated in place.
+
+    Called by: TrainingLoop._write_epoch_metrics, TrainingLoop._write_interval_metrics.
+    """
+
+    for name in CANVAS_STATE_NAMES:
+        row[f"{split}_accuracy_{name}"] = accuracy.get(name, "")
+        row[f"{split}_macro_f1_{name}"] = macro_f1.get(name, "")
+    row[f"{split}_bits_per_token"] = "" if bits_per_token is None else bits_per_token
+    row[f"{split}_perplexity"] = "" if perplexity is None else perplexity
+
+
+def _epoch_token_metric_fields(
+    train_counts: dict[str, torch.Tensor],
+    train_unweighted_ce_sum: float,
+    train_scored_token_count: float,
+    validation: "ValidationLog | None",
+) -> dict[str, object]:
+    """Build the eight token-metric keyword arguments for one EpochMetrics row.
+
+    Exists so the EpochMetrics construction in TrainingLoop.fit stays readable:
+    without it the call site would grow eight more inline conditional
+    expressions, each repeating the same "empty when there was no dev pass" rule
+    the surrounding loss fields already follow.
+
+    Args:
+        train_counts: epoch-pooled per-canvas-state token count matrices.
+        train_unweighted_ce_sum: epoch-pooled unweighted cross entropy, in nats.
+        train_scored_token_count: how many scored positions that total covered.
+        validation: the epoch-end dev pass, or None when the run has no dev
+            loader (or the epoch was cut short by --max-steps).
+
+    Returns:
+        A dict of the eight EpochMetrics field names to their values, ready to
+        splat into the constructor. The dev entries are empty dicts / None when
+        ``validation`` is None, matching how the dev loss decompositions behave.
+
+    Calls: _finalize_token_metrics, _finalize_bits_per_token.
+    Called by: TrainingLoop.fit.
+    """
+
+    train_accuracy, train_macro_f1 = _finalize_token_metrics(train_counts)
+    train_bits, train_perplexity = _finalize_bits_per_token(
+        train_unweighted_ce_sum,
+        train_scored_token_count,
+    )
+    return {
+        "train_accuracy": train_accuracy,
+        "dev_accuracy": validation.accuracy if validation is not None else {},
+        "train_macro_f1": train_macro_f1,
+        "dev_macro_f1": validation.macro_f1 if validation is not None else {},
+        "train_bits_per_token": train_bits,
+        "dev_bits_per_token": validation.bits_per_token if validation is not None else None,
+        "train_perplexity": train_perplexity,
+        "dev_perplexity": validation.perplexity if validation is not None else None,
+    }
+
+
+def _interval_token_metric_fields(
+    train_counts: dict[str, torch.Tensor],
+    train_unweighted_ce_sum: float,
+    train_scored_token_count: float,
+    validation: "ValidationLog | None",
+    *,
+    report_train: bool,
+) -> dict[str, object]:
+    """Build the eight token-metric keyword arguments for one IntervalMetrics row.
+
+    Same job as _epoch_token_metric_fields, with the extra gate the interval row
+    carries: ``train.interval_train_evaluation`` can switch the train half off,
+    in which case those columns are blanked here and the epoch row reports the
+    epoch-wide numbers instead. The accumulators still run either way, so
+    re-enabling the flag needs no other change.
+
+    Args:
+        train_counts: interval-pooled per-canvas-state token count matrices.
+        train_unweighted_ce_sum: interval-pooled unweighted cross entropy, nats.
+        train_scored_token_count: how many scored positions that total covered.
+        validation: the dev pass taken at this interval boundary, or None when
+            dev interval evaluation is off or the run has no dev loader.
+        report_train: whether the train half of this row is being reported.
+
+    Returns:
+        A dict of the eight IntervalMetrics field names to their values.
+
+    Calls: _finalize_token_metrics, _finalize_bits_per_token.
+    Called by: TrainingLoop.fit.
+    """
+
+    if report_train:
+        train_accuracy, train_macro_f1 = _finalize_token_metrics(train_counts)
+        train_bits, train_perplexity = _finalize_bits_per_token(
+            train_unweighted_ce_sum,
+            train_scored_token_count,
+        )
+    else:
+        train_accuracy, train_macro_f1 = {}, {}
+        train_bits, train_perplexity = None, None
+    return {
+        "train_accuracy": train_accuracy,
+        "dev_accuracy": validation.accuracy if validation is not None else {},
+        "train_macro_f1": train_macro_f1,
+        "dev_macro_f1": validation.macro_f1 if validation is not None else {},
+        "train_bits_per_token": train_bits,
+        "dev_bits_per_token": validation.bits_per_token if validation is not None else None,
+        "train_perplexity": train_perplexity,
+        "dev_perplexity": validation.perplexity if validation is not None else None,
+    }
+
+
+def _accumulate_token_class_counts(
+    accumulator: dict[str, torch.Tensor],
+    counts: dict[str, torch.Tensor],
+) -> None:
+    """Add one batch's token count matrices into a running per-canvas-state total.
+
+    Each value is the ``[3, vocab_size]`` int64 matrix described by
+    ``TOKEN_COUNT_ROWS`` in model/loss.py. Because every entry is a COUNT of
+    scored positions, pooling is plain elementwise addition -- which is exactly
+    why the loss module hands back counts instead of finished accuracy/F1
+    numbers. Averaging per-microbatch F1 scores would weight a microbatch with 6
+    scored positions the same as one with 6000.
+
+    The tensors are moved to the host here (a ~7 KB copy for this project's ~291
+    token vocabulary) so the accumulator never pins device memory across an epoch.
+    This runs inside the caller's already-synchronising lagged finalize, so it
+    adds no new stall.
+
+    Args:
+        accumulator: running per-canvas-state totals, mutated in place. A state
+            seen for the first time is inserted; states absent from ``counts``
+            are left untouched.
+        counts: this batch's per-canvas-state matrices, straight off
+            ``LossOutput.token_class_counts``. States that scored nothing are
+            already omitted by the loss module.
+
+    Returns:
+        None. ``accumulator`` is updated in place.
+
+    Called by: TrainingLoop.fit (epoch and interval accumulation) and
+        TrainingLoop.validate.
+    """
+
+    for name, value in counts.items():
+        host_counts = value.detach().to("cpu")
+        existing = accumulator.get(name)
+        if existing is None:
+            # clone() so a later add_ can never write back into the tensor the
+            # loss module returned for this batch.
+            accumulator[name] = host_counts.clone()
+        else:
+            existing.add_(host_counts)
+
+
+def _macro_f1_from_counts(counts: torch.Tensor) -> float:
+    """Compute the macro-averaged F1 over token ids from one pooled count matrix.
+
+    "Macro" means every token id gets ONE vote regardless of how often it occurs,
+    which is the whole point of reporting it next to accuracy: a model that has
+    collapsed onto the handful of very common tokens can score high accuracy
+    while scoring low macro F1, and only the second number shows the collapse.
+
+    Which token ids are averaged over: those with a non-zero PREDICTED count or a
+    non-zero TARGET count -- i.e. every token that either occurred or was
+    guessed. This matches scikit-learn's ``f1_score(average="macro")`` default
+    when no explicit ``labels`` argument is given. Tokens the model wrongly emits
+    but that never actually occur therefore contribute an F1 of 0 and pull the
+    score down, which is the intended penalty for hallucinating a token. Tokens
+    neither predicted nor present are excluded entirely rather than counted as
+    perfect or as zero, because a ~291-token vocabulary with many tokens absent
+    from a given slice would otherwise make the number say more about the slice
+    than about the model.
+
+    The F1 is computed ONCE from epoch-pooled (or interval-pooled, or dev-pass-
+    pooled) counts. It is NOT an average of per-batch F1 scores.
+
+    Args:
+        counts: host int64 tensor of shape ``[3, vocab_size]``, rows ordered by
+            TOKEN_COUNT_ROWS (true_positive, predicted, target).
+
+    Returns:
+        The macro F1 in ``[0.0, 1.0]``. Returns 0.0 for an all-zero matrix, which
+        the caller avoids passing by skipping states with no scored positions.
+
+    Called by: _finalize_token_metrics.
+    """
+
+    # float64 throughout: the counts can reach hundreds of millions over a full
+    # epoch, and the ratios below need to stay exact at that magnitude.
+    true_positive = counts[0].to(torch.float64)
+    predicted = counts[1].to(torch.float64)
+    target = counts[2].to(torch.float64)
+
+    averaged = (predicted > 0) | (target > 0)
+    if not bool(averaged.any()):
+        return 0.0
+
+    true_positive = true_positive[averaged]
+    predicted = predicted[averaged]
+    target = target[averaged]
+
+    # clamp_min only guards the division; wherever a denominator was genuinely 0
+    # the torch.where picks the 0.0 branch instead of the quotient, so the clamp
+    # can never change a reported value.
+    zero = torch.zeros_like(true_positive)
+    precision = torch.where(predicted > 0, true_positive / predicted.clamp_min(1.0), zero)
+    recall = torch.where(target > 0, true_positive / target.clamp_min(1.0), zero)
+    harmonic_denominator = precision + recall
+    per_token_f1 = torch.where(
+        harmonic_denominator > 0,
+        2.0 * precision * recall / harmonic_denominator.clamp_min(1e-12),
+        zero,
+    )
+    return float(per_token_f1.mean())
+
+
+def _finalize_token_metrics(
+    counts_by_state: dict[str, torch.Tensor],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Reduce pooled token count matrices to per-canvas-state accuracy and macro F1.
+
+    Reported per canvas state rather than pooled into one number, because a
+    single figure would mostly track the sampled corruption level: at low
+    corruption most scored positions already hold the right token and the model
+    only has to leave them alone. ``noised`` is the denoising work proper;
+    ``ground_truth_preserved`` is whether the model recognises an already-correct
+    token. See CANVAS_STATE_NAMES in model/loss.py for why the split keys on
+    token inequality rather than on the corruption coin-flip.
+
+    Args:
+        counts_by_state: canvas state name -> pooled ``[3, vocab_size]`` host
+            count matrix, as produced by _accumulate_token_class_counts.
+
+    Returns:
+        ``(accuracy, macro_f1)``, both keyed by canvas state name in sorted
+        order. A state whose pooled target count is 0 is OMITTED from both dicts,
+        following the same blank-cell convention the per-class loss columns use.
+
+    Calls: _macro_f1_from_counts.
+    Called by: TrainingLoop.fit (epoch and interval rows) and
+        TrainingLoop.validate.
+    """
+
+    accuracy: dict[str, float] = {}
+    macro_f1: dict[str, float] = {}
+    for name in sorted(counts_by_state):
+        counts = counts_by_state[name]
+        # Row 2 is the target count, so its sum is the number of scored positions
+        # this state pooled over.
+        scored_positions = int(counts[2].sum())
+        if scored_positions == 0:
+            continue
+        correct_positions = int(counts[0].sum())
+        accuracy[name] = correct_positions / scored_positions
+        macro_f1[name] = _macro_f1_from_counts(counts)
+    return accuracy, macro_f1
+
+
+def _finalize_bits_per_token(
+    unweighted_ce_sum: float,
+    scored_token_count: float,
+) -> tuple[float | None, float | None]:
+    """Convert a pooled unweighted cross-entropy total into bits/token and perplexity.
+
+    WHY this is not derived from the reported ``train_loss``/``dev_loss``: those
+    are the class-WEIGHTED training objective (config.loss.class_loss_weights
+    currently boosts ``[END]`` by ~24.6x and damps ``[PAD]`` to 0.1x), normalised
+    by the weight sum. Exponentiating that is not a perplexity of any
+    distribution and is not comparable between two runs whose weights differ. The
+    inputs here come from ``LossOutput.unweighted_ce_sum`` /
+    ``.scored_token_count``, which are accumulated separately and unweighted for
+    exactly this reason.
+
+    What the numbers mean: bits-per-token is the average number of binary
+    questions needed to identify the true token given the model's distribution,
+    and perplexity is the equivalent number of equally-likely choices the model
+    is effectively deciding between. Both are averaged over EVERY scored canvas
+    position -- the already-correct ones and the noised ones alike -- at the
+    run's sampled corruption distribution. That makes them comparable across
+    models trained and evaluated on the same splits with the same corruption
+    schedule, and NOT comparable to an autoregressive language model's
+    perplexity, which is a next-token quantity with no corruption process in it.
+
+    Args:
+        unweighted_ce_sum: total unweighted cross entropy in nats, pooled over
+            every scored position of the epoch / interval / dev pass.
+        scored_token_count: how many scored positions that total covered.
+
+    Returns:
+        ``(bits_per_token, perplexity)``, or ``(None, None)`` when nothing was
+        scored, which the CSV writers render as blank cells.
+
+    Called by: TrainingLoop.fit (epoch and interval rows) and
+        TrainingLoop.validate.
+    """
+
+    if scored_token_count <= 0:
+        return None, None
+    mean_nats = unweighted_ce_sum / scored_token_count
+    # log2(x) = ln(x) / ln(2); perplexity is the same quantity as 2 ** bits.
+    return mean_nats / math.log(2.0), math.exp(mean_nats)
+
+
 def move_batch_to_device(batch: DiffusionBatch, device: torch.device) -> DiffusionBatch:
     non_blocking = device.type == "cuda"
     features = batch.input_features
@@ -2395,4 +2998,8 @@ def move_batch_to_device(batch: DiffusionBatch, device: torch.device) -> Diffusi
         input_records=batch.input_records,
         canvas_metadata=batch.canvas_metadata,
         input_features=moved_features,
+        # Seeds stay on CPU. They are control metadata used to initialize
+        # per-row generators; copying them to CUDA only to read them back would
+        # add a synchronization for no benefit.
+        stochastic_seeds=batch.stochastic_seeds,
     )
