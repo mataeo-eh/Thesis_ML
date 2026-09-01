@@ -1,0 +1,4 @@
+# Generated inference-test output. Every run directory here is runtime state
+# (figures, CSVs, JSON) reproducible from the checkpoint plus the test scripts.
+*
+!.gitignore
