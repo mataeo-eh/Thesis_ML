@@ -6,6 +6,7 @@
 
 ## Ownership
 
+- `test_blizzard_replays.py` owns the standalone Blizzard replay archive inventory: it discovers client versions, enumerates packs per discovered version, and summarizes compressed sizes without downloading archive bodies. It requires `requests`, `python-dotenv`, and local `BLIZZARD_CLIENT_ID`/`BLIZZARD_CLIENT_SECRET` environment variables (or an ignored `.env`). Credentials are read only when run, so pytest collection does not require them. Discovery is subject to the API search cap; its totals describe discovered archives, not a guaranteed complete corpus. Captured console output under `output/Blizzard_Replay_Testing_Output/` stays ignored.
 - `estimate_context_window.py` owns dataset context-window analysis: it streams parquet metadata plus the two upgrade columns and writes token-length reports to `scripts/output/`.
 - `gpu_smoke_test.py` owns the pre-flight GPU fit/throughput check that fabricates a correctly-shaped random batch (no dataset required) and reports peak VRAM and per-step time.
 - `batch_interference_probe.py` owns the batch-versus-batch interference diagnostic: it restores a finished checkpoint, takes one optimizer step on each batch of a frozen epoch in turn, and records the loss that step causes on every other batch. It writes only to `scripts/output/batch_interference/<arm>/` and never mutates the probed run.
