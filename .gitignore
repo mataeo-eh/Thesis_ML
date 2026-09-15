@@ -14,6 +14,7 @@ dist/
 .venv/
 venv/
 env/
+.env
 
 # ---- Jupyter ----
 .ipynb_checkpoints/
@@ -36,6 +37,7 @@ data/*
 scripts/output/canvas_unigram_baseline/
 scripts/output/timestep_alignment_probe/
 scripts/output/rare_token_signal_probe/
+scripts/output/Blizzard_Replay_Testing_Output/
 
 # ---- Agent tooling (local, not shared) ----
 .agents/
