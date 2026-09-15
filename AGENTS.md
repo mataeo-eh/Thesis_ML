@@ -6,6 +6,7 @@
 
 ## Ownership
 
+- `Log.md` and `Timelog.xlsx` hold the research journal and time records. `TACCS_Proposal.docx` and `TACCS_Proposal_V1.docx` hold the original and revised cluster functional-testing proposals; these describe proposed work, not implemented architecture or measured cluster capabilities.
 - `Model_Architecture/` owns the exact current implementation/configuration reference for every learnable component and model-facing pipeline stage, plus the reusable update prompt that keeps the reference synchronized with source.
 - `src/thesis_ml/data/windowing.py` owns tokenized replay artifacts and timestep-aligned window manifests.
 - `src/thesis_ml/data/dataset.py` owns lazy per-window example construction and per-serving fog for both training modes.
