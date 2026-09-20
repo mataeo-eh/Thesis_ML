@@ -29,15 +29,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from thesis_ml.config import load_config
-from thesis_ml.inference.timing import TimedTimestep
-from thesis_ml.eval.buildorder import BuildOrderEvent
-from thesis_ml.eval.harness import EvaluationExampleResult
-from thesis_ml.inference.sampler import denoise_canvas_once
-from thesis_ml.serialize import TokenRecord
-from thesis_ml.viz import diagnostics
-from thesis_ml.vocab.content_vocab import build_content_vocabulary
-from thesis_ml.vocab.special_tokens import END_ID, MASK_ID, WIN_ID
+from thesis_shared.config import load_config
+from thesis_shared.inference.timing import TimedTimestep
+from thesis_shared.eval.buildorder import BuildOrderEvent
+from thesis_diffusion.eval.harness import EvaluationExampleResult
+from thesis_diffusion.inference.sampler import denoise_canvas_once
+from thesis_shared.serialize import TokenRecord
+from thesis_diffusion.viz import diagnostics
+from thesis_shared.vocab.content_vocab import build_content_vocabulary
+from thesis_shared.vocab.special_tokens import END_ID, MASK_ID, WIN_ID
 
 
 # Repo-relative fixture locations (metadata resolves via ../json/ of the parquet).
@@ -585,7 +585,7 @@ def _build_replay_dir(tmp_path: Path) -> Path:
 def _write_tiny_config(tmp_path: Path) -> Path:
     """Write a YAML that extends default.yaml with tiny, fast overrides."""
 
-    from thesis_ml.data.feature_stats import FeatureStatistics, write_feature_statistics
+    from thesis_shared.data.feature_stats import FeatureStatistics, write_feature_statistics
 
     default_path = (_REPO / "config" / "default.yaml").resolve().as_posix()
     token_dict = (_REPO / "data" / "Token_Dictionary.json").resolve().as_posix()
@@ -623,9 +623,9 @@ def _write_random_checkpoint(config_path: Path, checkpoint_path: Path) -> None:
     same ``model``/``ema_model``/``config`` keys the loader expects.
     """
 
-    from thesis_ml.model.model import SC2StrategyDiffusionModel
-    from thesis_ml.train.loop import TrainingLoop
-    from thesis_ml.vocab.content_vocab import load_content_vocabulary
+    from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+    from thesis_diffusion.train.loop import TrainingLoop
+    from thesis_shared.vocab.content_vocab import load_content_vocabulary
 
     config = load_config(config_path)
     vocabulary = load_content_vocabulary(config.pipeline.token_dictionary_uri)
@@ -746,8 +746,8 @@ def _write_distinct_weight_checkpoint(
     ``ema_model`` entry entirely to exercise the "default requires EMA" guard.
     """
 
-    from thesis_ml.model.model import SC2StrategyDiffusionModel
-    from thesis_ml.vocab.content_vocab import load_content_vocabulary
+    from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+    from thesis_shared.vocab.content_vocab import load_content_vocabulary
 
     config = load_config(config_path)
     vocabulary = load_content_vocabulary(config.pipeline.token_dictionary_uri)

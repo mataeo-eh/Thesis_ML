@@ -38,8 +38,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from thesis_ml.eval.finetune_report import build_debut_report
-from thesis_ml.viz.diagnostics import evaluate_selected, render_figures
+from thesis_diffusion.eval.finetune_report import build_debut_report
+from thesis_diffusion.viz.diagnostics import evaluate_selected, render_figures
 
 from inference_test_api import TestContext, TestResult, portable_path, write_json
 

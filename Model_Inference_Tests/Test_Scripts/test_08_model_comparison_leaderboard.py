@@ -127,7 +127,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from thesis_ml.train.loop import TrainingLoop
+from thesis_diffusion.train.loop import TrainingLoop
 
 from inference_test_api import (
     TestContext,

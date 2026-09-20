@@ -110,7 +110,7 @@ mkdir -p "$SWEEP_DIR"
 #    >0  the optimizer step the arm last checkpointed at
 #    -1  when last.pt exists but cannot be read (truncated / corrupt)
 #
-# Calls: thesis_ml.config.load_config, torch.load. Read-only -- it never writes
+# Calls: thesis_shared.config.load_config, torch.load. Read-only -- it never writes
 # or mutates a checkpoint.
 # ---------------------------------------------------------------------------
 probe_arm() {
@@ -120,7 +120,7 @@ from pathlib import Path
 
 import torch
 
-from thesis_ml.config import load_config
+from thesis_shared.config import load_config
 
 config_path = Path(sys.argv[1])
 checkpoint_dir = load_config(config_path).storage.checkpoint_uri
@@ -269,7 +269,7 @@ for index in "${!ARMS[@]}"; do
   # its config (train.epochs: 100 -> 3400 steps), and passing a cap here would
   # both truncate the schedules and make train_pipeline classify the run as a
   # bounded verification that skips export_finished_model().
-  "$PYTHON" -m thesis_ml.pipeline.train_pipeline \
+  "$PYTHON" -m thesis_diffusion.pipeline.train_pipeline \
     --config "$arm_config" \
     > "$console_log" 2>&1
   exit_code=$?

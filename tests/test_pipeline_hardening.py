@@ -8,15 +8,15 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.collate import collate_diffusion_examples
-from thesis_ml.data.frame_cache import BoundedFrameCache, resolve_cache_budget_bytes
-from thesis_ml.data.split import split_replays
-from thesis_ml.model.model import SC2StrategyDiffusionModel
-from thesis_ml.pipeline.storage import StorageResolver
-from thesis_ml.pipeline.train_pipeline import _resume_from_remote
-from thesis_ml.train.loop import TrainingLoop
-from thesis_ml.train.train import make_synthetic_examples
+from thesis_shared.config import ProjectConfig, load_config
+from thesis_diffusion.data.collate import collate_diffusion_examples
+from thesis_diffusion.data.frame_cache import BoundedFrameCache, resolve_cache_budget_bytes
+from thesis_shared.data.split import split_replays
+from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+from thesis_shared.pipeline.storage import StorageResolver
+from thesis_diffusion.pipeline.train_pipeline import _resume_from_remote
+from thesis_diffusion.train.loop import TrainingLoop
+from thesis_diffusion.train.train import make_synthetic_examples
 
 
 def test_split_replays_is_deterministic_disjoint_and_covers_all() -> None:

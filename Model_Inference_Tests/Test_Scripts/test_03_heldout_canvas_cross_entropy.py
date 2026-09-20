@@ -60,7 +60,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from thesis_ml.train.loop import TrainingLoop
+from thesis_diffusion.train.loop import TrainingLoop
 
 from inference_test_api import (  # noqa: E402
     TestContext,

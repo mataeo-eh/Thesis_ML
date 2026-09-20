@@ -17,8 +17,8 @@ import pytest
 import torch
 from torch import nn
 
-from thesis_ml.config import load_config
-from thesis_ml.data.dataset import (
+from thesis_shared.config import load_config
+from thesis_diffusion.data.dataset import (
     CLASS_DELIMITER,
     CLASS_END,
     CLASS_ENEMY_FUTURE,
@@ -26,19 +26,19 @@ from thesis_ml.data.dataset import (
     CLASS_PAD,
     CLASS_WINLOSS,
 )
-from thesis_ml.eval.buildorder import BuildOrderEvent
-from thesis_ml.eval.finetune_report import (
+from thesis_shared.eval.buildorder import BuildOrderEvent
+from thesis_diffusion.eval.finetune_report import (
     _absolute_timing_diffs,
     _example_fog_rate,
     assemble_finetune_report,
     build_debut_report,
     write_finetune_report,
 )
-from thesis_ml.data.dataset import CLASS_CLAMPED, DatasetExample
-from thesis_ml.inference.decode import validate_debut_canvas
-from thesis_ml.train.train import _synthetic_input_records
-from thesis_ml.vocab.content_vocab import build_content_vocabulary
-from thesis_ml.vocab.special_tokens import (
+from thesis_diffusion.data.dataset import CLASS_CLAMPED, DatasetExample
+from thesis_shared.inference.decode import validate_debut_canvas
+from thesis_diffusion.train.train import _synthetic_input_records
+from thesis_shared.vocab.content_vocab import build_content_vocabulary
+from thesis_shared.vocab.special_tokens import (
     BOS_ID,
     CONTENT_TOKEN_OFFSET,
     DELIMITER_ID,
@@ -315,7 +315,7 @@ def test_pretraining_validator_requires_leading_outcome_token() -> None:
     # pre-training grammar REQUIRES BOS then exactly one outcome token at position 1
     # (converging with the debut grammar). A canvas that leads with it is valid;
     # one missing it is rejected.
-    from thesis_ml.inference.decode import validate_canvas
+    from thesis_shared.inference.decode import validate_canvas
 
     assert validate_canvas([BOS_ID, WIN_ID, MARINE_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is True
     assert validate_canvas([MARINE_ID, DELIMITER_ID, END_ID, PAD_ID]).valid is False

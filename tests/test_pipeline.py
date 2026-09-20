@@ -5,10 +5,10 @@ import sys
 import pytest
 import yaml
 
-from thesis_ml.pipeline.acquire_data import CredentialError, run_acquisition
-from thesis_ml.pipeline.storage import StorageResolver, parse_s3_uri
-from thesis_ml.config import load_config
-from thesis_ml.pipeline.train_pipeline import (
+from thesis_shared.pipeline.acquire_data import CredentialError, run_acquisition
+from thesis_shared.pipeline.storage import StorageResolver, parse_s3_uri
+from thesis_shared.config import load_config
+from thesis_diffusion.pipeline.train_pipeline import (
     _explicit_replay_selection,
     _perspectives,
     _select_replays,
@@ -312,7 +312,7 @@ def test_storage_resolver_routes_local_and_s3(tmp_path: Path) -> None:
 
 
 def test_pipeline_code_has_no_machine_specific_absolute_paths() -> None:
-    pipeline_dir = Path(__file__).resolve().parents[1] / "src" / "thesis_ml" / "pipeline"
+    pipeline_dir = Path(__file__).resolve().parents[1] / "src" / "thesis_diffusion" / "pipeline"
     text = "\n".join(path.read_text(encoding="utf-8") for path in pipeline_dir.glob("*.py"))
     forbidden = ("C:\\", "C:/Users", "/Users/", "/home/matae")
     assert not any(pattern in text for pattern in forbidden)
@@ -344,15 +344,74 @@ def test_kaggle_credentials_are_required_from_env(tmp_path: Path, monkeypatch: p
 
 
 def test_run_documentation_matches_entrypoints() -> None:
+    """RUN.md must invoke the console scripts the workspace packages actually declare.
+
+    Since the split into a three-package workspace, entry points live in the member
+    package that owns them, not in the workspace root pyproject: the shared data
+    acquisition script belongs to thesis-shared, and the training/diagnostic scripts
+    belong to the diffusion arm. Script names are arm-qualified so a reader can tell
+    from a command line which arm is being driven.
+    """
     root = Path(__file__).resolve().parents[1]
     run_md = (root / "RUN.md").read_text(encoding="utf-8")
-    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    shared_pyproject = (
+        root / "packages" / "thesis-shared" / "pyproject.toml"
+    ).read_text(encoding="utf-8")
+    diffusion_pyproject = (
+        root / "packages" / "thesis-diffusion" / "pyproject.toml"
+    ).read_text(encoding="utf-8")
 
     assert "uv sync" in run_md
-    assert "uv run thesis-ml-train" in run_md
-    assert "uv run thesis-ml-acquire" in run_md
-    assert 'thesis-ml-train = "thesis_ml.pipeline.train_pipeline:main"' in pyproject
-    assert 'thesis-ml-acquire = "thesis_ml.pipeline.acquire_data:main"' in pyproject
+    assert "uv run thesis-diffusion-train" in run_md
+    assert "uv run thesis-acquire" in run_md
+    assert (
+        'thesis-acquire = "thesis_shared.pipeline.acquire_data:main"'
+        in shared_pyproject
+    )
+    assert (
+        'thesis-diffusion-train = "thesis_diffusion.pipeline.train_pipeline:main"'
+        in diffusion_pyproject
+    )
+
+
+def test_workspace_packages_declare_the_framework_boundary() -> None:
+    """The shared package must stay framework-free and the arms must stay separated.
+
+    This is the structural guarantee behind the whole two-arm comparison: both arms
+    consume identical tokenization, windowing, features, splits and metrics because
+    both import them from thesis-shared. If thesis-shared ever grows a torch or
+    tensorflow dependency, or if either arm takes a dependency on the other, that
+    guarantee is gone and the comparison stops being controlled.
+    """
+    root = Path(__file__).resolve().parents[1]
+    packages = root / "packages"
+    shared = (packages / "thesis-shared" / "pyproject.toml").read_text(encoding="utf-8")
+    diffusion = (packages / "thesis-diffusion" / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    ar = (packages / "thesis-ar" / "pyproject.toml").read_text(encoding="utf-8")
+
+    # Only inspect the declared dependency list, not the explanatory comments that
+    # name the forbidden frameworks precisely in order to forbid them.
+    def dependency_block(text: str) -> str:
+        start = text.index("dependencies = [")
+        return text[start : text.index("]", start)]
+
+    shared_deps = dependency_block(shared)
+    assert "torch" not in shared_deps
+    assert "tensorflow" not in shared_deps
+
+    diffusion_deps = dependency_block(diffusion)
+    assert "torch" in diffusion_deps
+    assert "tensorflow" not in diffusion_deps
+    assert "thesis-shared" in diffusion_deps
+    assert "thesis-ar" not in diffusion_deps
+
+    ar_deps = dependency_block(ar)
+    assert "tensorflow" in ar_deps
+    assert "torch" not in ar_deps
+    assert "thesis-shared" in ar_deps
+    assert "thesis-diffusion" not in ar_deps
 
 
 class FakeS3Client:

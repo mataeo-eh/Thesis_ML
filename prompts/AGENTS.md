@@ -12,7 +12,7 @@
 
 ## Local Contracts
 
-- Prompts are task inputs, not architecture authority; `SPEC.md` and the applicable `AGENTS.md` chain control conflicts.
+- Prompts are task inputs, not architecture authority; the applicable `AGENTS.md` contract chain controls conflicts.
 - Keep acceptance criteria, affected boundaries, and required verification explicit.
 - Move a prompt to `completed/` only after implementation, DOX closeout, and relevant verification are complete.
 - Provider adapters must point to the canonical workflow instead of copying its analytical instructions.

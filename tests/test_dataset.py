@@ -6,16 +6,16 @@ import pandas as pd
 import pytest
 import torch
 
-from thesis_ml.config import (
+from thesis_shared.config import (
     ClassLossWeightsConfig,
     FogConfig,
     ProjectConfig,
     UniformDistributionConfig,
     load_config,
 )
-from thesis_ml.data.collate import collate_diffusion_examples
-from thesis_ml.data.features import CONTINUOUS_FEATURE_NAMES
-from thesis_ml.data.dataset import (
+from thesis_diffusion.data.collate import collate_diffusion_examples
+from thesis_shared.data.features import CONTINUOUS_FEATURE_NAMES
+from thesis_diffusion.data.dataset import (
     CLASS_CONTENT,
     CLASS_DELIMITER,
     CLASS_END,
@@ -28,7 +28,7 @@ from thesis_ml.data.dataset import (
     build_input_records,
     build_target_canvas,
 )
-from thesis_ml.data.windowing import (
+from thesis_shared.data.windowing import (
     ENTITY_CODE,
     P1_CODE,
     P2_CODE,
@@ -37,10 +37,10 @@ from thesis_ml.data.windowing import (
     load_window_manifest,
     preprocess_replays,
 )
-from thesis_ml.model.model import SC2StrategyDiffusionModel
-from thesis_ml.serialize import serialize_snapshot
-from thesis_ml.vocab.content_vocab import load_content_vocabulary
-from thesis_ml.vocab.special_tokens import BOS_ID, DELIMITER_ID, END_ID, EOS_ID, PAD_ID, WIN_ID
+from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+from thesis_shared.serialize import serialize_snapshot
+from thesis_shared.vocab.content_vocab import load_content_vocabulary
+from thesis_shared.vocab.special_tokens import BOS_ID, DELIMITER_ID, END_ID, EOS_ID, PAD_ID, WIN_ID
 
 
 ROOT = Path(__file__).resolve().parents[1]

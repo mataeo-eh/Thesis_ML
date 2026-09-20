@@ -7,14 +7,14 @@ import torch
 from torch import nn
 
 from scripts.run_size_ablation import ARMS, _inspect_arm
-from thesis_ml.config import load_config
-from thesis_ml.data.dataset import SC2DiffusionDataset
-from thesis_ml.data.feature_stats import FeatureStatistics
-from thesis_ml.model.model import SC2StrategyDiffusionModel
-from thesis_ml.pipeline.train_pipeline import _resolve_step_budgets
-from thesis_ml.train.corruption import corrupt_batch
-from thesis_ml.train.loop import TrainingLoop
-from thesis_ml.vocab.content_vocab import load_content_vocabulary
+from thesis_shared.config import load_config
+from thesis_diffusion.data.dataset import SC2DiffusionDataset
+from thesis_shared.data.feature_stats import FeatureStatistics
+from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+from thesis_diffusion.pipeline.train_pipeline import _resolve_step_budgets
+from thesis_diffusion.train.corruption import corrupt_batch
+from thesis_diffusion.train.loop import TrainingLoop
+from thesis_shared.vocab.content_vocab import load_content_vocabulary
 
 
 ROOT = Path(__file__).resolve().parents[1]

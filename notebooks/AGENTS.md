@@ -6,7 +6,7 @@
 
 ## Ownership
 
-- Notebook files own interactive exploration; reusable production behavior remains owned by `src/thesis_ml/`.
+- Notebook files own interactive exploration; reusable production behavior remains owned by `packages/thesis-diffusion/src/thesis_diffusion/`.
 
 ## Local Contracts
 

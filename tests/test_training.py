@@ -10,16 +10,16 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from thesis_ml.config import (
+from thesis_shared.config import (
     ClassLossWeightsConfig,
     FogConfig,
     ProjectConfig,
     UniformDistributionConfig,
     load_config,
 )
-from thesis_ml.data.collate import collate_diffusion_examples
-from thesis_ml.data.resumable_sampler import ResumableBatchSampler
-from thesis_ml.data.dataset import (
+from thesis_diffusion.data.collate import collate_diffusion_examples
+from thesis_diffusion.data.resumable_sampler import ResumableBatchSampler
+from thesis_diffusion.data.dataset import (
     CLASS_CLAMPED,
     CLASS_DELIMITER,
     CLASS_END,
@@ -32,10 +32,10 @@ from thesis_ml.data.dataset import (
     PRETRAIN_CLASS_ID_TO_NAME,
     DatasetExample,
 )
-from thesis_ml.model.loss import RARE_CLASS_T_BUCKET_NAMES
-from thesis_ml.model.model import SC2StrategyDiffusionModel
-from thesis_ml.train.corruption import corrupt_batch, inverse_t_weights, sample_uniform_noise
-from thesis_ml.train.loop import (
+from thesis_diffusion.model.loss import RARE_CLASS_T_BUCKET_NAMES
+from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+from thesis_diffusion.train.corruption import corrupt_batch, inverse_t_weights, sample_uniform_noise
+from thesis_diffusion.train.loop import (
     INTERVAL_REPORTS_PER_EPOCH,
     TrainingLoop,
     _accumulate_token_class_counts,
@@ -49,8 +49,8 @@ from thesis_ml.train.loop import (
     interval_boundaries,
     optimizer_steps_per_epoch,
 )
-from thesis_ml.train.train import _synthetic_input_records, make_synthetic_examples, run_smoke_train
-from thesis_ml.vocab.special_tokens import (
+from thesis_diffusion.train.train import _synthetic_input_records, make_synthetic_examples, run_smoke_train
+from thesis_shared.vocab.special_tokens import (
     BOS_ID,
     CONTENT_TOKEN_OFFSET,
     DELIMITER_ID,
@@ -175,7 +175,7 @@ def test_per_epoch_reseed_makes_corruption_deterministic_and_epochs_distinct(
          resume replay the same draws an uninterrupted run would have made).
     """
 
-    import thesis_ml.train.loop as loop_module
+    import thesis_diffusion.train.loop as loop_module
 
     def run_and_capture(seed: int) -> list[torch.Tensor]:
         """Run 2 epochs x 2 steps and record every corruption branch, in order."""
@@ -260,7 +260,7 @@ def test_bos_is_clamped_while_outcome_position_one_is_noised_and_scored(tmp_path
     assert "win-loss" in result.loss_output.per_class
 
     # Its loss weight is nonzero in both modes; semantic [PAD] is also scored.
-    from thesis_ml.model.loss import CanvasCrossEntropyLoss
+    from thesis_diffusion.model.loss import CanvasCrossEntropyLoss
 
     pretrain_weights = CanvasCrossEntropyLoss(config).class_weights
     debut_weights = CanvasCrossEntropyLoss(_small_debut_config(tmp_path)).class_weights
@@ -1490,7 +1490,7 @@ def test_debut_mode_epoch_metrics_has_all_seven_classes_populated_from_epoch_one
 def _make_debut_synthetic_examples(config: ProjectConfig, *, count: int) -> list[DatasetExample]:
     """Build tiny synthetic debut-mode canvases containing all 7 debut classes.
 
-    Mirrors ``thesis_ml.train.train.make_synthetic_examples`` (the
+    Mirrors ``thesis_diffusion.train.train.make_synthetic_examples`` (the
     pretraining fixture) but lays out a debut-style canvas: a single win/loss
     clamped BOS at position 0, outcome token at position 1
     (``CLASS_WINLOSS``), followed by one token of

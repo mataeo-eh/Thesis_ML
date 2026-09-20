@@ -63,9 +63,9 @@ USAGE
     ./.venv/Scripts/python.exe scripts/batch_interference_probe.py \
         --config configs/memorization_01_no_regularization.yaml
 
-Calls into: thesis_ml.pipeline.train_pipeline (dataset/loader construction, so
+Calls into: thesis_diffusion.pipeline.train_pipeline (dataset/loader construction, so
 this probe stays byte-identical to how the run built its data), and
-thesis_ml.train.loop.TrainingLoop (checkpoint load, corruption, loss).
+thesis_diffusion.train.loop.TrainingLoop (checkpoint load, corruption, loss).
 """
 
 from __future__ import annotations
@@ -82,14 +82,14 @@ from pathlib import Path
 
 import torch
 
-from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.dataset import SC2DiffusionDataset
-from thesis_ml.data.feature_stats import load_feature_statistics
-from thesis_ml.data.split import split_replays
-from thesis_ml.data.windowing import load_window_manifest
-from thesis_ml.model.model import SC2StrategyDiffusionModel
-from thesis_ml.pipeline.storage import StorageResolver
-from thesis_ml.pipeline.train_pipeline import (
+from thesis_shared.config import ProjectConfig, load_config
+from thesis_diffusion.data.dataset import SC2DiffusionDataset
+from thesis_shared.data.feature_stats import load_feature_statistics
+from thesis_shared.data.split import split_replays
+from thesis_shared.data.windowing import load_window_manifest
+from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+from thesis_shared.pipeline.storage import StorageResolver
+from thesis_diffusion.pipeline.train_pipeline import (
     _ensure_window_manifest,
     _explicit_replay_selection,
     _local_checkpoint_dir,
@@ -98,8 +98,8 @@ from thesis_ml.pipeline.train_pipeline import (
     _materialize_replay_paths,
     _select_replays,
 )
-from thesis_ml.train.loop import TrainingLoop
-from thesis_ml.vocab.content_vocab import load_content_vocabulary
+from thesis_diffusion.train.loop import TrainingLoop
+from thesis_shared.vocab.content_vocab import load_content_vocabulary
 
 
 # Multiplier used to spread the per-batch corruption seeds far apart in the
@@ -377,10 +377,10 @@ def cache_batches_on_device(batches: list, device: torch.device, budget_gb: floa
     Returns:
         `(batches, cached)` -- the same list (moved) and whether caching happened.
 
-    Calls: batch_nbytes, thesis_ml.train.loop.move_batch_to_device.
+    Calls: batch_nbytes, thesis_diffusion.train.loop.move_batch_to_device.
     """
 
-    from thesis_ml.train.loop import move_batch_to_device
+    from thesis_diffusion.train.loop import move_batch_to_device
 
     if device.type != "cuda" or budget_gb <= 0:
         return batches, False

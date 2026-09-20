@@ -6,20 +6,20 @@ import pytest
 import torch
 from torch import nn
 
-from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.dataset import (
+from thesis_shared.config import ProjectConfig, load_config
+from thesis_diffusion.data.dataset import (
     CLASS_CLAMPED,
     CLASS_DELIMITER,
     CLASS_ENEMY_FUTURE,
     CLASS_PAD,
     CLASS_WINLOSS,
 )
-from thesis_ml.eval.buildorder import BuildOrderEvent, extract_build_order, extract_build_order_from_frame
-from thesis_ml.eval.harness import evaluate_examples
-from thesis_ml.eval.metrics import compare_build_orders
-from thesis_ml.train.train import make_synthetic_examples
-from thesis_ml.vocab.content_vocab import build_content_vocabulary
-from thesis_ml.vocab.special_tokens import (
+from thesis_shared.eval.buildorder import BuildOrderEvent, extract_build_order, extract_build_order_from_frame
+from thesis_diffusion.eval.harness import evaluate_examples
+from thesis_shared.eval.metrics import compare_build_orders
+from thesis_diffusion.train.train import make_synthetic_examples
+from thesis_shared.vocab.content_vocab import build_content_vocabulary
+from thesis_shared.vocab.special_tokens import (
     BOS_ID,
     CONTENT_TOKEN_OFFSET,
     DELIMITER_ID,

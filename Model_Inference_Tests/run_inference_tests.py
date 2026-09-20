@@ -61,7 +61,7 @@ from typing import Any, Sequence
 
 # Three directories have to be importable before anything else is touched,
 # because this script runs as a plain file (not `python -m`):
-#   src/         -> the `thesis_ml` package
+#   src/         -> the `thesis_diffusion` package
 #   <repo root>/ -> the `scripts` package (one test wraps a script from there)
 #   this dir     -> `inference_test_api`, which the test modules import by name
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -577,7 +577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if replay_selection is None:
         replay_selection = _infer_replay_selection_path(checkpoint_path)
 
-    from thesis_ml.config import load_config  # local import: after sys.path setup
+    from thesis_shared.config import load_config  # local import: after sys.path setup
 
     user_config = load_config(config_path)
     fog_rate = user_config.eval.fog_rate if args.fog_rate is None else args.fog_rate

@@ -3,7 +3,7 @@ extends: local_overfit_v2.yaml
 # MEMORIZATION PROBE, ARM 2 of 3 -- t=1 REGIME OVERSAMPLED TO 25%.
 #
 # THE PROBLEM THIS ADDRESSES. Training draws one corruption level `t` per example
-# per epoch, uniformly on [0, 1] (thesis_ml/train/corruption.py::_resolve_t).
+# per epoch, uniformly on [0, 1] (thesis_diffusion/train/corruption.py::_resolve_t).
 # Exactly 1.0 is a measure-zero draw, so the `t_eq_1` diagnostic bucket in
 # epoch_metrics.csv is essentially always empty and the model is effectively
 # never trained on a fully-noised canvas. That is the single hardest and most
@@ -54,5 +54,5 @@ diffusion:
   schedule:
     # 25% of examples per epoch, per-example Bernoulli, forced to t = 1.0 exactly
     # -- a fully noised canvas. Range-checked to [0, 1] by
-    # thesis_ml.config._validate_diffusion at load.
+    # thesis_shared.config._validate_diffusion at load.
     t_one_fraction: 0.25

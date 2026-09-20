@@ -5,19 +5,19 @@ import pytest
 import torch
 from torch import nn
 
-from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.collate import collate_diffusion_examples
-from thesis_ml.inference.decode import decode_canvas, validate_canvas
-from thesis_ml.inference.sampler import (
+from thesis_shared.config import ProjectConfig, load_config
+from thesis_diffusion.data.collate import collate_diffusion_examples
+from thesis_shared.inference.decode import decode_canvas, validate_canvas
+from thesis_diffusion.inference.sampler import (
     _entropy_bounded_acceptance,
     load_sampling_checkpoint,
     sample_canvas,
 )
-from thesis_ml.inference.timing import attach_absolute_times
-from thesis_ml.model.model import SC2StrategyDiffusionModel
-from thesis_ml.train.train import make_synthetic_examples
-from thesis_ml.vocab.content_vocab import build_content_vocabulary
-from thesis_ml.vocab.special_tokens import (
+from thesis_shared.inference.timing import attach_absolute_times
+from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+from thesis_diffusion.train.train import make_synthetic_examples
+from thesis_shared.vocab.content_vocab import build_content_vocabulary
+from thesis_shared.vocab.special_tokens import (
     BOS_ID,
     CONTENT_TOKEN_OFFSET,
     DELIMITER_ID,

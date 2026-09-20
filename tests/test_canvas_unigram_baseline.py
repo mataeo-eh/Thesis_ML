@@ -12,17 +12,17 @@ from scripts.canvas_unigram_baseline import (
     parse_args,
     summarize_counts,
 )
-from thesis_ml.config import load_config
-from thesis_ml.data.collate import collate_diffusion_examples
-from thesis_ml.data.dataset import (
+from thesis_shared.config import load_config
+from thesis_diffusion.data.collate import collate_diffusion_examples
+from thesis_diffusion.data.dataset import (
     CLASS_CLAMPED,
     CLASS_ENEMY_OBSERVED,
     CLASS_PAD,
     DatasetExample,
 )
-from thesis_ml.data.features import CATEGORICAL_FEATURE_WIDTH, CONTINUOUS_FEATURE_NAMES
-from thesis_ml.model.loss import CanvasCrossEntropyLoss, active_class_id_to_name
-from thesis_ml.vocab.special_tokens import BOS_ID, CONTENT_TOKEN_OFFSET, PAD_ID
+from thesis_shared.data.features import CATEGORICAL_FEATURE_WIDTH, CONTINUOUS_FEATURE_NAMES
+from thesis_diffusion.model.loss import CanvasCrossEntropyLoss, active_class_id_to_name
+from thesis_shared.vocab.special_tokens import BOS_ID, CONTENT_TOKEN_OFFSET, PAD_ID
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -146,8 +146,8 @@ def _batch(
     shape = (len(targets), len(targets[0]))
     empty_bool = torch.zeros(shape, dtype=torch.bool)
     empty_long = torch.zeros(shape, dtype=torch.long)
-    from thesis_ml.data.collate import DiffusionBatch
-    from thesis_ml.model.embedding import InputFeatures
+    from thesis_diffusion.data.collate import DiffusionBatch
+    from thesis_diffusion.model.embedding import InputFeatures
 
     return DiffusionBatch(
         input_token_ids=torch.empty((shape[0], 0), dtype=torch.long),

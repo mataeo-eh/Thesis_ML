@@ -53,7 +53,7 @@ Audit all relevant paths, not only the edited module:
 
 <required_live_measurement>
 1. Confirm .venv/Scripts/python.exe exists and use it for every Python command.
-2. Load configs/smallTrainingTestV3.yaml through thesis_ml.config.load_config.
+2. Load configs/smallTrainingTestV3.yaml through thesis_shared.config.load_config.
 3. Load the configured content vocabulary and feature-statistics artifact.
 4. Instantiate SC2StrategyDiffusionModel from the current source.
 5. Enumerate every named parameter and buffer with shape, dtype, numel, and

@@ -28,7 +28,7 @@ from rare_token_signal_probe import (  # noqa: E402
     run_lengths,
     summarize_token_signal,
 )
-from thesis_ml.vocab.special_tokens import CONTENT_TOKEN_OFFSET, DELIMITER_ID  # noqa: E402
+from thesis_shared.vocab.special_tokens import CONTENT_TOKEN_OFFSET, DELIMITER_ID  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +344,8 @@ def test_tech_and_non_tech_sets_partition_the_rows():
 def test_tech_building_names_all_exist_in_the_shipped_dictionary():
     """The named tech set is an editorial choice; it must still be real."""
 
-    from thesis_ml.config import load_config
-    from thesis_ml.vocab.content_vocab import load_content_vocabulary
+    from thesis_shared.config import load_config
+    from thesis_shared.vocab.content_vocab import load_content_vocabulary
 
     config = load_config(Path("configs/smallTrainingTestV3.yaml"))
     vocabulary = load_content_vocabulary(config.pipeline.token_dictionary_uri)
@@ -359,8 +359,8 @@ def test_tech_buildings_sort_after_protoss_economy_structures():
     displaces every Protoss tech-unlock building in that timestep.
     """
 
-    from thesis_ml.config import load_config
-    from thesis_ml.vocab.content_vocab import load_content_vocabulary
+    from thesis_shared.config import load_config
+    from thesis_shared.vocab.content_vocab import load_content_vocabulary
 
     config = load_config(Path("configs/smallTrainingTestV3.yaml"))
     vocabulary = load_content_vocabulary(config.pipeline.token_dictionary_uri)

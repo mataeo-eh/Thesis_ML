@@ -11,7 +11,7 @@
 - `MODEL_ARCHITECTURE_DIAGRAM.mmd` is the single canonical graph definition. `MODEL_ARCHITECTURE_DIAGRAM.svg` and `MODEL_ARCHITECTURE_DIAGRAM.png` are committed, directly viewable renderings generated from it.
 - `render_diagram.py` owns deterministic local rendering from the supported Mermaid flowchart subset to SVG and PNG without a Mermaid CLI or browser.
 - `UPDATE_PROMPT.md` owns the reusable GPT-5.6-sol update procedure for auditing an architecture-impacting change and synchronizing this directory with live source, configuration, tests, and DOX.
-- `SPEC.md` remains the normative architecture/design authority. `MODEL_ARCHITECTURE.md` is its exact implementation-and-configuration companion. A conflict is a defect: resolve it in the same task rather than documenting both states as alternatives.
+- `MODEL_ARCHITECTURE.md` is the exact implementation-and-configuration reference for Arm A (`thesis_diffusion`). Where it disagrees with live source or merged configuration, that is a defect: resolve it in the same task rather than documenting both states as alternatives. Arm B (`thesis_ar`, TensorFlow) is not yet covered here; when its model code lands it must get a clearly separated section rather than being blended into Arm A's description.
 
 ## Local Contracts
 
@@ -28,7 +28,7 @@
 
 ## Work Guidance
 
-- Start with semantic retrieval over `SPEC.md`, the changed subsystem, and the symbols/source map listed in `MODEL_ARCHITECTURE.md`; then verify high-impact claims directly against source and merged configuration.
+- Start with semantic retrieval over the changed subsystem and the symbols/source map listed in `MODEL_ARCHITECTURE.md`; then verify high-impact claims directly against source and merged configuration.
 - Treat a change as architecture-impacting when it changes either the function computed by the model or the exact data/configuration presented to learnable machinery, even if no `nn.Module` file changed.
 - Recompute dependent quantities transitively. For example, a vocabulary change affects embedding and head shapes, parameter totals, logits, corruption/sampler state space, memory estimates, and the Mermaid diagram.
 - Edit graph labels and edges only in `MODEL_ARCHITECTURE_DIAGRAM.mmd`, then run `.venv\Scripts\python.exe Model_Architecture\render_diagram.py`. Update `POSITIONS` only when graph membership/layout changes; do not duplicate labels or edges in the renderer.
@@ -39,7 +39,7 @@
 
 - Confirm `Thesis_ML/.venv/Scripts/python.exe` exists before Python commands and run all Python through that shim.
 - For architecture/model/config changes, run at least `tests/test_config.py`, `tests/test_model.py`, and `tests/test_windowing.py::test_small_training_v3_model_parameter_count`; add the owning subsystem tests named by its `AGENTS.md`.
-- Load `configs/smallTrainingTestV3.yaml` through `thesis_ml.config.load_config`; do not manually merge YAML overrides.
+- Load `configs/smallTrainingTestV3.yaml` through `thesis_shared.config.load_config`; do not manually merge YAML overrides.
 - Instantiate `SC2StrategyDiffusionModel` with `load_content_vocabulary(...)` and the configured feature-statistics artifact when present. Record `sum(p.numel() for p in model.parameters())`, subsystem totals, parameter shapes, buffer shapes, and dtypes.
 - Run `.venv\Scripts\python.exe Model_Architecture\render_diagram.py`, check that its Mermaid parser fails on no line or layout mismatch, visually inspect the PNG/SVG, and confirm the Markdown image/link targets resolve.
 - Check internal arithmetic and `git diff --check`.

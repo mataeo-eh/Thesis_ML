@@ -10,8 +10,8 @@
 
 ## Local Contracts
 
-- Plans must derive from the current `SPEC.md`, applicable `AGENTS.md` chain, and source state.
-- A plan may resolve implementation sequencing but may not silently settle `SPEC.md` open questions or bypass its banned list.
+- Plans must derive from the applicable `AGENTS.md` contract chain and current source state.
+- A plan may resolve implementation sequencing but may not silently settle an architecture question the owner has not decided, or cross a boundary the contract chain sets — notably the framework split between the two arms.
 
 ## Work Guidance
 

@@ -13,7 +13,7 @@ extends: local_overfit_v2.yaml
 #
 #   train.weight_decay 0.1 -> 0.0
 #       AdamW's decoupled weight decay pulls every parameter toward zero on
-#       every step, independent of the gradient (src/thesis_ml/train/loop.py
+#       every step, independent of the gradient (packages/thesis-diffusion/src/thesis_diffusion/train/loop.py
 #       constructs the optimizer with it). That is a direct penalty on the large,
 #       specific weights memorization needs: the model is being asked to fit the
 #       data AND to stay small, and the second objective never stops pushing
@@ -47,7 +47,7 @@ extends: local_overfit_v2.yaml
 #                                 loss, which is the memorization signal here, is
 #                                 computed on the raw weights either way.
 #   dropout                    -- already 0.0 throughout the backbone
-#                                 (src/thesis_ml/model/backbone.py); there is no
+#                                 (packages/thesis-diffusion/src/thesis_diffusion/model/backbone.py); there is no
 #                                 config knob to turn off.
 #   diffusion t resampling     -- a fresh t per example per epoch is the training
 #                                 objective itself, not a regularizer. Arm 2

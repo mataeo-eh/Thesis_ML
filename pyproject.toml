@@ -1,5 +1,35 @@
-# pyproject.toml - package metadata and build configuration for Thesis_ML.
-# Managed with uv; the importable package uses a src/ layout at src/thesis_ml.
+# pyproject.toml - uv workspace root for the two-arm thesis experiment.
+#
+# The repository holds three independently installable packages under packages/:
+#
+#   thesis-shared     framework-agnostic core - NO torch, NO tensorflow.
+#                     Tokenization, vocabulary, windowing, input features,
+#                     standardization statistics, replay splits, canvas decode,
+#                     timing recovery, build-order extraction and metrics.
+#                     This is the experiment's controlled constant: both arms
+#                     import it, so both consume identical data and are scored
+#                     by identical metrics.
+#
+#   thesis-diffusion  Arm A - uniform discrete diffusion, PyTorch.
+#   thesis-ar         Arm B - autoregressive baseline, TensorFlow.
+#
+# Dependencies flow ONE way: each arm depends on thesis-shared. Neither arm may
+# depend on the other, and neither framework may reach the shared package.
+#
+# ENVIRONMENTS. The two arms are installed into SEPARATE virtual environments and
+# are never installed together. A single Python process loads exactly one CUDA
+# runtime, so co-installing the cu130 Torch wheels with TensorFlow's bundled CUDA
+# libraries produces import errors or silent ABI mismatches.
+#
+#   Local Windows dev env (.venv)  -> this root project: shared + diffusion.
+#                                     `uv sync`
+#   AR verification env            -> a separate venv, shared + ar only:
+#                                     `uv venv .venv-tf`
+#                                     `uv pip install -e packages/thesis-shared \
+#                                                     -e packages/thesis-ar`
+#   Linux cloud training env       -> per-arm, built from that arm's package only.
+#
+# Installing thesis-ar into .venv is a mistake, not a shortcut.
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -8,41 +38,35 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "thesis-ml"
 version = "0.0.1"
-description = "SC2 strategy prediction with masked discrete diffusion"
+description = "Workspace root: SC2 strategy prediction, discrete diffusion vs autoregressive comparison"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Mataeo John Anderson" }]
+# The local Windows development environment is the DIFFUSION arm. thesis-ar is
+# deliberately absent here; see the environment note above.
 dependencies = [
-    "boto3>=1.34",
-    "kaggle>=1.6",
-    "matplotlib>=3.7",
-    "pandas>=2.1",
-    "psutil>=5.9",
-    "pyarrow>=12.0",
-    "PyYAML>=6.0",
-    "safetensors>=0.8.0",
-    "torch>=2.2",
+    "thesis-shared",
+    "thesis-diffusion",
 ]
-
-[project.scripts]
-thesis-ml-acquire = "thesis_ml.pipeline.acquire_data:main"
-thesis-ml-train = "thesis_ml.pipeline.train_pipeline:main"
-thesis-ml-viz = "thesis_ml.viz.diagnostics:main"
-
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4",
 ]
 
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+thesis-shared = { workspace = true }
+thesis-diffusion = { workspace = true }
+thesis-ar = { workspace = true }
+
 [tool.pytest.ini_options]
 markers = [
     "slow: end-to-end tests that build artifacts / sample the model (deselect with -m 'not slow')",
+    "tensorflow: Arm B tests; require the separate AR environment, not .venv",
 ]
 # Never collect from generated launcher-run artifacts under tests/output/ (they
 # contain scratch .py files and OS-permission-locked directories that break
@@ -61,8 +85,7 @@ norecursedirs = [
     "{arch}",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu130" }
+# The workspace root ships no importable package of its own; it exists to pin the
+# workspace and hold shared tooling configuration.
+[tool.setuptools]
+py-modules = []

@@ -30,7 +30,7 @@ model:
   self_conditioning: true
   gradient_checkpointing: false
   # Architecture toggles. `segment_embeddings` and `per_segment_positions` are
-  # still ABLATION EXPERIMENTS and stay false (see SPEC.md 14b);
+  # still ABLATION EXPERIMENTS and stay false;
   # `frozen_input_kv` has been PROMOTED TO A DEFAULT and is true below.
   #
   # Run the input region alone through all L blocks first (attending only to
@@ -45,7 +45,7 @@ model:
   # inference time substantially -- the input region is static across every
   # denoising step, so recomputing its K/V 64 times per sample was pure waste.
   # The accepted semantic cost is that the input no longer attends to the canvas,
-  # making attention one-directional across the input/canvas seam (SPEC.md 14a).
+  # making attention one-directional across the input/canvas seam.
   #
   # WHAT THIS DOES TO CHECKPOINT IDENTITY: `toggle_fingerprint` is deliberately
   # NOT rebased. A default-derived model now stamps

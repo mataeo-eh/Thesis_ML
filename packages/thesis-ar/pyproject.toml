@@ -1,0 +1,46 @@
+# pyproject.toml - thesis-ar: Arm B, autoregressive baseline (TensorFlow).
+#
+# FRAMEWORK CONTRACT: this arm is TensorFlow/Keras, exclusively.
+#
+# `torch` must NEVER appear in this file's dependencies, and `thesis-diffusion`
+# must never be added either. The only intentional coupling to the other arm is
+# `thesis-shared`, which is framework-agnostic by construction.
+#
+# EXECUTION CONTRACT: TensorFlow has had no native-Windows GPU support since
+# 2.11, so on the owner's Windows workstation this package is CPU-only. That is
+# accepted and intentional: no meaningful training is ever run locally. Local
+# execution is limited to lightweight correctness verification (unit tests, tiny
+# smoke runs, shape/graph checks). All real training runs on Linux cloud compute.
+# See `src/thesis_ar/AGENTS.md`.
+#
+# `tensorflow` is left unpinned-by-index here because the local (CPU, Windows)
+# and cloud (GPU, Linux) environments resolve it differently; the cloud
+# environment installs `tensorflow[and-cuda]`.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thesis-ar"
+version = "0.0.1"
+description = "SC2 strategy prediction via an autoregressive transformer (TensorFlow) - Arm B of the thesis comparison"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Mataeo John Anderson" }]
+dependencies = [
+    "thesis-shared",
+    "tensorflow>=2.16",
+]
+
+[project.optional-dependencies]
+# Installed in the Linux cloud training environment only. Do not install on
+# native Windows: it resolves to CUDA wheels that native-Windows TF cannot use.
+cuda = ["tensorflow[and-cuda]>=2.16"]
+
+[tool.uv.sources]
+thesis-shared = { workspace = true }
+
+[tool.setuptools.packages.find]
+where = ["src"]

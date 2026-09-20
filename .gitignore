@@ -12,6 +12,7 @@ dist/
 
 # ---- Virtual environments ----
 .venv/
+.venv-tf/
 venv/
 env/
 .env
@@ -42,3 +43,6 @@ scripts/output/Blizzard_Replay_Testing_Output/
 # ---- Agent tooling (local, not shared) ----
 .agents/
 .claude/
+
+# Office lock files (created while a doc is open)
+~$*

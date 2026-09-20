@@ -13,7 +13,7 @@ modes into one number:
     it was shown.
 
 They imply different fixes, so they have to be told apart by measurement. This
-test runs the existing `thesis_ml.viz.outcome_probe` measurement against the
+test runs the existing `thesis_diffusion.viz.outcome_probe` measurement against the
 HELD-OUT test replays -- the probe's own CLI is wired to the ablation arms and to
 the train/dev splits, so this script builds the loader over the test split and
 calls the probe's public measurement functions directly.
@@ -55,7 +55,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import torch  # noqa: E402
 
-from thesis_ml.viz.outcome_probe import (
+from thesis_diffusion.viz.outcome_probe import (
     _draw_noise_levels,
     _print_arm_summary,
     probe_batch,

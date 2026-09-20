@@ -12,12 +12,12 @@
 ## Local Contracts
 
 - Preserve citations, provenance, assumptions, and the date or version of externally changing claims.
-- Research informs decisions but does not override `SPEC.md`, configs, source, or the applicable DOX chain.
+- Research informs decisions but does not override configs, source, or the applicable DOX chain.
 - Clearly separate evidence, inference, and project decisions.
 
 ## Work Guidance
 
-- Convert accepted durable decisions into `SPEC.md`, config, source, tests, and owning DOX instead of leaving them only in research notes.
+- Convert accepted durable decisions into config, source, tests, and owning DOX instead of leaving them only in research notes.
 
 ## Verification
 

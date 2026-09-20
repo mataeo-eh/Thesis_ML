@@ -4,9 +4,9 @@ from dataclasses import replace
 from pathlib import Path
 
 from scripts.gpu_smoke_test import build_synthetic_batch
-from thesis_ml.config import load_config
-from thesis_ml.data.dataset import CLASS_CLAMPED, CLASS_WINLOSS
-from thesis_ml.vocab.special_tokens import BOS_ID, EOS_ID, LOSS_ID, WIN_ID
+from thesis_shared.config import load_config
+from thesis_diffusion.data.dataset import CLASS_CLAMPED, CLASS_WINLOSS
+from thesis_shared.vocab.special_tokens import BOS_ID, EOS_ID, LOSS_ID, WIN_ID
 
 
 ROOT = Path(__file__).resolve().parents[1]

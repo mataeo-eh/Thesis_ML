@@ -14,9 +14,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from thesis_ml.config import load_config
-from thesis_ml.data.features import CONTINUOUS_FEATURE_NAMES
-from thesis_ml.data.dataset import (
+from thesis_shared.config import load_config
+from thesis_shared.data.features import CONTINUOUS_FEATURE_NAMES
+from thesis_diffusion.data.dataset import (
     CLASS_CLAMPED,
     CLASS_DELIMITER,
     CLASS_END,
@@ -30,8 +30,8 @@ from thesis_ml.data.dataset import (
     _build_debut_target,
     resolve_replay_outcome,
 )
-from thesis_ml.data.windowing import ENTITY_CODE, P1_CODE, P2_CODE, UPGRADE_CODE, WindowManifestEntry
-from thesis_ml.vocab.special_tokens import BOS_ID, DELIMITER_ID, END_ID, LOSS_ID, PAD_ID, WIN_ID
+from thesis_shared.data.windowing import ENTITY_CODE, P1_CODE, P2_CODE, UPGRADE_CODE, WindowManifestEntry
+from thesis_shared.vocab.special_tokens import BOS_ID, DELIMITER_ID, END_ID, LOSS_ID, PAD_ID, WIN_ID
 
 
 ROOT = Path(__file__).resolve().parents[1]

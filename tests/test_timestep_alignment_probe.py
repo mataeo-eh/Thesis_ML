@@ -33,8 +33,8 @@ import numpy as np
 import pytest
 import torch
 
-from thesis_ml.data.collate import DiffusionBatch
-from thesis_ml.data.dataset import (
+from thesis_diffusion.data.collate import DiffusionBatch
+from thesis_diffusion.data.dataset import (
     CLASS_CLAMPED,
     CLASS_DELIMITER,
     CLASS_END,
@@ -43,8 +43,8 @@ from thesis_ml.data.dataset import (
     CLASS_WINLOSS,
     PRETRAIN_CLASS_ID_TO_NAME,
 )
-from thesis_ml.model.embedding import InputFeatures
-from thesis_ml.vocab.special_tokens import (
+from thesis_diffusion.model.embedding import InputFeatures
+from thesis_shared.vocab.special_tokens import (
     BOS_ID,
     CONTENT_TOKEN_OFFSET,
     DELIMITER_ID,
@@ -738,8 +738,8 @@ def test_coupled_corruption_is_nested_across_noise_levels():
     which truthful anchors survive rather than swapping in unrelated canvases.
     """
 
-    from thesis_ml.train.corruption import corrupt_batch
-    from thesis_ml.config import DiffusionScheduleConfig
+    from thesis_diffusion.train.corruption import corrupt_batch
+    from thesis_shared.config import DiffusionScheduleConfig
 
     schedule = DiffusionScheduleConfig(
         name="linear",

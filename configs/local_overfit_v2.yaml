@@ -84,7 +84,7 @@ train:
 #
 # The two toggles below are still experiments. Enabling either changes the
 # model's stored architecture identity (see `toggle_fingerprint` in
-# src/thesis_ml/config.py), so a checkpoint trained with a toggle on will refuse
+# packages/thesis-shared/src/thesis_shared/config.py), so a checkpoint trained with a toggle on will refuse
 # to load into a model built without it and vice versa -- that is deliberate.
 # Point `storage.checkpoint_uri` somewhere new before running an enabled
 # ablation if you want to keep whatever sits in checkpoints/local-overfitV2.

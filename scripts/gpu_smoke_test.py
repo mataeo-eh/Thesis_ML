@@ -27,15 +27,15 @@ import time
 
 import torch
 
-from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.collate import DiffusionBatch
-from thesis_ml.data.dataset import CLASS_CLAMPED, CLASS_CONTENT, CLASS_WINLOSS
-from thesis_ml.data.features import CATEGORICAL_FEATURE_WIDTH, CONTINUOUS_FEATURE_NAMES
-from thesis_ml.model.embedding import InputFeatures
-from thesis_ml.model.model import SC2StrategyDiffusionModel
-from thesis_ml.train.loop import TrainingLoop
-from thesis_ml.vocab.content_vocab import load_content_vocabulary
-from thesis_ml.vocab.special_tokens import (
+from thesis_shared.config import ProjectConfig, load_config
+from thesis_diffusion.data.collate import DiffusionBatch
+from thesis_diffusion.data.dataset import CLASS_CLAMPED, CLASS_CONTENT, CLASS_WINLOSS
+from thesis_shared.data.features import CATEGORICAL_FEATURE_WIDTH, CONTINUOUS_FEATURE_NAMES
+from thesis_diffusion.model.embedding import InputFeatures
+from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+from thesis_diffusion.train.loop import TrainingLoop
+from thesis_shared.vocab.content_vocab import load_content_vocabulary
+from thesis_shared.vocab.special_tokens import (
     BOS_ID,
     CONTENT_TOKEN_OFFSET,
     EOS_ID,

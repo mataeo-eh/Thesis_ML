@@ -2,7 +2,7 @@
 REM ---------------------------------------------------------------------------
 REM Overfit (learnability probe) launcher -- PRE-TRAINING pathway.
 REM
-REM Runs configs\local_overfit_v2.yaml through thesis_ml.pipeline.train_pipeline:
+REM Runs configs\local_overfit_v2.yaml through thesis_diffusion.pipeline.train_pipeline:
 REM 100 epochs (= 3400 optimizer steps at 34/epoch) over an explicitly named
 REM 10-train / 3-dev replay subset chosen at the corpus median token count. The
 REM point is to confirm the full current pipeline can drive loss down at all
@@ -57,7 +57,7 @@ REM console.log instead of dying in a buffer.
 set "PYTHONUNBUFFERED=1"
 
 pushd "%PROJECT_ROOT%"
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "& { & '.venv\Scripts\python.exe' -m thesis_ml.pipeline.train_pipeline --config configs\local_overfit_v2.yaml %* 2>&1 | Tee-Object -FilePath '%OUTPUT_DIR%\console.log'; exit $LASTEXITCODE }"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "& { & '.venv\Scripts\python.exe' -m thesis_diffusion.pipeline.train_pipeline --config configs\local_overfit_v2.yaml %* 2>&1 | Tee-Object -FilePath '%OUTPUT_DIR%\console.log'; exit $LASTEXITCODE }"
 set "EXIT_CODE=%ERRORLEVEL%"
 popd
 

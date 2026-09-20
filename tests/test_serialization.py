@@ -4,8 +4,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from thesis_ml.config import load_config
-from thesis_ml.serialize import (
+from thesis_shared.config import load_config
+from thesis_shared.serialize import (
     deserialize_counts,
     parse_entity_columns,
     parse_upgrades,
@@ -13,12 +13,12 @@ from thesis_ml.serialize import (
     serialize_snapshot,
     snapshot_content_counts,
 )
-from thesis_ml.vocab.content_vocab import (
+from thesis_shared.vocab.content_vocab import (
     ContentToken,
     ContentVocabulary,
     load_content_vocabulary,
 )
-from thesis_ml.vocab.special_tokens import CONTENT_TOKEN_OFFSET, DELIMITER_ID, SPECIAL_TOKENS
+from thesis_shared.vocab.special_tokens import CONTENT_TOKEN_OFFSET, DELIMITER_ID, SPECIAL_TOKENS
 
 
 ROOT = Path(__file__).resolve().parents[1]

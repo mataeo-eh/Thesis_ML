@@ -18,7 +18,7 @@ from typing import Iterable, Sequence
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from thesis_ml.serialize import EntityColumnGroup, parse_entity_columns, parse_upgrades
+from thesis_shared.serialize import EntityColumnGroup, parse_entity_columns, parse_upgrades
 
 
 SCRIPT_DIR = Path(__file__).parent

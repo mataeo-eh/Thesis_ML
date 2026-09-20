@@ -16,7 +16,7 @@ extends: local_overfit_v2.yaml
 #     architecture_identity == "dense-multinomial-SC2-v2"   (unsuffixed)
 #
 # Anything that needs the baseline arm reads it from HERE -- notably
-# `ARMS[0]` in src/thesis_ml/viz/outcome_probe.py, which builds a model from this
+# `ARMS[0]` in packages/thesis-diffusion/src/thesis_diffusion/viz/outcome_probe.py, which builds a model from this
 # config and loads the baseline checkpoint into it. Pointed at the post-promotion
 # local_overfit_v2.yaml instead, that load would abort on a fingerprint mismatch.
 #

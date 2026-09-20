@@ -26,18 +26,18 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.collate import DiffusionBatch
-from thesis_ml.data.dataset import SC2DiffusionDataset
-from thesis_ml.data.split import split_replays
-from thesis_ml.data.windowing import (
+from thesis_shared.config import ProjectConfig, load_config
+from thesis_diffusion.data.collate import DiffusionBatch
+from thesis_diffusion.data.dataset import SC2DiffusionDataset
+from thesis_shared.data.split import split_replays
+from thesis_shared.data.windowing import (
     WindowManifestEntry,
     load_window_manifest,
     read_manifest_metadata,
 )
-from thesis_ml.model.loss import CanvasCrossEntropyLoss, active_class_id_to_name
-from thesis_ml.pipeline.storage import StorageResolver
-from thesis_ml.pipeline.train_pipeline import (
+from thesis_diffusion.model.loss import CanvasCrossEntropyLoss, active_class_id_to_name
+from thesis_shared.pipeline.storage import StorageResolver
+from thesis_diffusion.pipeline.train_pipeline import (
     _ensure_window_manifest,
     _explicit_replay_selection,
     _make_dataloader,
@@ -46,8 +46,8 @@ from thesis_ml.pipeline.train_pipeline import (
     _select_replays,
     _shutdown_dataloader,
 )
-from thesis_ml.train.corruption import uniform_noise_support_size
-from thesis_ml.vocab.content_vocab import load_content_vocabulary
+from thesis_diffusion.train.corruption import uniform_noise_support_size
+from thesis_shared.vocab.content_vocab import load_content_vocabulary
 
 
 DEFAULT_OUTPUT_DIR = Path("scripts/output/canvas_unigram_baseline")

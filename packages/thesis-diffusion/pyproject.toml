@@ -1,0 +1,42 @@
+# pyproject.toml - thesis-diffusion: Arm A, uniform discrete diffusion (PyTorch).
+#
+# Torch is pinned through uv to the explicit official `pytorch-cu130` index.
+# Preserve the `tool.uv.sources` mapping and regenerate the lock with uv when
+# changing Torch.
+#
+# This package must NEVER depend on tensorflow, and must never be installed into
+# the autoregressive arm's environment.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thesis-diffusion"
+version = "0.0.1"
+description = "SC2 strategy prediction via uniform discrete diffusion (PyTorch) - Arm A of the thesis comparison"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Mataeo John Anderson" }]
+dependencies = [
+    "thesis-shared",
+    "safetensors>=0.8.0",
+    "torch>=2.2",
+]
+
+[project.scripts]
+thesis-diffusion-train = "thesis_diffusion.pipeline.train_pipeline:main"
+thesis-diffusion-viz = "thesis_diffusion.viz.diagnostics:main"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+thesis-shared = { workspace = true }
+
+[tool.setuptools.packages.find]
+where = ["src"]

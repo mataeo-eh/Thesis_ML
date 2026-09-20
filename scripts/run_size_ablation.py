@@ -12,7 +12,7 @@ import subprocess
 import sys
 from typing import Any
 
-from thesis_ml.config import ProjectConfig, load_config
+from thesis_shared.config import ProjectConfig, load_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -166,7 +166,7 @@ def _run_arm(arm: Arm) -> int:
     command = [
         sys.executable,
         "-m",
-        "thesis_ml.pipeline.train_pipeline",
+        "thesis_diffusion.pipeline.train_pipeline",
         "--config",
         arm.config_path,
     ]

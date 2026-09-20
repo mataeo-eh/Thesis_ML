@@ -50,9 +50,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import torch  # noqa: E402
 
-from thesis_ml.inference.decode import validate_canvas
-from thesis_ml.inference.sampler import denoise_canvas_once
-from thesis_ml.model.loss import active_class_id_to_name
+from thesis_shared.inference.decode import validate_canvas
+from thesis_diffusion.inference.sampler import denoise_canvas_once
+from thesis_diffusion.model.loss import active_class_id_to_name
 
 from inference_test_api import (  # noqa: E402
     TestContext,

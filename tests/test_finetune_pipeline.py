@@ -23,11 +23,11 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.collate import collate_diffusion_examples
-from thesis_ml.model.model import SC2StrategyDiffusionModel
-from thesis_ml.train.loop import TrainingLoop
-from thesis_ml.train.train import make_synthetic_examples
+from thesis_shared.config import ProjectConfig, load_config
+from thesis_diffusion.data.collate import collate_diffusion_examples
+from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+from thesis_diffusion.train.loop import TrainingLoop
+from thesis_diffusion.train.train import make_synthetic_examples
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

@@ -24,7 +24,7 @@ is almost entirely interior; a token type that appears ONCE is entirely boundary
 So the pooled amplification is small precisely BECAUSE the damage is concentrated
 on the rare types, and a pooled metric cannot see that concentration.
 
-The rare types are the semantically pivotal ones. SPEC.md sec.5 sorts a timestep's
+The rare types are the semantically pivotal ones. The canonical serialization order sorts a timestep's
 entities by SC2 source (unit-type) ID, so for Protoss the numerous economy and
 gateway structures -- nexus(59), pylon(60), assimilator(61), gateway(62),
 forge(63) -- sort BEFORE every tech-unlock building: fleetbeacon(64),
@@ -112,25 +112,25 @@ from timestep_alignment_probe import (  # noqa: E402
     verify_recorded_split,
 )
 
-from thesis_ml.config import load_config  # noqa: E402
-from thesis_ml.data.collate import DiffusionBatch  # noqa: E402
-from thesis_ml.data.dataset import SC2DiffusionDataset  # noqa: E402
-from thesis_ml.data.windowing import load_window_manifest  # noqa: E402
-from thesis_ml.model.loss import CanvasCrossEntropyLoss  # noqa: E402
-from thesis_ml.pipeline.storage import StorageResolver  # noqa: E402
-from thesis_ml.pipeline.train_pipeline import (  # noqa: E402
+from thesis_shared.config import load_config  # noqa: E402
+from thesis_diffusion.data.collate import DiffusionBatch  # noqa: E402
+from thesis_diffusion.data.dataset import SC2DiffusionDataset  # noqa: E402
+from thesis_shared.data.windowing import load_window_manifest  # noqa: E402
+from thesis_diffusion.model.loss import CanvasCrossEntropyLoss  # noqa: E402
+from thesis_shared.pipeline.storage import StorageResolver  # noqa: E402
+from thesis_diffusion.pipeline.train_pipeline import (  # noqa: E402
     _ensure_window_manifest,
     _make_dataloader,
     _materialize_file,
     _materialize_replay_paths,
 )
-from thesis_ml.train.corruption import corrupt_batch  # noqa: E402
-from thesis_ml.viz.diagnostics import load_diagnostic_model  # noqa: E402
-from thesis_ml.vocab.content_vocab import (  # noqa: E402
+from thesis_diffusion.train.corruption import corrupt_batch  # noqa: E402
+from thesis_diffusion.viz.diagnostics import load_diagnostic_model  # noqa: E402
+from thesis_shared.vocab.content_vocab import (  # noqa: E402
     ContentVocabulary,
     load_content_vocabulary,
 )
-from thesis_ml.vocab.special_tokens import (  # noqa: E402
+from thesis_shared.vocab.special_tokens import (  # noqa: E402
     CONTENT_TOKEN_OFFSET,
     DELIMITER_ID,
 )

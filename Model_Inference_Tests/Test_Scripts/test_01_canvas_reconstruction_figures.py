@@ -9,7 +9,7 @@ token-by-token comparison behind them.
 
 Method
 ------
-Thin wrapper over the existing ``thesis_ml.viz.diagnostics`` module. For each
+Thin wrapper over the existing ``thesis_diffusion.viz.diagnostics`` module. For each
 selected held-out window it runs the full evaluation path -- iterative
 entropy-bounded sampling (``inference.sampler.sample_canvas``), grammar
 validation and decode (``inference.decode``), and the build-order oracle on BOTH
@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from thesis_ml.viz.diagnostics import (
+from thesis_diffusion.viz.diagnostics import (
     evaluate_selected,
     render_figures,
     write_canvas_comparison_csv_files,
@@ -50,7 +50,7 @@ TEST_TITLE = "Per-window prediction vs ground-truth canvas figures"
 TEST_DESCRIPTION = """
 Renders, for a small number of individual held-out test windows, the aligned
 ground-truth / predicted / signed-error entity-count heatmaps produced by
-`thesis_ml.viz.diagnostics`, plus an aggregate mean-absolute-difference heatmap
+`thesis_diffusion.viz.diagnostics`, plus an aggregate mean-absolute-difference heatmap
 across those windows. Alongside the figures it exports the position-by-position
 token comparison (CSV), the exact model input sequence with self/enemy markers
 (text), and the final-canvas top-k logits and softmax confidences (JSON).

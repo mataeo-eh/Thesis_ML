@@ -24,13 +24,13 @@ Everything heavier than a path lookup is lazy and memoized, so a runner that
 executes only the cheap data-only test never pays for a GPU model load.
 
 Depends on (calls into) the main package rather than reimplementing it:
-``thesis_ml.config.load_config``, ``thesis_ml.pipeline.storage.StorageResolver``,
-``thesis_ml.pipeline.train_pipeline._explicit_replay_selection``,
-``thesis_ml.data.split.split_replays``, ``thesis_ml.data.windowing.load_window_manifest``,
-``thesis_ml.data.dataset.SC2DiffusionDataset``,
-``thesis_ml.data.collate.collate_diffusion_examples``,
-``thesis_ml.viz.diagnostics.load_diagnostic_model``,
-``thesis_ml.vocab.content_vocab.load_content_vocabulary``.
+``thesis_shared.config.load_config``, ``thesis_shared.pipeline.storage.StorageResolver``,
+``thesis_diffusion.pipeline.train_pipeline._explicit_replay_selection``,
+``thesis_shared.data.split.split_replays``, ``thesis_shared.data.windowing.load_window_manifest``,
+``thesis_diffusion.data.dataset.SC2DiffusionDataset``,
+``thesis_diffusion.data.collate.collate_diffusion_examples``,
+``thesis_diffusion.viz.diagnostics.load_diagnostic_model``,
+``thesis_shared.vocab.content_vocab.load_content_vocabulary``.
 """
 
 from __future__ import annotations
@@ -44,21 +44,21 @@ from typing import Any, Sequence
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.collate import collate_diffusion_examples
-from thesis_ml.data.dataset import DatasetExample, SC2DiffusionDataset
-from thesis_ml.data.split import split_replays
-from thesis_ml.data.windowing import WindowManifestEntry, load_window_manifest
-from thesis_ml.pipeline.storage import StorageResolver
+from thesis_shared.config import ProjectConfig, load_config
+from thesis_diffusion.data.collate import collate_diffusion_examples
+from thesis_diffusion.data.dataset import DatasetExample, SC2DiffusionDataset
+from thesis_shared.data.split import split_replays
+from thesis_shared.data.windowing import WindowManifestEntry, load_window_manifest
+from thesis_shared.pipeline.storage import StorageResolver
 
 # The training pipeline's own replay-selection helper. Imported (despite the
 # leading underscore) rather than duplicated for the same reason
 # ``viz/outcome_probe.py`` imports it: a second implementation of "which replays
 # were held out" is the one bug that would silently invalidate every number this
 # package produces.
-from thesis_ml.pipeline.train_pipeline import _explicit_replay_selection
-from thesis_ml.viz.diagnostics import load_diagnostic_model
-from thesis_ml.vocab.content_vocab import ContentVocabulary, load_content_vocabulary
+from thesis_diffusion.pipeline.train_pipeline import _explicit_replay_selection
+from thesis_diffusion.viz.diagnostics import load_diagnostic_model
+from thesis_shared.vocab.content_vocab import ContentVocabulary, load_content_vocabulary
 
 
 # Repository root (the Thesis_ML package root), derived from this file's location
@@ -359,7 +359,7 @@ class SharedResources:
             ``model`` section replaced by the checkpoint's, so the sampler and
             loss see the architecture the weights actually have.
 
-        Calls: ``thesis_ml.viz.diagnostics.load_diagnostic_model``, which also
+        Calls: ``thesis_diffusion.viz.diagnostics.load_diagnostic_model``, which also
         validates the checkpoint's stamped architecture identity and feature
         statistics identity before loading any tensor.
         """
@@ -751,7 +751,7 @@ def salvage_canvas_timesteps(
         ``eval.buildorder.extract_build_order``.
     """
 
-    from thesis_ml.vocab.special_tokens import (
+    from thesis_shared.vocab.special_tokens import (
         BOS_ID,
         DELIMITER_ID,
         END_ID,

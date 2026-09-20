@@ -53,12 +53,12 @@ establish causation. Arm A is the model-independent half and is the only arm
 that can prove an objective-geometry claim on its own.
 
 Calls into the production package rather than reimplementing it:
-``thesis_ml.config.load_config``, ``thesis_ml.data.dataset.SC2DiffusionDataset``,
-``thesis_ml.data.collate.collate_diffusion_examples`` (through
-``_make_dataloader``), ``thesis_ml.train.corruption.corrupt_batch``,
-``thesis_ml.model.loss.CanvasCrossEntropyLoss``,
-``thesis_ml.viz.diagnostics.load_diagnostic_model``,
-``thesis_ml.train.loop._macro_f1_from_counts``, and the training pipeline's own
+``thesis_shared.config.load_config``, ``thesis_diffusion.data.dataset.SC2DiffusionDataset``,
+``thesis_diffusion.data.collate.collate_diffusion_examples`` (through
+``_make_dataloader``), ``thesis_diffusion.train.corruption.corrupt_batch``,
+``thesis_diffusion.model.loss.CanvasCrossEntropyLoss``,
+``thesis_diffusion.viz.diagnostics.load_diagnostic_model``,
+``thesis_diffusion.train.loop._macro_f1_from_counts``, and the training pipeline's own
 replay-selection helpers.
 """
 
@@ -80,29 +80,29 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.collate import DiffusionBatch
-from thesis_ml.data.dataset import (
+from thesis_shared.config import ProjectConfig, load_config
+from thesis_diffusion.data.collate import DiffusionBatch
+from thesis_diffusion.data.dataset import (
     CLASS_DELIMITER,
     CLASS_END,
     CLASS_PAD,
     CLASS_WINLOSS,
     SC2DiffusionDataset,
 )
-from thesis_ml.data.split import split_replays
-from thesis_ml.data.windowing import (
+from thesis_shared.data.split import split_replays
+from thesis_shared.data.windowing import (
     WindowManifestEntry,
     load_window_manifest,
     read_manifest_metadata,
 )
-from thesis_ml.model.embedding import InputFeatures
-from thesis_ml.model.loss import (
+from thesis_diffusion.model.embedding import InputFeatures
+from thesis_diffusion.model.loss import (
     FUTURE_DISTANCE_BUCKETS,
     CanvasCrossEntropyLoss,
     active_class_id_to_name,
 )
-from thesis_ml.pipeline.storage import StorageResolver
-from thesis_ml.pipeline.train_pipeline import (
+from thesis_shared.pipeline.storage import StorageResolver
+from thesis_diffusion.pipeline.train_pipeline import (
     _ensure_window_manifest,
     _explicit_replay_selection,
     _make_dataloader,
@@ -111,11 +111,11 @@ from thesis_ml.pipeline.train_pipeline import (
     _select_replays,
     _shutdown_dataloader,
 )
-from thesis_ml.train.loop import _macro_f1_from_counts
-from thesis_ml.train.corruption import corrupt_batch
-from thesis_ml.viz.diagnostics import load_diagnostic_model
-from thesis_ml.vocab.content_vocab import ContentVocabulary, load_content_vocabulary
-from thesis_ml.vocab.special_tokens import (
+from thesis_diffusion.train.loop import _macro_f1_from_counts
+from thesis_diffusion.train.corruption import corrupt_batch
+from thesis_diffusion.viz.diagnostics import load_diagnostic_model
+from thesis_shared.vocab.content_vocab import ContentVocabulary, load_content_vocabulary
+from thesis_shared.vocab.special_tokens import (
     BOS_ID,
     CONTENT_TOKEN_OFFSET,
     DELIMITER_ID,

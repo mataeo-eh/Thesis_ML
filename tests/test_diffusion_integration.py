@@ -8,13 +8,13 @@ from pathlib import Path
 import pytest
 import torch
 
-from thesis_ml.config import ProjectConfig, load_config
-from thesis_ml.data.collate import DiffusionBatch, collate_diffusion_examples
-from thesis_ml.inference.sampler import load_sampling_checkpoint, sample_canvas
-from thesis_ml.model.model import SC2StrategyDiffusionModel
-from thesis_ml.train.loop import TrainingLoop
-from thesis_ml.train.train import make_synthetic_examples
-from thesis_ml.vocab.special_tokens import MASK_ID
+from thesis_shared.config import ProjectConfig, load_config
+from thesis_diffusion.data.collate import DiffusionBatch, collate_diffusion_examples
+from thesis_diffusion.inference.sampler import load_sampling_checkpoint, sample_canvas
+from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+from thesis_diffusion.train.loop import TrainingLoop
+from thesis_diffusion.train.train import make_synthetic_examples
+from thesis_shared.vocab.special_tokens import MASK_ID
 
 
 def test_uniform_real_training_loss_backward_and_inference_flow(tmp_path: Path) -> None:

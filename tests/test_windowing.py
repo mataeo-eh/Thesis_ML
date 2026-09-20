@@ -7,11 +7,11 @@ import pytest
 import pandas as pd
 import torch
 
-from thesis_ml.config import (
+from thesis_shared.config import (
     load_config,
 )
-from thesis_ml.data.collate import collate_diffusion_examples
-from thesis_ml.data.dataset import (
+from thesis_diffusion.data.collate import collate_diffusion_examples
+from thesis_diffusion.data.dataset import (
     CLASS_ENEMY_FUTURE,
     PRETRAIN_CLASS_ID_TO_NAME,
     SC2DiffusionDataset,
@@ -19,15 +19,15 @@ from thesis_ml.data.dataset import (
     _artifact_timestep_records,
     _build_debut_target,
 )
-from thesis_ml.data.feature_stats import (
+from thesis_shared.data.feature_stats import (
     CONTINUOUS_FEATURE_NAMES,
     FeatureStatisticsError,
     compute_feature_statistics,
     load_feature_statistics,
     write_feature_statistics,
 )
-from thesis_ml.data.features import continuous_feature_is_valid
-from thesis_ml.data.windowing import (
+from thesis_shared.data.features import continuous_feature_is_valid
+from thesis_shared.data.windowing import (
     MANIFEST_VERSION,
     _artifact_is_current,
     TokenizedReplay,
@@ -40,13 +40,13 @@ from thesis_ml.data.windowing import (
     validate_manifest_integrity,
     vocabulary_stamp,
 )
-from thesis_ml.inference.timing import attach_absolute_times
-from thesis_ml.model.embedding import build_input_features
-from thesis_ml.model.model import SC2StrategyDiffusionModel
-from thesis_ml.serialize import serialize_snapshot
-from thesis_ml.train.train import run_smoke_train
-from thesis_ml.vocab.content_vocab import ContentVocabulary, build_content_vocabulary, load_content_vocabulary
-from thesis_ml.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID, WIN_ID
+from thesis_shared.inference.timing import attach_absolute_times
+from thesis_diffusion.model.embedding import build_input_features
+from thesis_diffusion.model.model import SC2StrategyDiffusionModel
+from thesis_shared.serialize import serialize_snapshot
+from thesis_diffusion.train.train import run_smoke_train
+from thesis_shared.vocab.content_vocab import ContentVocabulary, build_content_vocabulary, load_content_vocabulary
+from thesis_shared.vocab.special_tokens import DELIMITER_ID, END_ID, PAD_ID, WIN_ID
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -455,7 +455,7 @@ def test_architecture_ablation_toggles_do_not_change_manifest_or_vocabulary_stam
     already-built manifest at forward time -- they must never leak into
     either stamp, or flipping one on would force re-preprocessing all 943
     replays for no data-side reason. `manifest_config_stamp` only reads
-    `config.data.*` fields (see `src/thesis_ml/data/windowing.py`), and
+    `config.data.*` fields (see `src/thesis_diffusion/data/windowing.py`), and
     `vocabulary_stamp` does not take a config at all, so this test also
     guards against a future refactor accidentally threading `config.model`
     into either function.

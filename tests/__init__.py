@@ -1,1 +1,1 @@
-# Test suite for the thesis_ml package.
+# Test suite for the thesis_diffusion package.

@@ -217,6 +217,6 @@ and batches with `context.shared.dataloader(...)` — all memoized, so the
 checkpoint is read from disk once per run regardless of how many tests ask.
 
 Prefer wrapping existing package code over reimplementing it. Every test here is
-a thin selector-and-writer around `thesis_ml.eval`, `thesis_ml.inference`,
-`thesis_ml.viz`, or `thesis_ml.train`; that is what keeps these numbers
+a thin selector-and-writer around `thesis_diffusion.eval`, `thesis_diffusion.inference`,
+`thesis_diffusion.viz`, or `thesis_diffusion.train`; that is what keeps these numbers
 comparable to the ones the training pipeline reports.

@@ -21,27 +21,27 @@ uv run python -c "import torch; print(torch.__version__, torch.version.cuda, tor
 Run a tiny smoke training pipeline:
 
 ```bash
-uv run thesis-ml-train --config config/default.yaml --smoke
+uv run thesis-diffusion-train --config config/default.yaml --smoke
 ```
 
 Acquire replay data independently:
 
 ```bash
-uv run thesis-ml-acquire --config config/default.yaml
+uv run thesis-acquire --config config/default.yaml
 ```
 
 Run training against configured parquet data:
 
 ```bash
-uv run thesis-ml-train --config config/default.yaml
+uv run thesis-diffusion-train --config config/default.yaml
 ```
 
 Run the local proof-of-life profiles:
 
 ```bash
-uv run thesis-ml-train --config configs/local_overfit.yaml
-uv run thesis-ml-train --config configs/local_overfit_v2.yaml
-uv run thesis-ml-train --config configs/local_full.yaml
+uv run thesis-diffusion-train --config configs/local_overfit.yaml
+uv run thesis-diffusion-train --config configs/local_overfit_v2.yaml
+uv run thesis-diffusion-train --config configs/local_full.yaml
 ```
 
 The current full-corpus V3 run is launched on Windows with
@@ -142,7 +142,7 @@ Data acquisition is CPU-bound and training is GPU-bound, so run them separately.
 5. Run:
 
 ```bash
-uv run thesis-ml-acquire --config config/default.yaml
+uv run thesis-acquire --config config/default.yaml
 ```
 
 For training:
@@ -153,7 +153,7 @@ For training:
 4. Run:
 
 ```bash
-uv run thesis-ml-train --config config/default.yaml
+uv run thesis-diffusion-train --config config/default.yaml
 ```
 
 Spot instances are safe to use: every `train.checkpoint_interval` optimizer steps the run
@@ -283,7 +283,7 @@ micro-batch your GPU supports.
 Render held-out replay diagnostics with the EMA checkpoint weights:
 
 ```powershell
-.\.venv\Scripts\python.exe -m thesis_ml.viz.diagnostics --checkpoint <last.pt> --replay-dir <features-dir> --out-dir <output-dir>
+.\.venv\Scripts\python.exe -m thesis_diffusion.viz.diagnostics --checkpoint <last.pt> --replay-dir <features-dir> --out-dir <output-dir>
 ```
 
 The default output is PNG/SVG figures plus a combined PDF. Add `--csv` to write

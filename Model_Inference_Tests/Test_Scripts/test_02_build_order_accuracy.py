@@ -62,10 +62,10 @@ import matplotlib
 matplotlib.use("Agg")  # headless: never try to open a window on a training box
 import matplotlib.pyplot as plt  # noqa: E402
 
-from thesis_ml.eval.buildorder import extract_build_order
-from thesis_ml.eval.harness import evaluate_example
-from thesis_ml.eval.metrics import BuildOrderMetrics, aggregate_metrics, compare_build_orders
-from thesis_ml.inference.decode import validate_canvas
+from thesis_shared.eval.buildorder import extract_build_order
+from thesis_diffusion.eval.harness import evaluate_example
+from thesis_shared.eval.metrics import BuildOrderMetrics, aggregate_metrics, compare_build_orders
+from thesis_shared.inference.decode import validate_canvas
 
 from inference_test_api import (  # noqa: E402
     TestContext,

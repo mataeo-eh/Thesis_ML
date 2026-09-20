@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from thesis_ml.config import ConfigError, load_config, toggle_fingerprint
+from thesis_shared.config import ConfigError, load_config, toggle_fingerprint
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
@@ -282,7 +282,7 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
     # pins all three false so the completed prompt-009 sweep's baseline arm still
     # resolves to the unsuffixed `dense-multinomial-SC2-v2` identity its recorded
     # checkpoint was trained under -- see the ARMS table in
-    # src/thesis_ml/viz/outcome_probe.py, which builds a model from this config
+    # src/thesis_diffusion/viz/outcome_probe.py, which builds a model from this config
     # and loads that checkpoint into it.
     ablation_baseline = load_config(root / "configs" / "ablation_00_baseline.yaml")
     assert ablation_baseline.model.frozen_input_kv is False
@@ -420,7 +420,7 @@ def test_ablation_sweep_driver_step_constants_match_the_configured_run_length() 
     # flag they no longer pass, and matching on the whole file would flag those.
     lines = script.splitlines()
     launch_start = next(
-        index for index, line in enumerate(lines) if "thesis_ml.pipeline.train_pipeline" in line
+        index for index, line in enumerate(lines) if "thesis_diffusion.pipeline.train_pipeline" in line
     )
     # The invocation is line-continued with trailing backslashes; take it plus
     # every continuation line that follows.
@@ -593,7 +593,7 @@ def test_memorization_sweep_driver_step_constants_match_the_configured_run_lengt
     # inspected -- the header comments mention the flag they no longer pass.
     lines = script.splitlines()
     launch_start = next(
-        index for index, line in enumerate(lines) if "thesis_ml.pipeline.train_pipeline" in line
+        index for index, line in enumerate(lines) if "thesis_diffusion.pipeline.train_pipeline" in line
     )
     launch = [lines[launch_start]]
     while launch[-1].rstrip().endswith("\\"):

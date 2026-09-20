@@ -5,14 +5,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from thesis_ml.config import (
+from thesis_shared.config import (
     ClassLossWeightsConfig,
     FogConfig,
     ProjectConfig,
     UniformDistributionConfig,
     load_config,
 )
-from thesis_ml.data.dataset import (
+from thesis_diffusion.data.dataset import (
     CLASS_CONTENT,
     CLASS_DELIMITER,
     CLASS_END,
@@ -23,7 +23,7 @@ from thesis_ml.data.dataset import (
     CLASS_WINLOSS,
     PRETRAIN_CLASS_ID_TO_NAME,
 )
-from thesis_ml.data.features import (
+from thesis_shared.data.features import (
     BUFF_ID_MAX,
     BUFF_VALIDITY_INDEX,
     BUFF_VALUE_OFFSET,
@@ -31,18 +31,18 @@ from thesis_ml.data.features import (
     CONTINUOUS_FEATURE_NAMES,
     parse_buff_ids,
 )
-from thesis_ml.model.loss import CanvasCrossEntropyLoss
-from thesis_ml.model import backbone as backbone_module
-from thesis_ml.model.backbone import GeGLU, MultiHeadSelfAttention, RotaryEmbedding, TransformerBlock
-from thesis_ml.model.embedding import InputFeatures, _numeric_feature, build_input_features
-from thesis_ml.model.model import (
+from thesis_diffusion.model.loss import CanvasCrossEntropyLoss
+from thesis_diffusion.model import backbone as backbone_module
+from thesis_diffusion.model.backbone import GeGLU, MultiHeadSelfAttention, RotaryEmbedding, TransformerBlock
+from thesis_diffusion.model.embedding import InputFeatures, _numeric_feature, build_input_features
+from thesis_diffusion.model.model import (
     SC2StrategyDiffusionModel,
     _build_per_segment_position_ids,
     canvas_self_conditioning_from_logits,
     validate_checkpoint_compatibility,
 )
-from thesis_ml.serialize import TokenRecord
-from thesis_ml.vocab.special_tokens import PAD_ID
+from thesis_shared.serialize import TokenRecord
+from thesis_shared.vocab.special_tokens import PAD_ID
 
 
 def test_slash_form_numeric_features_are_encoded_as_fractions() -> None:
@@ -251,7 +251,7 @@ def _left_padded_batch(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, InputFeatures]:
     """Build one LEFT-PADDED input row: real content flush against the right edge.
 
-    Mirrors the real collater's convention (`thesis_ml.data.collate`, which
+    Mirrors the real collater's convention (`thesis_diffusion.data.collate`, which
     always left-pads the input region): `real_token_ids` occupies the final
     ``len(real_token_ids)`` slots of a ``total_width``-wide row, and every slot
     before that is `PAD_ID` with `input_attention_mask` False. Used by the

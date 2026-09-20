@@ -416,7 +416,7 @@ This is the only one of the three that adds parameters. When enabled on V3 it ad
 
 ### `model.per_segment_positions`
 
-Computes RoPE position ids **per segment** instead of as one `arange` over the concatenated sequence. The module-level helper `_build_per_segment_position_ids` in `src/thesis_ml/model/model.py` returns a `[B, L_i + 4096]` long tensor in which:
+Computes RoPE position ids **per segment** instead of as one `arange` over the concatenated sequence. The module-level helper `_build_per_segment_position_ids` in `packages/thesis-diffusion/src/thesis_diffusion/model/model.py` returns a `[B, L_i + 4096]` long tensor in which:
 
 - input real content receives `0 … L-1` in its left-padded slots, by subtracting the row's `input_len - input_lengths[i]` offset from an `arange`; the left-pad slots go negative and are `clamp_min(0)`-ed. Pinning them to `0` is deliberate rather than incidental — those slots are excluded from attention as keys and their logits are never scored, so their rotation is unobservable, but it must still be defined;
 - the canvas restarts at `0` at canvas index 0.
@@ -431,7 +431,7 @@ Note that per-segment positions **alias** the two regions onto the same relative
 
 ### Derived `architecture_identity` and checkpoint compatibility
 
-`toggle_fingerprint(model_config)` in `src/thesis_ml/config.py` returns the empty string when all three toggles are false, otherwise an alphabetically sorted `+`-joined suffix of the enabled field names, for example `+frozen_input_kv+per_segment_positions`. `SC2StrategyDiffusionModel.__init__` stamps:
+`toggle_fingerprint(model_config)` in `packages/thesis-shared/src/thesis_shared/config.py` returns the empty string when all three toggles are false, otherwise an alphabetically sorted `+`-joined suffix of the enabled field names, for example `+frozen_input_kv+per_segment_positions`. `SC2StrategyDiffusionModel.__init__` stamps:
 
 ```python
 self.architecture_identity = ARCHITECTURE_ID + toggle_fingerprint(model_config)
@@ -738,7 +738,7 @@ Both halves of that guard are load-bearing and must not be "simplified" away. Th
 
 `used_cached_input_kv` is `False` on the cache-building first pass of a frozen-KV run, `True` on every later pass, and `False` on every pass of a toggle-off run. Comparing the two groups' `forward_wall_seconds` is what makes the frozen-KV payoff observable rather than merely asserted.
 
-Timing follows the convention `train/loop.py` already established: `time.perf_counter` on CPU, and `torch.cuda.Event` pairs with a synchronizing read on GPU, because CUDA launches asynchronously and a bare host-side timer around a GPU forward would report a fictional speedup. Both fields are defaulted, so existing trace consumers are unaffected. This is performance instrumentation and is unrelated to `src/thesis_ml/inference/timing.py`, which owns in-game absolute-clock recovery per `SPEC.md` §7 and is correctly untouched by it.
+Timing follows the convention `train/loop.py` already established: `time.perf_counter` on CPU, and `torch.cuda.Event` pairs with a synchronizing read on GPU, because CUDA launches asynchronously and a bare host-side timer around a GPU forward would report a fictional speedup. Both fields are defaulted, so existing trace consumers are unaffected. This is performance instrumentation and is unrelated to `packages/thesis-shared/src/thesis_shared/inference/timing.py`, which owns in-game absolute-clock recovery per `SPEC.md` §7 and is correctly untouched by it.
 
 ## Pretraining versus debut/outcome fine-tuning
 
@@ -781,23 +781,23 @@ Older console logs and vocabulary-v1 checkpoints are historical and must not be 
 
 | Concern | Owning source |
 |---|---|
-| Canonical defaults and merged profiles | `config/default.yaml`, `configs/smallTrainingTestV3.yaml`, `configs/size_ablation_*.yaml`, `configs/local_full.yaml`, `src/thesis_ml/config.py` |
-| Special/content vocabulary | `src/thesis_ml/vocab/special_tokens.py`, `src/thesis_ml/vocab/content_vocab.py`, `data/Token_Dictionary.json` |
-| Raw feature codec and widths | `src/thesis_ml/data/features.py` |
-| Feature statistics | `src/thesis_ml/data/feature_stats.py` and configured statistics artifact |
-| Input/target grammar | `src/thesis_ml/data/dataset.py`, `src/thesis_ml/data/windowing.py` |
-| Batch shapes and masks | `src/thesis_ml/data/collate.py` |
-| Embedding and conditioning | `src/thesis_ml/model/embedding.py` |
-| Transformer/RoPE | `src/thesis_ml/model/backbone.py` |
-| Model assembly/output | `src/thesis_ml/model/model.py` |
-| Ablation toggle fields and `toggle_fingerprint` | `src/thesis_ml/config.py`, `config/default.yaml`, `configs/local_overfit_v2.yaml` |
-| `architecture_identity` stamping and checkpoint gating | `src/thesis_ml/model/model.py` (`ARCHITECTURE_ID`, `validate_checkpoint_compatibility`) |
-| Canvas loss | `src/thesis_ml/model/loss.py` |
-| Corruption | `src/thesis_ml/train/corruption.py` |
-| Optimizer, scheduler, self-conditioning, EMA | `src/thesis_ml/train/loop.py` |
-| Training-profile construction | `src/thesis_ml/pipeline/train_pipeline.py` |
-| Fine-tuning-profile construction | `src/thesis_ml/pipeline/finetune_pipeline.py` |
-| Sampling | `src/thesis_ml/inference/sampler.py` |
+| Canonical defaults and merged profiles | `config/default.yaml`, `configs/smallTrainingTestV3.yaml`, `configs/size_ablation_*.yaml`, `configs/local_full.yaml`, `packages/thesis-shared/src/thesis_shared/config.py` |
+| Special/content vocabulary | `packages/thesis-shared/src/thesis_shared/vocab/special_tokens.py`, `packages/thesis-shared/src/thesis_shared/vocab/content_vocab.py`, `data/Token_Dictionary.json` |
+| Raw feature codec and widths | `packages/thesis-shared/src/thesis_shared/data/features.py` |
+| Feature statistics | `packages/thesis-shared/src/thesis_shared/data/feature_stats.py` and configured statistics artifact |
+| Input/target grammar | `packages/thesis-diffusion/src/thesis_diffusion/data/dataset.py`, `packages/thesis-shared/src/thesis_shared/data/windowing.py` |
+| Batch shapes and masks | `packages/thesis-diffusion/src/thesis_diffusion/data/collate.py` |
+| Embedding and conditioning | `packages/thesis-diffusion/src/thesis_diffusion/model/embedding.py` |
+| Transformer/RoPE | `packages/thesis-diffusion/src/thesis_diffusion/model/backbone.py` |
+| Model assembly/output | `packages/thesis-diffusion/src/thesis_diffusion/model/model.py` |
+| Ablation toggle fields and `toggle_fingerprint` | `packages/thesis-shared/src/thesis_shared/config.py`, `config/default.yaml`, `configs/local_overfit_v2.yaml` |
+| `architecture_identity` stamping and checkpoint gating | `packages/thesis-diffusion/src/thesis_diffusion/model/model.py` (`ARCHITECTURE_ID`, `validate_checkpoint_compatibility`) |
+| Canvas loss | `packages/thesis-diffusion/src/thesis_diffusion/model/loss.py` |
+| Corruption | `packages/thesis-diffusion/src/thesis_diffusion/train/corruption.py` |
+| Optimizer, scheduler, self-conditioning, EMA | `packages/thesis-diffusion/src/thesis_diffusion/train/loop.py` |
+| Training-profile construction | `packages/thesis-diffusion/src/thesis_diffusion/pipeline/train_pipeline.py` |
+| Fine-tuning-profile construction | `packages/thesis-diffusion/src/thesis_diffusion/pipeline/finetune_pipeline.py` |
+| Sampling | `packages/thesis-diffusion/src/thesis_diffusion/inference/sampler.py` |
 
 ## Required freshness check
 

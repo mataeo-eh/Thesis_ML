@@ -25,7 +25,7 @@ def test_windows_launchers_are_thin_config_driven_wrappers() -> None:
         # terminal AND land in console.log (the redirect-only form hid all
         # output from the console the .bat opened).
         assert f'set "output_dir=%~dp0output\\{output_dir}"' in text
-        assert "'.venv\\scripts\\python.exe' -m thesis_ml.pipeline.train_pipeline" in text
+        assert "'.venv\\scripts\\python.exe' -m thesis_diffusion.pipeline.train_pipeline" in text
         assert "tee-object -filepath '%output_dir%\\console.log'" in text
         assert "exit $lastexitcode" in text
         # A launcher must not carry training logic of its own -- no inline Python
@@ -39,4 +39,4 @@ def test_size_ablation_launcher_delegates_to_restartable_driver() -> None:
     text = (ROOT / "tests" / "SizeAblationTest.bat").read_text(encoding="utf-8").lower()
     assert 'set "project_root=%~dp0.."' in text
     assert '".venv\\scripts\\python.exe" scripts\\run_size_ablation.py %*' in text
-    assert "thesis_ml.pipeline.train_pipeline" not in text
+    assert "thesis_diffusion.pipeline.train_pipeline" not in text
