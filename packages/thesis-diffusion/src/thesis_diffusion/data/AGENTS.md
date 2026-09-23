@@ -10,6 +10,8 @@
 
 ## Ownership
 
+- Recorded replay outcomes are resolved in `thesis_shared.data.replay_outcomes`; `dataset.py` preserves the public import as a compatibility re-export.
+
 - `dataset.py` owns lazy per-window example construction and per-serving fog (`ReplayWindow`, `CanvasBuild`, `_build_artifact_input`/`_build_artifact_target`, `resolve_replay_outcome`).
 - `collate.py` owns dynamic batch padding and exact input/canvas attention and loss masks (`DiffusionBatch`, `collate_diffusion_examples`).
 - `resumable_sampler.py` owns deterministic, resumable batch ordering across epochs and restarts.

@@ -6,6 +6,10 @@
 
 ## Ownership
 
+- `test_sequence_bpe.py` covers the optional joint-preview content BPE: boundaries, frequency stopping, deterministic merges, decoding, compressed whole-timestep windowing, and backward-compatible configuration.
+
+- `test_sequence_preview.py` covers the shared joint pretraining preview, format validation, legacy vocabulary preservation, perspective/outcome placement, complete-timestep boundaries, and absence of deep-learning imports.
+
 - `test_*.py` own package regression coverage (config, serialization, windowing, dataset, model, training, sampler, eval, pipeline, fine-tune report, launcher checks). `test_diffusion_integration.py` owns bounded real-model checks spanning corruption/loss/backward, self-conditioning, sampling, and checkpoint transfer between training and inference.
 - `test_canvas_unigram_baseline.py` owns the closed-form entropy/weighted-optimum baseline and exact equivalence with production canvas-loss mask selection and normalization.
 - `test_training_report.py` owns the finished-run report preparer's validation, metric summarization, architecture matching, and artifact allowlist.

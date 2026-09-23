@@ -14,6 +14,8 @@
 
 ## Ownership
 
+- `sequence_formats/` owns the clean joint two-player preview and shared presentation functions; this path is not yet integrated into either trainer. Its separate explicit profile is `config/sequence_preview.yaml`.
+
 - `config.py` owns the single-YAML-to-dataclass configuration loader (`load_config`, `ConfigError`, deep-merge over `config/default.yaml`). All runtime parameters are read from here; nothing is hardcoded.
 - `serialize.py` owns tokenization and serialization (`serialize_snapshot`, `serialize_sequence`, `parse_entity_columns`, `TokenRecord`): raw atomic entity-level tokens in the canonical order.
 - `vocab/` owns the shared content vocabulary and the reserved special tokens.
@@ -60,6 +62,8 @@
 - Any change here must additionally be checked for framework neutrality: importing `thesis_shared` must not pull `torch` or `tensorflow` into `sys.modules`.
 
 ## Child DOX Index
+
+- `sequence_formats/AGENTS.md`: joint pretraining preview grammar, vocabulary overlay, no-fog/no-feature contract, and integration boundary.
 
 - `vocab/AGENTS.md`: shared content vocabulary and reserved special tokens.
 - `data/`, `eval/`, `inference/`, `pipeline/`: governed by this file; no separate child contracts.

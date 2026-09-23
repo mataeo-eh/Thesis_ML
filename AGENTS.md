@@ -25,6 +25,8 @@
 
 ## Ownership
 
+- `packages/thesis-shared/src/thesis_shared/sequence_formats/` and `data/window_policies/` own the additive unconditioned joint sequence preview. `config/sequence_preview.yaml` explicitly selects its new default; `scripts/preview_sequence.py` inspects one replay without rebuilding manifests. Existing training entry points remain conditioned until joint training integration is implemented.
+
 - `Log.md` and `Timelog.xlsx` hold the research journal and time records. `TACCS_Proposal.docx` and `TACCS_Proposal_V1.docx` hold the original and revised cluster functional-testing proposals; these describe proposed work, not implemented architecture or measured cluster capabilities.
 - `Model_Architecture/` owns the exact current implementation/configuration reference for every learnable component and model-facing pipeline stage, plus the reusable update prompt that keeps the reference synchronized with source.
 - `packages/thesis-shared/src/thesis_shared/data/windowing.py` owns tokenized replay artifacts and timestep-aligned window manifests.
@@ -39,6 +41,10 @@
 - `prompts/training-run-summary/` owns the provider-neutral reporting workflow; `.agents/skills/training-run-summary/` and `.claude/skills/training-run-summary/` are thin discovery adapters to that one workflow.
 
 ## Local Contracts
+
+- Full tokenization (including BPE vocabulary fitting), windowing, and manifest building are cloud-compute work. Local single-replay previews and bounded tests are debugging exceptions. The optional `config/sequence_preview_bpe.yaml` fits only its named replay, preserves legacy IDs and training defaults, and must not be treated as a production tokenizer or held-out evaluation.
+
+- The additive joint preview uses `[BOS] [DELIMITER] ([SELF] self-content [ENEMY] enemy-content [DELIMITER])+ [SELF] self-outcome [ENEMY] enemy-outcome`, with END only at replay end. It has no fog or metadata features, and appends ownership IDs without altering legacy IDs. Its intended diffusion replacement support is the entire vocabulary; only position zero is clamped. Production training/corruption contracts below still describe the conditioned path. See `packages/thesis-shared/src/thesis_shared/sequence_formats/AGENTS.md` for the preview/integration boundary.
 
 - Read the root `AGENTS.md`, this file, `CLAUDE.md`, and the current task-specific prompt before editing.
 - Any change to model-facing data, vocabulary, features, sequence grammar, configuration, learnable modules, parameterization, corruption/loss, optimization/EMA, checkpoint compatibility, or sampling must update every affected section in `Model_Architecture/MODEL_ARCHITECTURE.md`, update `MODEL_ARCHITECTURE_DIAGRAM.mmd`, and regenerate its SVG/PNG in the same change. Use `Model_Architecture/UPDATE_PROMPT.md`, recompute derived values from live source, and remove superseded text; Git owns historical versions.

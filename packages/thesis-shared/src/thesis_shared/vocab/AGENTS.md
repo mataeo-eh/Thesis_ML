@@ -6,10 +6,14 @@
 
 ## Ownership
 
+- `sequence_vocabulary.py` owns explicit conditioned/joint vocabulary views. Joint preview appends SELF/ENEMY after existing content IDs; the conditioned registry and content offset remain unchanged. Joint ID 5 is displayed as `[LOSE]` while conditioned ID 5 remains `[LOSS]`.
+
 - `content_vocab.py` owns content-token identity and lookup (`ContentToken`, `ContentVocabulary`, `normalize_content_name`, `load_content_vocabulary`, `build_content_vocabulary`).
 - `special_tokens.py` owns the contiguous reserved special-token constants (`[MASK]`, `[PAD]`, `[END]`, `[DELIMITER]`, `[WIN]`, `[LOSS]`, `[BOS]`, `[EOS]`, and IDs 0–7) and derives the content offset from their count.
 
 ## Local Contracts
+
+- The rules below describe the production conditioned vocabulary. The additive joint preview uses a separate 293-ID overlay (SELF=291, ENEMY=292 with the current dictionary), explicit content membership, and its own vocabulary identity. Its full-vocabulary noise contract is not wired to production yet.
 
 - One vocabulary is shared by input and output. Content tokens are raw entity-type tokens and carry no spatial information of any kind.
 - `[MASK]` is the absorbing-ablation noise state and is never a content target. Uniform prior/corruption/renoising draws exactly `[PAD]`, `[DELIMITER]`, or a content ID; clean-token candidate sampling excludes only `[MASK]`. `[PAD]` is a real semantic canvas token for surplus positions.

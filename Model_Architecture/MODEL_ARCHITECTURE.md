@@ -2,7 +2,7 @@
 
 ## Scope and authority
 
-This document is the exact implementation-and-configuration companion to `SPEC.md`. `SPEC.md` remains the normative design authority; this file records the current learnable machinery, model-facing plumbing, tensor sizes, parameter counts, training objective, and inference procedure implemented by the repository.
+This document is the exact implementation-and-configuration reference for Arm A. Binding rules live in the `AGENTS.md` contract tree; the retired `research/SPEC-legacy.md` is not normative. This file records the current learnable machinery, model-facing plumbing, tensor sizes, parameter counts, training objective, and inference procedure implemented by the repository.
 
 Unless a section explicitly says otherwise, exact run-profile values refer to the merged `configs/smallTrainingTestV3.yaml` full-corpus profile. Values are derived from the loaded configuration, the live vocabulary, the configured feature-statistics artifact, and direct `SC2StrategyDiffusionModel` construction—not from an older checkpoint or console log.
 
@@ -29,6 +29,26 @@ Unless a section explicitly says otherwise, exact run-profile values refer to th
 ![Thesis_ML model architecture data-flow diagram](MODEL_ARCHITECTURE_DIAGRAM.png)
 
 The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARCHITECTURE_DIAGRAM.png) and [`MODEL_ARCHITECTURE_DIAGRAM.svg`](MODEL_ARCHITECTURE_DIAGRAM.svg). The single canonical graph definition is [`MODEL_ARCHITECTURE_DIAGRAM.mmd`](MODEL_ARCHITECTURE_DIAGRAM.mmd); `render_diagram.py` reads it and regenerates both images without requiring Mermaid CLI or a browser.
+
+## Shared unconditioned sequence preview
+
+The additive **unconditioned joint preview** is separate from the production pipeline shown above. `config/sequence_preview.yaml` explicitly selects `unconditioned_joint_v1`, a single 8192-token output budget, and one player perspective. `thesis_shared.sequence_formats` reuses the canonical entity serializer; `data.window_policies.unconditioned_joint` selects complete timesteps. Grammar is `[BOS] [DELIMITER] ([SELF] self-content [ENEMY] enemy-content [DELIMITER])+ [SELF] self-outcome [ENEMY] enemy-outcome`, followed by END only at actual replay end. Empty player blocks retain their markers. Every window reserves four final footer positions, all scored, after the last timestep delimiter; END follows that footer only at actual replay end. The preview is unpadded and never creates manifests, statistics, or model weights.
+
+The atomic overlay vocabulary preserves the meanings of IDs 0–290, spells ID 5 as `[LOSE]` (the conditioned vocabulary retains `[LOSS]`), and appends SELF=291 and ENEMY=292, giving **293 IDs** with an independent vocabulary identity. Optional BPE appends one ID per learned merge, giving **293 + M IDs** for M merges. Existing conditioned models still use **291 IDs** and retain the parameter counts, tensor shapes, and restricted corruption support documented here. No training model is constructed by this preview. Future same-width embedding/head tables would each gain `2 + M` rows; at width 384 that is `768 × (2 + M)` additional parameters in total, before any other architecture decisions.
+
+Joint pretraining has no observed input region, fog omission, or ground-truth feature/allegiance MLP inputs for either arm. Only the first BOS position is unscored/clamped. The intended new diffusion contract replaces any other position with any ID in the selected vocabulary (293 atomic IDs plus optional BPE merges), including MASK, BOS, EOS, outcomes, and ownership markers. That contract is exported for inspection but **not yet wired to production corruption, terminal-prior initialization, renoising, or sampling**. Training integration also needs format-aware checkpoint compatibility, masks/padding, decoder and loss reporting, and both framework adapters. Existing conditioned builders remain intact.
+
+Outcomes appear only in the final footer, so they cannot condition later entity targets. All four footer positions are scored to learn ownership and complementary outcomes; no inference-time rule forces opposite predictions. Under teacher forcing, the second outcome can use the first, so the pair is not two independent forecasting measurements. Raw metadata features are intentionally absent from both arms in the new preview. Position and health would require a shared observed-conditioning or generated-feature design to be available during generation.
+
+Run `.venv/Scripts/python.exe scripts/preview_sequence.py` to write `sequence.txt`, `tokens.csv`, and `summary.json` below `scripts/output/sequence_preview/`. Source timestep/owner columns in CSV are inspection metadata only. Missing or unknown format selection fails before replay loading. The preview shares a framework-free outcome resolver with the existing diffusion dataset.
+
+Select `--config config/sequence_preview_bpe.yaml` for the optional BPE preview. `sequence_formats/bpe.py` learns adjacent **content-ID** pairs on the full named replay, both owners in one perspective, then reuses the same whole-timestep window policy on compressed timesteps. Entities and upgrades/research are equally mergeable content; only structural markers stop merges. Atomic tokenization remains the default. At `bpe_min_occurrences: 3`, fitting stops when all current adjacent-pair frequencies are below three; overlapping occurrences count, replacement is left-to-right non-overlapping, and ties select the smallest token-ID pair. There is no vocabulary-size stopping cap. Later merges can consume earlier compound occurrences; the threshold is a selection-time frequency, not a minimum final token count.
+
+In `sequence.txt`, merged IDs display as one bracketed list of atomic names. Delimiter labels indicate the following one-based replay timestep; the final delimiter explicitly labels replay/window end. These annotations never enter the vocabulary, CSV IDs, or model tokens.
+
+BPE outputs below `scripts/output/sequence_preview/bpe/` include the re-windowed first sequence, the atomic first window in `before/`, its exact same-timestep compression in `same_window_bpe/`, `comparison.json`, and `bpe_vocabulary.json`. The latter records base names, ordered merges/frequencies, atomic expansions, and an identity covering the actual merge rules; vocabulary names alone cannot identify the tokenizer. Exact token/owner/timestep decoding is checked across the entire replay. Full-replay comparison counts include a single prefix/footer/END and are distinct from a sum of independently framed windows.
+
+This is an in-sample tokenizer debugging preview. Full vocabulary fitting, tokenization, windowing, and manifest construction are cloud-compute work; no cloud job is provisioned here. Production fitting must use training replays only after splitting, freeze the tokenizer for dev/test and both arms, and stamp its identity into downstream artifacts and checkpoints.
 
 ## Exact smallTrainingTestV3 configuration
 

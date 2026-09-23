@@ -11,12 +11,17 @@
 
 ## Ownership
 
+- `replay_outcomes.py` owns recorded replay outcome resolution for both arms; the diffusion dataset re-exports the existing public resolver.
+- `window_policies/unconditioned_joint.py` owns the additive shared whole-timestep joint window iterator used by the preview. It does not create production manifests.
+
 - `windowing.py` owns tokenized replay artifacts and timestep-aligned window manifests, including budget enforcement and boundary handling.
 - `features.py` owns input feature construction from allowlisted continuous values, continuous-validity bits, categorical cloak/buff values, and numeric allegiance.
 - `feature_stats.py` owns train-split-only normalization statistics, deterministic artifact identity, and strict loading.
 - `split.py` owns the replay-level train/dev/test split.
 
 ## Local Contracts
+
+- The budget and fog contracts below describe existing conditioned training. The additive joint preview has one output-only budget, one four-token per-player outcome footer, and no fog or features; see `../sequence_formats/AGENTS.md`.
 
 - Pretraining windows contain contiguous whole timesteps from one replay and are bounded independently by input and enemy-reconstruction token budgets.
 - Debut/outcome windows tile non-overlapping input timesteps under the input token budget only; each debut canvas starts at the input-window start and runs to replay end or the canvas budget, so output horizons may overlap. Outcome mode owns a separate stamped manifest.

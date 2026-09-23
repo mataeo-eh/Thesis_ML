@@ -14,6 +14,40 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True)
+class SequencePreviewConfig:
+    sequence_format: str
+    context_budget_tokens: int
+    project_config: str
+    perspective: str
+    replay_path: str
+    input_directory: str
+    output_directory: str
+    tokenizer: str = "atomic"
+    bpe_min_occurrences: int = 3
+
+
+def load_sequence_preview_config(path: str | Path) -> SequencePreviewConfig:
+    """Load the separate preview contract without changing legacy training defaults."""
+    from thesis_shared.vocab.sequence_vocabulary import validate_sequence_format
+
+    raw = _load_config_mapping(Path(path), stack=())
+    # Additive preview settings: older atomic preview profiles remain valid.
+    raw.setdefault("tokenizer", "atomic")
+    raw.setdefault("bpe_min_occurrences", 3)
+    config = _build_dataclass(SequencePreviewConfig, raw, "preview")
+    validate_sequence_format(config.sequence_format)
+    if config.context_budget_tokens < 10:
+        raise ConfigError("preview.context_budget_tokens must be at least 10")
+    if config.perspective not in ("p1", "p2"):
+        raise ConfigError("preview.perspective must be p1 or p2")
+    if config.tokenizer not in ("atomic", "bpe"):
+        raise ConfigError("preview.tokenizer must be atomic or bpe")
+    if type(config.bpe_min_occurrences) is not int or config.bpe_min_occurrences < 2:
+        raise ConfigError("preview.bpe_min_occurrences must be an integer of at least 2")
+    return config
+
+
+@dataclass(frozen=True)
 class RateDistributionConfig:
     name: str
     min: float

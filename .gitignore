@@ -39,6 +39,7 @@ scripts/output/canvas_unigram_baseline/
 scripts/output/timestep_alignment_probe/
 scripts/output/rare_token_signal_probe/
 scripts/output/Blizzard_Replay_Testing_Output/
+scripts/output/sequence_preview/
 
 # ---- Agent tooling (local, not shared) ----
 .agents/

@@ -35,6 +35,9 @@ EDGE_PATTERN = re.compile(
 # from the Mermaid file. A newly added node fails closed until its placement is
 # chosen deliberately instead of silently producing an unreadable diagram.
 POSITIONS: dict[str, tuple[float, float]] = {
+    "P": (9.5, 8.0),
+    "JW": (9.5, 5.5),
+    "PO": (9.5, 3.0),
     "A": (-5.2, 12.4),
     "AF": (-1.5, 12.4),
     "T": (3.0, 12.4),
@@ -78,6 +81,9 @@ COLORS: dict[str, tuple[str, str]] = {
 }
 
 CATEGORY = {
+    "P": "input",
+    "JW": "canvas",
+    "PO": "output",
     "A": "input",
     "E": "input",
     "AF": "feature",

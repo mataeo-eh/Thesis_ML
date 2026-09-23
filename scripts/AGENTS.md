@@ -6,6 +6,10 @@
 
 ## Ownership
 
+- `preview_sequence.py --config config/sequence_preview_bpe.yaml` fits content BPE on just the named replay and re-windows it. It exports ranked vocabulary/merges, exact round-trip verification, before/after token and vocabulary counts, the original first window, its same-span compression, and the re-windowed first sequence. Full tokenization/windowing/manifest jobs run on cloud compute; this command is local debugging only.
+
+- `preview_sequence.py` selects one replay and exports the first unconditioned joint window through shared presentation/windowing functions. `config/sequence_preview.yaml` explicitly selects the new format; CLI overrides accept `--replay` and `--perspective`. Outputs are `sequence.txt`, `tokens.csv`, and `summary.json` under `scripts/output/sequence_preview/`. It never builds manifests or statistics and is not a training launcher.
+
 - `test_blizzard_replays.py` owns the standalone Blizzard replay archive inventory: it discovers client versions, enumerates packs per discovered version, and summarizes compressed sizes without downloading archive bodies. It requires `requests`, `python-dotenv`, and local `BLIZZARD_CLIENT_ID`/`BLIZZARD_CLIENT_SECRET` environment variables (or an ignored `.env`). Credentials are read only when run, so pytest collection does not require them. Discovery is subject to the API search cap; its totals describe discovered archives, not a guaranteed complete corpus. Captured console output under `output/Blizzard_Replay_Testing_Output/` stays ignored.
 - `estimate_context_window.py` owns dataset context-window analysis: it streams parquet metadata plus the two upgrade columns and writes token-length reports to `scripts/output/`.
 - `gpu_smoke_test.py` owns the pre-flight GPU fit/throughput check that fabricates a correctly-shaped random batch (no dataset required) and reports peak VRAM and per-step time.

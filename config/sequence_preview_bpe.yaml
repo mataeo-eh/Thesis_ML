@@ -1,0 +1,7 @@
+# Local debugging only. Full tokenization/windowing/manifests run on cloud compute.
+extends: sequence_preview.yaml
+tokenizer: bpe
+bpe_min_occurrences: 3
+# Same replay as the original atomic preview; fit on this replay only.
+replay_path: ../../data/quickstart/parquet/match_4745721_game_state.parquet
+output_directory: ../scripts/output/sequence_preview/bpe
