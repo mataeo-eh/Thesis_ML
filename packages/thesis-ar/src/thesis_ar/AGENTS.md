@@ -39,6 +39,7 @@ This is the defining constraint of this package. Read it before writing a single
 ### Comparison fairness
 
 - **Non-embedding parameter count is the matched quantity.** Vocabulary/embedding parameters are excluded from the match, because the two arms share a vocabulary and embedding tables would otherwise dominate the comparison. Record the measured non-embedding count for both arms whenever a size claim is made.
+- **Input and output embeddings are tied in both arms.** Arm A projects logits through its token-embedding table with no separate output head. Arm B's next-token head must reuse its token-embedding matrix the same way, so the embedding parameterization is identical across the comparison.
 - Both arms train on the same replay corpus, the same `pipeline.seed`-derived splits, and the same perspective expansion (`p1`-as-self and `p2`-as-self), with replay-level splitting before perspective expansion so no window leaks across splits.
 - The AR arm gets the same pre-training and post-training stages as the diffusion arm. Where a stage cannot be identical because the objectives differ, document the difference explicitly in the run's report rather than quietly dropping the stage.
 - Report AR perplexity as standard next-token perplexity. **Do not compare it numerically to the diffusion arm's `perplexity` column**, which is computed over a sampled corruption distribution and is not a next-token quantity. The arms are compared on shared task metrics (build-order precision/recall/F1 and the other `thesis_shared.eval` metrics), not on each other's loss.

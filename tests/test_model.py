@@ -909,7 +909,48 @@ def test_all_toggles_off_architecture_identity_uses_vocab_v2_baseline() -> None:
 
     config = _small_config()
     model = SC2StrategyDiffusionModel(config, vocab_size=128)
-    assert model.architecture_identity == "dense-multinomial-SC2-v2"
+    assert model.architecture_identity == "dense-multinomial-SC2-v2-tied"
+
+
+def test_output_projection_is_tied_to_the_token_embedding_table() -> None:
+    """Logits reuse the input token table; no separate head exists anywhere.
+
+    Pins three things: the model owns no ``output_head`` parameter or
+    ``state_dict`` key (so untied checkpoints cannot load strictly and the EMA
+    never double-updates an aliased tensor), logits equal ``hidden @ E^T``
+    exactly, and the loss gradient on the logits reaches the shared table.
+    """
+
+    config = _small_config(layers=1, self_conditioning=False)
+    model = SC2StrategyDiffusionModel(config, vocab_size=128)
+
+    state_keys = set(model.state_dict())
+    assert "embedding.token_embedding.weight" in state_keys
+    assert not any(key.startswith("output_head") for key in state_keys)
+    table_elements = 128 * config.model.d_model
+    table_count = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.shape == (128, config.model.d_model)
+    )
+    assert table_count == table_elements
+
+    input_ids = torch.tensor([[6, 7, 8]])
+    canvas_ids = torch.tensor([[9, 10, 11]])
+    output = model(
+        input_token_ids=input_ids,
+        canvas_token_ids=canvas_ids,
+        input_features=_features(_records(1, 3), input_ids.shape[1]),
+    )
+    expected = output.hidden_states @ model.embedding.token_embedding.weight.T
+    assert torch.allclose(output.logits, expected)
+
+    # Only the canvas logits are backpropagated, and the canvas ids are
+    # disjoint from token 100, so any gradient on row 100 can only have
+    # arrived through the output projection.
+    output.logits[:, input_ids.shape[1]:, 100].sum().backward()
+    row_gradient = model.embedding.token_embedding.weight.grad[100]
+    assert row_gradient.abs().sum() > 0
 
 
 def test_all_toggles_off_forward_matches_fixed_seed_reference() -> None:
@@ -918,7 +959,7 @@ def test_all_toggles_off_forward_matches_fixed_seed_reference() -> None:
     With all three ablation toggles off, this exact seed/config/input
     construction must reproduce logit values captured once from this same
     construction. This guards against an unintended change to the SHARED
-    forward path (embedding, backbone, output head) that the toggle-off case
+    forward path (embedding, backbone, tied output projection) that the toggle-off case
     is supposed to leave bit-identical to pre-ablation behavior -- a change
     that per-toggle behavioral tests below would not catch, because they only
     compare toggle-on against toggle-off, not against a fixed historical value.
@@ -942,19 +983,20 @@ def test_all_toggles_off_forward_matches_fixed_seed_reference() -> None:
     assert output.logits.shape == (1, input_ids.shape[1] + canvas_ids.shape[1], 128)
     assert output.hidden_states.shape == (1, input_ids.shape[1] + canvas_ids.shape[1], config.model.d_model)
 
-    # Captured once from this exact seed/config/input construction (see the
-    # prompt task's verification run). float32 accumulation noise through two
-    # transformer blocks is far below 1e-5 for a model this small; a real
-    # regression in the shared forward path would move these by orders of
-    # magnitude more.
+    # Captured once from this exact seed/config/input construction, and
+    # recaptured when the output projection was tied to the token-embedding
+    # table (the old values came from a separate, independently initialized
+    # head). float32 accumulation noise through two transformer blocks is far
+    # below 1e-5 for a model this small; a real regression in the shared
+    # forward path would move these by orders of magnitude more.
     expected_first_position = torch.tensor(
-        [0.05702521651983261, -0.08367864042520523, -0.04190473631024361, 0.23668478429317474, -0.08491497486829758]
+        [0.044392891228199005, -0.05735515430569649, -0.07466427981853485, -0.07915055006742477, 0.005816641729325056]
     )
     expected_first_canvas_position = torch.tensor(
-        [0.06585192680358887, -0.018592674285173416, 0.009641138836741447, -0.04609399661421776, -0.09642499685287476]
+        [0.0663105770945549, 0.025853147730231285, -0.04022173583507538, -0.15245448052883148, 0.01144930999726057]
     )
     expected_last_position = torch.tensor(
-        [-0.07902131974697113, -0.07257570326328278, -0.08648346364498138, 0.050129733979701996, -0.07474275678396225]
+        [-0.0407412052154541, 0.005857410840690136, 0.008856851607561111, -0.04984170198440552, -0.08840441703796387]
     )
     assert torch.allclose(output.logits[0, 0, :5], expected_first_position, atol=1e-5)
     assert torch.allclose(output.logits[0, 4, :5], expected_first_canvas_position, atol=1e-5)

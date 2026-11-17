@@ -563,7 +563,7 @@ def test_local_model_parameter_count_is_near_ten_million() -> None:
     vocabulary = load_content_vocabulary(ROOT / "data" / "Token_Dictionary.json")
     model = SC2StrategyDiffusionModel(config, vocab_size=vocabulary.vocab_size)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    assert parameter_count == 10_995_776
+    assert parameter_count == 10_921_280
     assert 7_000_000 <= parameter_count <= 13_000_000
 
 
@@ -573,7 +573,7 @@ def test_small_training_v3_model_parameter_count() -> None:
     model = SC2StrategyDiffusionModel(config, vocab_size=vocabulary.vocab_size)
 
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    assert parameter_count == 29_318_720
+    assert parameter_count == 29_206_976
 
 
 def _assert_metadata_has_only_complete_timesteps(metadata: list[dict[str, object]]) -> None:

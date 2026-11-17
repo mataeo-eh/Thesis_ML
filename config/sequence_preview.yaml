@@ -9,3 +9,8 @@ input_directory: ../../data/quickstart/parquet
 output_directory: ../scripts/output/sequence_preview
 tokenizer: atomic
 bpe_min_occurrences: 3
+# Window the anchor replay plus the next replay in sorted filename order, and
+# pack the second replay's opening timesteps into the space after the first
+# replay's [END]. Exports the first window and the first packed window.
+replay_count: 2
+pack_replays: true

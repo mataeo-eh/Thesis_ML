@@ -9,7 +9,7 @@ import yaml
 
 from thesis_shared.config import ConfigError, load_sequence_preview_config
 from thesis_shared.sequence_formats.bpe import fit_content_bpe
-from thesis_shared.sequence_formats.types import SequenceToken
+from thesis_shared.sequence_formats.types import JointReplay, SequenceToken
 from thesis_shared.sequence_formats.preview import write_sequence_preview
 from thesis_shared.data.window_policies.unconditioned_joint import iter_joint_windows
 from thesis_shared.vocab.content_vocab import build_content_vocabulary
@@ -24,6 +24,11 @@ ENTITIES = tuple(t.token_id for t in CONTENT.tokens if t.kind == "entity")
 def tokens(*names, timestep=0, owner="p1"):
     return tuple(SequenceToken(VOCAB.token_id(n), n, timestep, owner,
                                "content" if n in CONTENT.name_to_id else "structure") for n in names)
+
+
+def windows(steps, vocabulary, budget):
+    replay = JointReplay("r", "p1", {"p1": "[TERRAN]", "p2": "[ZERG]"}, {"p1": 4, "p2": 5}, steps)
+    return list(iter_joint_windows([replay], vocabulary, context_budget=budget, pack_replays=True))
 
 
 def fit(steps, minimum=3):
@@ -71,18 +76,18 @@ def test_rewindow_compressed_steps_keeps_footer_end_and_budget():
     steps = [tokens("[SELF]", "scv", "scv", "scv", "scv", "[ENEMY]", "[DELIMITER]", timestep=i)
              for i in range(6)]
     bpe = fit(steps)
-    args = dict(context_budget=21, perspective="p1", outcomes={"p1": 4, "p2": 5})
-    before = list(iter_joint_windows(steps, VOCAB, **args))
-    after = list(iter_joint_windows([bpe.encode(s) for s in steps], bpe.vocabulary, **args))
-    assert after[0].end_timestep > before[0].end_timestep
-    assert after[-1].end_timestep == len(steps)
-    assert sum(w.reached_replay_end for w in after) == 1
+    before = windows(steps, VOCAB, 25)
+    after = windows([bpe.encode(s) for s in steps], bpe.vocabulary, 25)
+    assert after[0].segments[0].end_timestep > before[0].segments[0].end_timestep
+    assert after[-1].segments[0].end_timestep == len(steps)
+    assert sum(w.segments[0].reached_replay_end for w in after) == 1
     assert after[-1].tokens[-1].name == "[END]"
-    assert all(len(w.tokens) <= 21 and not w.loss_mask[0] and all(w.loss_mask[1:]) for w in after)
+    assert all(len(w.tokens) <= 25 and sum(w.diffusion_clamp_mask) == 5 for w in after)
     for w in after:
         decoded = bpe.decode(w.tokens)
-        body = tuple(t for step in steps[w.start_timestep:w.end_timestep] for t in step)
-        assert decoded[2:2 + len(body)] == body
+        segment = w.segments[0]
+        body = tuple(t for step in steps[segment.start_timestep:segment.end_timestep] for t in step)
+        assert decoded[6:6 + len(body)] == body
 
 
 @pytest.mark.parametrize("field,value", [("tokenizer", "typo"), ("bpe_min_occurrences", 1),
@@ -111,8 +116,7 @@ def test_upgrades_merge_with_entities_and_render_as_one_readable_token(tmp_path)
     assert any(CONTENT.token_id_for("upgrade") in bpe.expansions[m[2]] for m in bpe.merges)
     encoded = [bpe.encode(s) for s in steps]
     assert all(bpe.decode(e) == s for s, e in zip(steps, encoded))
-    window = next(iter_joint_windows(encoded, bpe.vocabulary, context_budget=100,
-                                     perspective="p1", outcomes={"p1": 4, "p2": 5}))
+    window = windows(encoded, bpe.vocabulary, 100)[0]
     write_sequence_preview(window, tmp_path, {}, bpe=bpe)
     text = (tmp_path / "sequence.txt").read_text()
     assert "[SELF] [scv upgrade marine]" in text
@@ -122,7 +126,8 @@ def test_upgrades_merge_with_entities_and_render_as_one_readable_token(tmp_path)
         "[DELIMITER | replay end after timestep 3]"]
     assert "<BPE_" in (tmp_path / "tokens.csv").read_text()
     # Nonzero-start windows use replay timestep numbers, not per-window counts.
-    later = replace(window, start_timestep=7, end_timestep=10, reached_replay_end=False,
+    later = replace(window, segments=(replace(window.segments[0], start_timestep=7, end_timestep=10,
+                                              reached_replay_end=False),),
                     tokens=tuple(replace(t, timestep=t.timestep + 7) if t.timestep is not None else t
                                  for t in window.tokens[:-1]))
     write_sequence_preview(later, tmp_path, {}, bpe=bpe)

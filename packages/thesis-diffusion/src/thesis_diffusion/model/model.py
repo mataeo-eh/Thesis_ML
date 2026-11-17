@@ -26,7 +26,13 @@ from thesis_diffusion.model.embedding import InputContextEmbedding, InputFeature
 # is its own thing (one full canvas, clamped fogged input, joint static
 # conditioning) and should not carry another model's name. Keep attribution in
 # prose; keep it out of the identifier.
-ARCHITECTURE_ID = "dense-multinomial-SC2-v2"
+#
+# The "-tied" suffix marks tied input/output embeddings: the output projection
+# reuses the token-embedding table instead of owning a separate head. Untied
+# v2 checkpoints carry an extra `output_head.weight` tensor and a head that was
+# trained independently of the embedding, so they must fail closed here rather
+# than reach `load_state_dict`.
+ARCHITECTURE_ID = "dense-multinomial-SC2-v2-tied"
 
 
 @dataclass(frozen=True)
@@ -95,7 +101,13 @@ class SC2StrategyDiffusionModel(nn.Module):
             gradient_checkpointing=model_config.gradient_checkpointing,
             frozen_input_kv=model_config.frozen_input_kv,
         )
-        self.output_head = nn.Linear(model_config.d_model, vocab_size, bias=False)
+        # No separate output head: logits are projected through the SAME
+        # `embedding.token_embedding.weight` table that embeds the tokens (tied
+        # input/output embeddings, the standard LM arrangement). See
+        # `output_logits`. Reusing the tensor, rather than registering a Linear
+        # whose weight aliases it, keeps exactly one `state_dict` key for the
+        # table, so per-key consumers such as the EMA update never touch the
+        # shared tensor twice.
         self._init_weights(model_config.layers)
         # The general initializer above intentionally initializes every Linear;
         # restore the exact zero-output joint residual after it completes.
@@ -149,7 +161,7 @@ class SC2StrategyDiffusionModel(nn.Module):
 
         Calls: ``self.embedding``, ``_combine_attention_masks``,
         ``_build_per_segment_position_ids``, ``self.backbone``,
-        ``self.output_head``.
+        ``self.output_logits``.
         """
 
         embeddings = self.embedding(
@@ -195,8 +207,27 @@ class SC2StrategyDiffusionModel(nn.Module):
             hidden, produced_cache = backbone_output
         else:
             hidden, produced_cache = backbone_output, None
-        logits = self.output_head(hidden)
+        logits = self.output_logits(hidden)
         return ModelOutput(logits=logits, hidden_states=hidden, cached_input_kv=produced_cache)
+
+    def output_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Project final hidden states to token logits through the tied table.
+
+        Each logit is the dot product of a position's hidden state with that
+        token's embedding row, so the input and output sides share one
+        ``[vocab_size, d_model]`` table and one set of gradients.
+
+        Parameters:
+            hidden: ``[batch, seq_len, d_model]`` post-final-norm hidden states.
+
+        Returns:
+            ``[batch, seq_len, vocab_size]`` logits (no bias).
+
+        Calls: ``torch.nn.functional.linear`` on
+        ``self.embedding.token_embedding.weight``.
+        """
+
+        return nn.functional.linear(hidden, self.embedding.token_embedding.weight)
 
     def _init_weights(self, layers: int) -> None:
         """Explicit LLaMA/GPT-style init instead of framework defaults."""

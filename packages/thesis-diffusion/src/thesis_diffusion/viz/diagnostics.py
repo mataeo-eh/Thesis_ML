@@ -237,8 +237,9 @@ def load_diagnostic_model(
             )
         state = checkpoint["ema_model"]
 
-    # Infer vocab size from the selected output head (shape [vocab_size, d_model]).
-    vocab_size = int(state["output_head.weight"].shape[0])
+    # Infer vocab size from the tied token-embedding table, which is also the
+    # output projection (shape [vocab_size, d_model]).
+    vocab_size = int(state["embedding.token_embedding.weight"].shape[0])
 
     statistics_identity = checkpoint.get("feature_statistics_identity")
     if not isinstance(statistics_identity, str):

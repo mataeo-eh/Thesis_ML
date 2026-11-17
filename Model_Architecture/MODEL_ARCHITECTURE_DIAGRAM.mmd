@@ -1,5 +1,5 @@
 flowchart TD
-    P["Shared joint PREVIEW only<br/>Content: atomic or optional BPE<br/>No fog / no features"] --> JW["Whole-timestep joint windows<br/>After optional content BPE<br/>293 + merges IDs · budget 8192"]
+    P["Shared joint PREVIEW only<br/>Content: atomic or optional BPE<br/>No fog / no features"] --> JW["Race-headed whole-timestep windows<br/>Packed across replays · optional BPE<br/>297 + merges IDs · budget 8192"]
     JW --> PO["One replay: text / CSV / JSON<br/>Final outcome footer · all scored<br/>Not connected to training"]
     %% Training schedule: WSD = 500-step warmup, stable middle, final 20% decay.
     %% Default stop and schedule horizons match; the capacity suite deliberately
@@ -25,7 +25,7 @@ flowchart TD
 
     CAT --> TR["12 × transformer block<br/>6-head MHA · GeGLU 1536<br/>sandwich RMSNorm"]
     TR --> FN["Final RMSNorm"]
-    FN --> OH["Untied output head<br/>384 → 291"]
+    FN --> OH["Tied output projection<br/>H · Eᵀ (shared token table)<br/>384 → 291"]
     OH --> FULL["Full logits<br/>[B, Li + 4096, 291]"]
     FULL --> SLICE["Canvas slice<br/>[B, 4096, 291]"]
     SLICE --> LOSS["Weighted clean-state cross-entropy<br/>6 rows × 7 accumulations = 42 windows/update<br/>PAD 0.1 · END 24.6333"]

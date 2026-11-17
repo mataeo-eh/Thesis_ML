@@ -1,4 +1,4 @@
-"""Export the first joint pretraining window of one replay without preprocessing."""
+"""Export the first joint pretraining window (and first packed window) of a few replays without preprocessing."""
 
 import argparse
 import json
@@ -16,9 +16,13 @@ def main() -> None:
     output = preview_replay(args.config, replay_override=args.replay, perspective_override=args.perspective)
     print(f"UNCONDITIONED JOINT PREVIEW (no fog, no features, no manifest): {output.name}")
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
-    print(f"{summary['replay']} / {summary['perspective']}: {summary['emitted_tokens']:,} tokens, "
-          f"{summary['end_timestep_exclusive']} whole timesteps, {summary['unused_capacity']} slots unused")
+    first = summary["segments"][0]
+    print(f"{', '.join(summary['replays'])} / {summary['perspective']}: {len(summary['windows'])} windows")
+    print(f"First window: {summary['emitted_tokens']:,} tokens, {first['end_timestep_exclusive']} whole timesteps "
+          f"of {first['replay']}, {summary['unused_capacity']} slots unused")
     print("Wrote sequence.txt, tokens.csv, summary.json")
+    if summary["packed_boundary_window"] is not None:
+        print(f"Wrote packed_boundary/ (window {summary['packed_boundary_window']}, crosses a replay boundary)")
     if "comparison" in summary:
         comparison = summary["comparison"]
         for label in ("full_replay", "original_first_window"):

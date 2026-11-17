@@ -39,7 +39,7 @@ extends: local_overfit_v2.yaml
 #
 # ARCHITECTURE: `model.frozen_input_kv` is INHERITED as true from
 # config/default.yaml. Architecture identity is
-# `dense-multinomial-SC2-v2+frozen_input_kv`.
+# `dense-multinomial-SC2-v2-tied+frozen_input_kv`.
 #
 # RUN LENGTH: 100 epochs = 3400 optimizer steps, inherited from
 # configs/local_overfit_v2.yaml along with the LR and EMA schedules. No

@@ -34,7 +34,7 @@ def test_valid_config_loads() -> None:
     # PROMOTED to a default on 2026-08-09 (owner decision on ablation arm 01's
     # evidence: no meaningful loss difference, much faster inference), so the
     # default-derived architecture identity is now
-    # `dense-multinomial-SC2-v2+frozen_input_kv`. The other two remain
+    # `dense-multinomial-SC2-v2-tied+frozen_input_kv`. The other two remain
     # experiments and stay false.
     assert config.model.frozen_input_kv is True
     assert config.model.segment_embeddings is False
@@ -279,11 +279,12 @@ def test_local_profiles_extend_default_with_profile_specific_self_conditioning()
         assert config.model.per_segment_positions is False
 
     # configs/ablation_00_baseline.yaml is the one profile that opts back OUT. It
-    # pins all three false so the completed prompt-009 sweep's baseline arm still
-    # resolves to the unsuffixed `dense-multinomial-SC2-v2` identity its recorded
-    # checkpoint was trained under -- see the ARMS table in
+    # pins all three false so the completed prompt-009 sweep's baseline arm
+    # resolves to the unsuffixed identity -- see the ARMS table in
     # src/thesis_diffusion/viz/outcome_probe.py, which builds a model from this config
-    # and loads that checkpoint into it.
+    # and loads that arm's checkpoint into it. Since tied embeddings, that identity
+    # is `dense-multinomial-SC2-v2-tied`; the recorded sweep checkpoints are
+    # untied and stamp plain `dense-multinomial-SC2-v2`, so they now fail closed.
     ablation_baseline = load_config(root / "configs" / "ablation_00_baseline.yaml")
     assert ablation_baseline.model.frozen_input_kv is False
     assert ablation_baseline.model.segment_embeddings is False

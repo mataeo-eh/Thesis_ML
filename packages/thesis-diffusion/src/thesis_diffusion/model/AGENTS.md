@@ -32,11 +32,12 @@ Three `model:` config booleans exist ONLY to run the prompt-009 representational
 Hard invariants when touching any of them:
 
 - With all three off, ablation-specific code adds nothing to the current vocabulary-v2 baseline, including the `[S, D]` RoPE broadcast and shared `torch.arange` positions.
-- `architecture_identity` is `ARCHITECTURE_ID + toggle_fingerprint(model_config)` and equals exactly `"dense-multinomial-SC2-v2"` with all toggles off. Vocabulary-v1 checkpoints must fail closed. Never bump `ARCHITECTURE_ID` merely for a toggle; fingerprints prevent silent cross-arm loads for zero-parameter toggles.
+- `architecture_identity` is `ARCHITECTURE_ID + toggle_fingerprint(model_config)` and equals exactly `"dense-multinomial-SC2-v2-tied"` with all toggles off. Vocabulary-v1 and untied-v2 checkpoints must fail closed. Never bump `ARCHITECTURE_ID` merely for a toggle; fingerprints prevent silent cross-arm loads for zero-parameter toggles.
 - No toggle may feed `manifest_config_stamp` or `vocabulary_stamp`; flipping one must never trigger a manifest rebuild.
 - Position ids cannot create absolute landmarks under relative RoPE. Do not "fix" seam identification by reassigning positions — anchoring the canvas at 0 with negative input positions is provably a no-op, pinned by `tests/test_model.py::test_anchoring_canvas_at_zero_with_negative_input_positions_equals_the_baseline`.
 - Uniform-mode loss predicts clean `x0` at every valid canvas position except clamped BOS, without inverse-time or corruption-mask weighting. The absorbing ablation retains its masked inverse-time objective. Per-token-class loss logging remains mandatory.
 - `rope_theta`, `rope_scaling.*`, `d_model`/`layers`/`heads`/`ffn`, `qk_norm`, `self_conditioning`, and `gradient_checkpointing` are config-owned; sequence length is not hard-capped in the rotary implementation.
+- Input and output embeddings are tied: logits are `hidden @ token_embedding.weightᵀ` via `SC2StrategyDiffusionModel.output_logits`. There is no `output_head` module or `state_dict` key. Do not reintroduce a separate head or a Linear whose weight aliases the table: an aliased tensor appears under two `state_dict` keys and the per-key EMA update would decay it twice per step.
 - Self-conditioning converts the stopped prior distribution through the shared token-embedding table, applies RMSNorm -> dense GeGLU, adds it to canvas token embeddings only, and applies scale-less RMSNorm. Training and inference share this interface.
 - The GeGLU/sandwich-norm revision is intentionally incompatible with retired checkpoints; architecture/process metadata must fail closed before weight loading.
 

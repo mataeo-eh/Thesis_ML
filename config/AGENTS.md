@@ -6,9 +6,9 @@
 
 ## Ownership
 
-- `sequence_preview_bpe.yaml` extends the atomic preview with optional content BPE, minimum adjacent frequency 3, the original preview replay explicitly pinned, and separate output below `scripts/output/sequence_preview/bpe/`. It is a local debug profile; full preprocessing belongs on cloud compute.
+- `sequence_preview_bpe.yaml` extends the atomic preview with optional content BPE, minimum adjacent frequency 3, the original preview replay explicitly pinned with `replay_count: 1`, and separate output below `scripts/output/sequence_preview/bpe/`. It is a local debug profile; full preprocessing belongs on cloud compute.
 
-- `sequence_preview.yaml` is a separate, strictly validated inspection profile, loaded through `load_sequence_preview_config`. It explicitly selects `unconditioned_joint_v1` and an 8192-token budget without changing legacy training defaults. Its paths are relative to this configuration file.
+- `sequence_preview.yaml` is a separate, strictly validated inspection profile, loaded through `load_sequence_preview_config`. It explicitly selects `unconditioned_joint_v1`, an 8192-token budget, `replay_count: 2` and `pack_replays: true` without changing legacy training defaults. Missing `replay_count`/`pack_replays` default to 1/true. Its paths are relative to this configuration file.
 
 - `default.yaml` owns the full default set of `data.*`, `fog.*`, `diffusion.*`, `model.*`, `train.*`, `sampler.*`, `pipeline.*`, `storage.*`, `data_source.*`, and evaluation parameters validated by `packages/thesis-shared/src/thesis_shared/config.py`, including uniform diffusion, adaptive EB stopping, feature-statistics identity, and explicit preparation switches.
 

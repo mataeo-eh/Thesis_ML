@@ -1,4 +1,4 @@
-"""Framework-neutral replay result metadata, shared by all sequence formats."""
+"""Framework-neutral replay metadata (result and race), shared by all sequence formats."""
 
 from functools import lru_cache
 import json
@@ -52,8 +52,65 @@ def resolve_replay_outcome(replay_path: str | Path, perspective_player: str) -> 
     if perspective_player not in ("p1", "p2"):
         raise ValueError("perspective_player must be 'p1' or 'p2'")
 
-    # Derive the metadata path from the parquet path: go from ".../parquet/
-    # match_<id>_game_state.parquet" to ".../json/match_<id>_metadata.json".
+    metadata_path, player = _player_metadata(replay_path, perspective_player)
+    result = player.get("result")
+    if result == "Victory":
+        return WIN_ID
+    if result == "Defeat":
+        return LOSS_ID
+    raise ValueError(
+        f"unresolvable result {result!r} for {perspective_player} in {metadata_path}"
+    )
+
+
+def resolve_replay_race(replay_path: str | Path, player: str) -> str:
+    """Resolve one player's race token name (e.g. "[TERRAN]") for one replay.
+
+    Reads ``players.<player>.race`` from the same sibling metadata JSON that
+    ``resolve_replay_outcome`` uses. The joint sequence format places both
+    players' race tokens at the start of every replay segment.
+
+    Parameters:
+        replay_path: Path to the game-state parquet for this replay.
+        player: Either "p1" or "p2".
+
+    Returns:
+        The race token name from ``RACE_TOKENS`` ("[PROTOSS]", "[RANDOM]",
+        "[TERRAN]" or "[ZERG]").
+
+    Raises:
+        ValueError: If the metadata or player entry is missing, or the recorded
+            race is not a known race. Never silently defaults to a race.
+
+    Calls:
+        ``_player_metadata`` and ``race_token_name``.
+    """
+
+    # Imported here so this module keeps no import-time dependency on the
+    # vocabulary package (it is also imported by the legacy diffusion dataset).
+    from thesis_shared.vocab.sequence_vocabulary import race_token_name
+
+    if player not in ("p1", "p2"):
+        raise ValueError("player must be 'p1' or 'p2'")
+    metadata_path, entry = _player_metadata(replay_path, player)
+    race = entry.get("race")
+    try:
+        return race_token_name(race)
+    except ValueError as error:
+        raise ValueError(f"{error} for {player} in {metadata_path}") from None
+
+
+def _player_metadata(replay_path: str | Path, player: str) -> tuple[Path, dict[str, Any]]:
+    """Locate the sibling metadata JSON and return (metadata path, player entry).
+
+    The parquet lives at ".../parquet/match_<id>_game_state.parquet" and its
+    metadata at ".../json/match_<id>_metadata.json".
+
+    Raises:
+        ValueError: If the path is not a game-state parquet, the metadata file is
+            missing, or the player key is absent.
+    """
+
     parquet_path = Path(replay_path)
     metadata_name = parquet_path.name.replace("_game_state.parquet", "_metadata.json")
     if metadata_name == parquet_path.name:
@@ -63,22 +120,15 @@ def resolve_replay_outcome(replay_path: str | Path, perspective_player: str) -> 
     metadata_path = parquet_path.parent.parent / "json" / metadata_name
 
     if not metadata_path.exists():
-        raise ValueError(f"replay outcome metadata not found: {metadata_path}")
+        raise ValueError(f"replay metadata not found: {metadata_path}")
 
     metadata = _read_replay_metadata(str(metadata_path))
     players = metadata.get("players")
-    if not isinstance(players, dict) or perspective_player not in players:
+    if not isinstance(players, dict) or player not in players:
         raise ValueError(
-            f"metadata {metadata_path} is missing players.{perspective_player}"
+            f"metadata {metadata_path} is missing players.{player}"
         )
-    result = players[perspective_player].get("result")
-    if result == "Victory":
-        return WIN_ID
-    if result == "Defeat":
-        return LOSS_ID
-    raise ValueError(
-        f"unresolvable result {result!r} for {perspective_player} in {metadata_path}"
-    )
+    return metadata_path, players[player]
 
 
 @lru_cache(maxsize=256)

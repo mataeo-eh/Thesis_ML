@@ -32,12 +32,12 @@ class Arm:
 # availability. A failed/interrupted arm stops the driver, so a restart returns
 # to it before any larger model is attempted.
 ARMS = (
-    Arm("005m", "configs/size_ablation_005m.yaml", 4_750_016),
-    Arm("015m", "configs/size_ablation_015m.yaml", 15_078_080),
-    Arm("030m-baseline", "configs/size_ablation_030m_baseline.yaml", 29_318_720),
-    Arm("030m-deep", "configs/size_ablation_030m_deep.yaml", 30_213_440),
-    Arm("060m", "configs/size_ablation_060m.yaml", 59_359_296),
-    Arm("120m", "configs/size_ablation_120m.yaml", 121_465_152),
+    Arm("005m", "configs/size_ablation_005m.yaml", 4_694_144),
+    Arm("015m", "configs/size_ablation_015m.yaml", 14_984_960),
+    Arm("030m-baseline", "configs/size_ablation_030m_baseline.yaml", 29_206_976),
+    Arm("030m-deep", "configs/size_ablation_030m_deep.yaml", 30_101_696),
+    Arm("060m", "configs/size_ablation_060m.yaml", 59_210_304),
+    Arm("120m", "configs/size_ablation_120m.yaml", 121_241_664),
 )
 
 

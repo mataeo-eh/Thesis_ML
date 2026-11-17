@@ -13,7 +13,7 @@ extends: local_overfit_v2.yaml
 # restates the three toggles explicitly, so it resolves to exactly the
 # architecture the recorded baseline was trained with:
 #
-#     architecture_identity == "dense-multinomial-SC2-v2"   (unsuffixed)
+#     architecture_identity == "dense-multinomial-SC2-v2-tied"   (unsuffixed)
 #
 # Anything that needs the baseline arm reads it from HERE -- notably
 # `ARMS[0]` in packages/thesis-diffusion/src/thesis_diffusion/viz/outcome_probe.py, which builds a model from this

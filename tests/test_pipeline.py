@@ -278,8 +278,11 @@ def test_proper_finish_writes_durable_finished_model(tmp_path: Path) -> None:
     }
 
     ema_state = load_file(str(finished / "model.ema.safetensors"))
-    assert "output_head.weight" in ema_state
-    assert int(metadata["vocab_size"]) == ema_state["output_head.weight"].shape[0]
+    assert "embedding.token_embedding.weight" in ema_state
+    # Tied embeddings: the output projection reuses this table, so no separate
+    # output-head tensor is exported.
+    assert "output_head.weight" not in ema_state
+    assert int(metadata["vocab_size"]) == ema_state["embedding.token_embedding.weight"].shape[0]
 
     # config.json is valid JSON carrying the model architecture the run used.
     config_json = json.loads((finished / "config.json").read_text(encoding="utf-8"))

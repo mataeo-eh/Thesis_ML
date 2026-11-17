@@ -24,6 +24,11 @@ class SequencePreviewConfig:
     output_directory: str
     tokenizer: str = "atomic"
     bpe_min_occurrences: int = 3
+    # How many replays to window: the anchor replay plus the next ones in
+    # sorted filename order from the same directory.
+    replay_count: int = 1
+    # Fill the space after one replay's [END] with the next replay's start.
+    pack_replays: bool = True
 
 
 def load_sequence_preview_config(path: str | Path) -> SequencePreviewConfig:
@@ -34,16 +39,23 @@ def load_sequence_preview_config(path: str | Path) -> SequencePreviewConfig:
     # Additive preview settings: older atomic preview profiles remain valid.
     raw.setdefault("tokenizer", "atomic")
     raw.setdefault("bpe_min_occurrences", 3)
+    raw.setdefault("replay_count", 1)
+    raw.setdefault("pack_replays", True)
     config = _build_dataclass(SequencePreviewConfig, raw, "preview")
     validate_sequence_format(config.sequence_format)
-    if config.context_budget_tokens < 10:
-        raise ConfigError("preview.context_budget_tokens must be at least 10")
+    # 11 = [BOS] + 2 race-header pairs + opening [DELIMITER] + 4-token footer + [END].
+    if config.context_budget_tokens < 11:
+        raise ConfigError("preview.context_budget_tokens must be at least 11")
     if config.perspective not in ("p1", "p2"):
         raise ConfigError("preview.perspective must be p1 or p2")
     if config.tokenizer not in ("atomic", "bpe"):
         raise ConfigError("preview.tokenizer must be atomic or bpe")
     if type(config.bpe_min_occurrences) is not int or config.bpe_min_occurrences < 2:
         raise ConfigError("preview.bpe_min_occurrences must be an integer of at least 2")
+    if type(config.replay_count) is not int or config.replay_count < 1:
+        raise ConfigError("preview.replay_count must be an integer of at least 1")
+    if type(config.pack_replays) is not bool:
+        raise ConfigError("preview.pack_replays must be true or false")
     return config
 
 

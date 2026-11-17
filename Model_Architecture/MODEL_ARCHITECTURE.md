@@ -9,7 +9,7 @@ Unless a section explicitly says otherwise, exact run-profile values refer to th
 ## Architecture at a glance
 
 - Model family: dense uniform-state discrete-diffusion transformer with frozen input K/V conditioning.
-- Trainable parameters: **29,318,720**.
+- Trainable parameters: **29,206,976** (29,095,232 non-embedding plus the 111,744-parameter tied token table).
 - Model width: **384**.
 - Transformer blocks: **12**.
 - Attention: **6** heads × **64** dimensions per head.
@@ -19,7 +19,7 @@ Unless a section explicitly says otherwise, exact run-profile values refer to th
 - Input budget: at most **4,096** served tokens per row.
 - Canvas size: exactly **4,096** target tokens per row in the production builders.
 - Maximum concatenated model sequence: **8,192** positions.
-- Output: one untied, bias-free **384 → 291** token head at every concatenated position; training slices the canvas region and excludes its clamped BOS anchor from loss.
+- Output: a bias-free **384 → 291** projection at every concatenated position through the tied token-embedding table (no separate head); training slices the canvas region and excludes its clamped BOS anchor from loss.
 - Position encoding: parameter-free Llama 3.1-style frequency-scaled RoPE.
 - No encoder-decoder split, cross-attention, causal mask, learned positional embedding, region/segment embedding, copy head, classification head, or explicit diffusion-time embedding.
 - Frozen input K/V is the promoted default and is `true` in V3; segment embeddings and per-segment positions remain disabled ablations. The active identity is `dense-multinomial-SC2-v2+frozen_input_kv`.
@@ -32,21 +32,21 @@ The directly viewable artifacts are [`MODEL_ARCHITECTURE_DIAGRAM.png`](MODEL_ARC
 
 ## Shared unconditioned sequence preview
 
-The additive **unconditioned joint preview** is separate from the production pipeline shown above. `config/sequence_preview.yaml` explicitly selects `unconditioned_joint_v1`, a single 8192-token output budget, and one player perspective. `thesis_shared.sequence_formats` reuses the canonical entity serializer; `data.window_policies.unconditioned_joint` selects complete timesteps. Grammar is `[BOS] [DELIMITER] ([SELF] self-content [ENEMY] enemy-content [DELIMITER])+ [SELF] self-outcome [ENEMY] enemy-outcome`, followed by END only at actual replay end. Empty player blocks retain their markers. Every window reserves four final footer positions, all scored, after the last timestep delimiter; END follows that footer only at actual replay end. The preview is unpadded and never creates manifests, statistics, or model weights.
+The additive **unconditioned joint preview** is separate from the production pipeline shown above. `config/sequence_preview.yaml` explicitly selects `unconditioned_joint_v1`, a single 8192-token output budget, one player perspective, and two replays with packing enabled. `thesis_shared.sequence_formats` reuses the canonical entity serializer; `data.window_policies.unconditioned_joint` selects complete timesteps. Each replay segment is `[BOS] [SELF] self-race [ENEMY] enemy-race [DELIMITER] ([SELF] self-content [ENEMY] enemy-content [DELIMITER])+ [SELF] self-outcome [ENEMY] enemy-outcome`, followed by `[END]` only at actual replay end. Within each player block, content tokens are in ascending content token ID (the serializer's SC2-type-ID order); the full specification is `PRETRAINING_PIPELINE.md`. Empty player blocks retain their markers. With packing, the space after a replay's `[END]` holds the next replay's segment when at least one whole timestep of it fits. The preview is unpadded and never creates manifests, statistics, or model weights.
 
-The atomic overlay vocabulary preserves the meanings of IDs 0–290, spells ID 5 as `[LOSE]` (the conditioned vocabulary retains `[LOSS]`), and appends SELF=291 and ENEMY=292, giving **293 IDs** with an independent vocabulary identity. Optional BPE appends one ID per learned merge, giving **293 + M IDs** for M merges. Existing conditioned models still use **291 IDs** and retain the parameter counts, tensor shapes, and restricted corruption support documented here. No training model is constructed by this preview. Future same-width embedding/head tables would each gain `2 + M` rows; at width 384 that is `768 × (2 + M)` additional parameters in total, before any other architecture decisions.
+The atomic overlay vocabulary preserves the meanings of IDs 0–290, spells ID 5 as `[LOSE]` (the conditioned vocabulary retains `[LOSS]`), and appends SELF=291, ENEMY=292, PROTOSS=293, RANDOM=294, TERRAN=295 and ZERG=296, giving **297 IDs** with an independent vocabulary identity. Optional BPE appends one ID per learned merge, giving **297 + M IDs** for M merges. Existing conditioned models still use **291 IDs** and retain the parameter counts, tensor shapes, and restricted corruption support documented here. No training model is constructed by this preview. Because input and output embeddings are tied, a future same-width table gains `6 + M` rows once; at width 384 that is `384 × (6 + M)` additional parameters in total, before any other architecture decisions.
 
-Joint pretraining has no observed input region, fog omission, or ground-truth feature/allegiance MLP inputs for either arm. Only the first BOS position is unscored/clamped. The intended new diffusion contract replaces any other position with any ID in the selected vocabulary (293 atomic IDs plus optional BPE merges), including MASK, BOS, EOS, outcomes, and ownership markers. That contract is exported for inspection but **not yet wired to production corruption, terminal-prior initialization, renoising, or sampling**. Training integration also needs format-aware checkpoint compatibility, masks/padding, decoder and loss reporting, and both framework adapters. Existing conditioned builders remain intact.
+Joint pretraining has no observed input region, fog omission, or ground-truth feature/allegiance MLP inputs for either arm. For diffusion, the window's first five positions (`[BOS]` and the leading race header) are clamped and unscored by position; later packed headers stay mutable. The AR arm scores every position after 0, race tokens included. The intended new diffusion contract replaces any mutable position with any ID in the selected vocabulary (297 atomic IDs plus optional BPE merges), including MASK, BOS, EOS, outcomes, ownership and race markers. That contract is exported for inspection but **not yet wired to production corruption, terminal-prior initialization, renoising, or sampling**. Training integration also needs format-aware checkpoint compatibility, masks/padding (including a document-mask/position choice for packed windows), decoder and loss reporting, and both framework adapters. Existing conditioned builders remain intact.
 
-Outcomes appear only in the final footer, so they cannot condition later entity targets. All four footer positions are scored to learn ownership and complementary outcomes; no inference-time rule forces opposite predictions. Under teacher forcing, the second outcome can use the first, so the pair is not two independent forecasting measurements. Raw metadata features are intentionally absent from both arms in the new preview. Position and health would require a shared observed-conditioning or generated-feature design to be available during generation.
+Outcomes appear only in each segment's footer, so they cannot condition later entity targets of that segment. All four footer positions are scored to learn ownership and complementary outcomes; no inference-time rule forces opposite predictions. Under teacher forcing, the second outcome can use the first, so the pair is not two independent forecasting measurements. Raw metadata features are intentionally absent from both arms in the new preview; race enters only as header tokens. Position and health would require a shared observed-conditioning or generated-feature design to be available during generation.
 
-Run `.venv/Scripts/python.exe scripts/preview_sequence.py` to write `sequence.txt`, `tokens.csv`, and `summary.json` below `scripts/output/sequence_preview/`. Source timestep/owner columns in CSV are inspection metadata only. Missing or unknown format selection fails before replay loading. The preview shares a framework-free outcome resolver with the existing diffusion dataset.
+Run `.venv/Scripts/python.exe scripts/preview_sequence.py` to write `sequence.txt`, `tokens.csv`, and `summary.json` (first window) plus `packed_boundary/` (first window crossing a replay boundary) below `scripts/output/sequence_preview/`. Source timestep/owner/replay columns in CSV are inspection metadata only; the CSV also carries each position's diffusion clamp and AR scoring flags. Missing or unknown format selection fails before replay loading. The preview shares framework-free outcome and race resolvers with the existing diffusion dataset.
 
 Select `--config config/sequence_preview_bpe.yaml` for the optional BPE preview. `sequence_formats/bpe.py` learns adjacent **content-ID** pairs on the full named replay, both owners in one perspective, then reuses the same whole-timestep window policy on compressed timesteps. Entities and upgrades/research are equally mergeable content; only structural markers stop merges. Atomic tokenization remains the default. At `bpe_min_occurrences: 3`, fitting stops when all current adjacent-pair frequencies are below three; overlapping occurrences count, replacement is left-to-right non-overlapping, and ties select the smallest token-ID pair. There is no vocabulary-size stopping cap. Later merges can consume earlier compound occurrences; the threshold is a selection-time frequency, not a minimum final token count.
 
-In `sequence.txt`, merged IDs display as one bracketed list of atomic names. Delimiter labels indicate the following one-based replay timestep; the final delimiter explicitly labels replay/window end. These annotations never enter the vocabulary, CSV IDs, or model tokens.
+In `sequence.txt`, merged IDs display as one bracketed list of atomic names. Each segment's `[BOS]` names its replay. Delimiter labels indicate the following one-based replay timestep; each segment's final delimiter explicitly labels replay/window end.
 
-BPE outputs below `scripts/output/sequence_preview/bpe/` include the re-windowed first sequence, the atomic first window in `before/`, its exact same-timestep compression in `same_window_bpe/`, `comparison.json`, and `bpe_vocabulary.json`. The latter records base names, ordered merges/frequencies, atomic expansions, and an identity covering the actual merge rules; vocabulary names alone cannot identify the tokenizer. Exact token/owner/timestep decoding is checked across the entire replay. Full-replay comparison counts include a single prefix/footer/END and are distinct from a sum of independently framed windows.
+BPE outputs below `scripts/output/sequence_preview/bpe/` include the re-windowed first sequence, the atomic first window in `before/`, its exact same-timestep compression in `same_window_bpe/`, `comparison.json`, and `bpe_vocabulary.json`. The latter records base names, ordered merges/frequencies, atomic expansions, and an identity covering the actual merge rules; vocabulary names alone cannot identify the tokenizer. Exact token/owner/timestep decoding is checked across every selected replay. Full-replay comparison counts include one 11-token header/delimiter/footer/END per replay and are distinct from a sum of independently framed windows.
 
 This is an in-sample tokenizer debugging preview. Full vocabulary fitting, tokenization, windowing, and manifest construction are cloud-compute work; no cloud job is provisioned here. Production fitting must use training replays only after splitting, freeze the tokenizer for dev/test and both arms, and stamp its identity into downstream artifacts and checkpoints.
 
@@ -113,16 +113,16 @@ The default `wsd` multiplier uses exactly 500 warmup, 40,340 stable, and 10,210 
 
 `tests/SizeAblationTest.bat` runs six full-corpus profiles in ascending size order. All retain this architecture family, 64-dimensional vanilla-MHA heads, QK-norm, dense GeGLU, sandwich RMSNorm, scaled RoPE, self-conditioning, frozen input K/V, uniform diffusion, and the V3 optimizer/loss/data settings.
 
-The shape ladder uses depth and width together instead of forcing parameter targets through pathological FFN widths. The dedicated matched-width control is motivated by [MobileLLM's primary depth/width ablation](https://arxiv.org/abs/2402.14905), which found 30/42-layer sub-billion models stronger than 12-layer peers, while the retained 64-dimensional head convention is also used by the small/medium models in the [GPT-3 architecture table](https://arxiv.org/abs/2005.14165). This repository does **not** import MobileLLM's GQA, embedding sharing, or block sharing: those would violate or confound the settled Thesis_ML family. The evidence is motivation for the measured depth control, not a claim that language-model optima transfer automatically to SC2 diffusion.
+The shape ladder uses depth and width together instead of forcing parameter targets through pathological FFN widths. The dedicated matched-width control is motivated by [MobileLLM's primary depth/width ablation](https://arxiv.org/abs/2402.14905), which found 30/42-layer sub-billion models stronger than 12-layer peers, while the retained 64-dimensional head convention is also used by the small/medium models in the [GPT-3 architecture table](https://arxiv.org/abs/2005.14165). This repository does **not** import MobileLLM's GQA or block sharing: those would violate or confound the settled Thesis_ML family. Input/output embedding tying is used, but as the family-wide standard applied to every arm (see *Output projection and loss*), not as a size-ladder variable. The evidence is motivation for the measured depth control, not a claim that language-model optima transfer automatically to SC2 diffusion.
 
 | Arm | Width | Blocks | Heads | GeGLU width | Parameters | Microbatch × accumulation |
 |---|---:|---:|---:|---:|---:|---:|
-| 005m | 192 | 12 | 3 | 384 | 4,750,016 | 12 × 4 = 48 |
-| 015m | 320 | 14 | 5 | 640 | 15,078,080 | 8 × 6 = 48 |
-| 030m baseline | 384 | 12 | 6 | 1,536 | 29,318,720 | 6 × 7 = 42 |
-| 030m deep | 384 | 18 | 6 | 896 | 30,213,440 | 5 × 9 = 45 |
-| 060m | 512 | 22 | 8 | 1,024 | 59,359,296 | 3 × 15 = 45 |
-| 120m | 768 | 20 | 12 | 1,536 | 121,465,152 | 1 × 45 = 45 |
+| 005m | 192 | 12 | 3 | 384 | 4,694,144 | 12 × 4 = 48 |
+| 015m | 320 | 14 | 5 | 640 | 14,984,960 | 8 × 6 = 48 |
+| 030m baseline | 384 | 12 | 6 | 1,536 | 29,206,976 | 6 × 7 = 42 |
+| 030m deep | 384 | 18 | 6 | 896 | 30,101,696 | 5 × 9 = 45 |
+| 060m | 512 | 22 | 8 | 1,024 | 59,210,304 | 3 × 15 = 45 |
+| 120m | 768 | 20 | 12 | 1,536 | 121,241,664 | 1 × 45 = 45 |
 
 Each arm sets `train.epochs: 3` and `train.schedule_horizon_epochs: 50`. The first value is the hard run stop; the second is resolved from that arm's own optimizer steps per epoch and drives both WSD and EMA. Thus the three measured epochs reproduce the opening of a 50-epoch run rather than compressing warmup/stable/decay or EMA into three epochs. Because effective batches cannot match exactly, every changed arm is at or above the baseline's 42 nominal windows per update.
 
@@ -148,7 +148,7 @@ The vocabulary width is the largest assigned token ID plus one:
 V = 290 + 1 = 291.
 \]
 
-All 291 embedding/output rows are named special or content tokens; there is no reserved-ID hole. Uniform prior, corruption, and re-noising draw uniformly from 285 states: `[PAD]`, `[DELIMITER]`, and the 283 content IDs. They never inject `[MASK]`, `[END]`, `[WIN]`, `[LOSS]`, `[BOS]`, or `[EOS]`. Clean-token candidate sampling masks only `[MASK]`, so the output head can still predict legitimate target specials.
+All 291 embedding/output rows are named special or content tokens; there is no reserved-ID hole. Uniform prior, corruption, and re-noising draw uniformly from 285 states: `[PAD]`, `[DELIMITER]`, and the 283 content IDs. They never inject `[MASK]`, `[END]`, `[WIN]`, `[LOSS]`, `[BOS]`, or `[EOS]`. Clean-token candidate sampling masks only `[MASK]`, so the tied output projection can still predict legitimate target specials.
 
 ### Shared token embedding
 
@@ -156,7 +156,7 @@ All 291 embedding/output rows are named special or content tokens; there is no r
 E \in \mathbb{R}^{291 \times 384}
 \]
 
-The same table embeds clamped input IDs, noised canvas IDs, and the expected token distribution used by self-conditioning. It is not tied to the output head.
+The same table embeds clamped input IDs, noised canvas IDs, and the expected token distribution used by self-conditioning. It is also the output projection: input and output embeddings are tied (see *Output projection and loss*).
 
 ## Clamped input and feature conditioning
 
@@ -403,7 +403,7 @@ The V3 profile checkpoints each transformer block while training. This changes a
 
 Three independent boolean fields on `ModelConfig` control how the input region and the canvas region relate to each other. They exist so an ablation can isolate why the position-pinned rare classes fail to fit; the motivating failure analysis is `diagnostics/009-rare-class-position-blindness.md` and the implementation interface is `diagnostics/009-ablation-toggle-interface-map.md`.
 
-`frozen_input_kv` is `true` in the default and V3 profile. `segment_embeddings` and `per_segment_positions` are false. Frozen input K/V adds no parameters, so the active V3 model remains 29,318,720 parameters and stamps `dense-multinomial-SC2-v2+frozen_input_kv`.
+`frozen_input_kv` is `true` in the default and V3 profile. `segment_embeddings` and `per_segment_positions` are false. Frozen input K/V adds no parameters, so the active V3 model remains 29,206,976 parameters and stamps `dense-multinomial-SC2-v2-tied+frozen_input_kv`.
 
 `configs/local_overfit_v2.yaml` is the ablation control surface: exactly one flag is flipped there per arm.
 
@@ -432,7 +432,7 @@ The table is zero-initialized by `InputContextEmbedding.reset_segment_embeddings
 
 When the toggle is off the module is not constructed at all — the attribute holds a plain `None`, which `nn.Module` does not register — so **no extra `state_dict` keys appear**. Architecture-v2 checkpoints from the matching arm load strictly.
 
-This is the only one of the three that adds parameters. When enabled on V3 it adds `2 × 384 = 768` trainable parameters, taking the whole-model total to 29,319,488.
+This is the only one of the three that adds parameters. When enabled on V3 it adds `2 × 384 = 768` trainable parameters, taking the whole-model total to 29,207,744.
 
 ### `model.per_segment_positions`
 
@@ -457,13 +457,13 @@ Note that per-segment positions **alias** the two regions onto the same relative
 self.architecture_identity = ARCHITECTURE_ID + toggle_fingerprint(model_config)
 ```
 
-With the V3/default toggle set this is `dense-multinomial-SC2-v2+frozen_input_kv`. Vocabulary-v1 checkpoints are intentionally retired because their embedding/head widths and canvas grammar differ. `validate_checkpoint_compatibility` compares the stamp before reading weights, so v1 checkpoints and checkpoints from a different v2 toggle set cannot resume, warm-start, sample, or feed diagnostics.
+`ARCHITECTURE_ID` is `dense-multinomial-SC2-v2-tied`; with the V3/default toggle set the stamp is `dense-multinomial-SC2-v2-tied+frozen_input_kv`. Vocabulary-v1 checkpoints are intentionally retired because their embedding/head widths and canvas grammar differ. Untied v2 checkpoints (stamped `dense-multinomial-SC2-v2…` and carrying a separate `output_head.weight`) are retired by the tying change, including the recorded prompt-009 ablation and size-ablation checkpoints. `validate_checkpoint_compatibility` compares the stamp before reading weights, so v1 checkpoints, untied v2 checkpoints, and checkpoints from a different toggle set cannot resume, warm-start, sample, or feed diagnostics.
 
 **This gating is necessary rather than defensive.** `frozen_input_kv` and `per_segment_positions` add no parameters and no keys, so a strict `load_state_dict` across mismatched arms would otherwise succeed silently and quietly corrupt the comparison with no error anywhere. Only `segment_embeddings` would be caught by key mismatch alone.
 
 Practical consequence: each toggle set needs its own `storage.checkpoint_uri`, or its first save can collide with an incompatible `resume/last.pt`.
 
-## Output head and loss
+## Output projection and loss
 
 After 12 blocks, a final learned RMSNorm produces:
 
@@ -471,10 +471,10 @@ After 12 blocks, a final learned RMSNorm produces:
 H \in \mathbb{R}^{B \times (L_i + 4096) \times 384}.
 \]
 
-An untied, bias-free linear head maps every position to 291 logits:
+There is no separate output head. Input and output embeddings are tied: `SC2StrategyDiffusionModel.output_logits` projects every position through the same token table \(E\) that embeds the tokens, bias-free:
 
 \[
-W_{out} \in \mathbb{R}^{291 \times 384},
+logits = H E^{\top}, \qquad E \in \mathbb{R}^{291 \times 384},
 \]
 
 \[
@@ -597,8 +597,9 @@ Twelve blocks contain `12 × 2,360,960 = 28,331,520` parameters. The final RMSNo
 | Twelve transformer blocks | 28,331,520 |
 | Final RMSNorm | 384 |
 | Complete backbone | 28,331,904 |
-| Untied output head | 111,744 |
-| **Total trainable parameters** | **29,318,720** |
+| Output projection | 0 (tied to the shared token embedding) |
+| **Total trainable parameters** | **29,206,976** |
+| Non-embedding parameters (total minus the 111,744 token table) | 29,095,232 |
 
 Every model parameter currently has `requires_grad=True`.
 
@@ -673,21 +674,21 @@ EMA weights are used for validation, final checkpointing, sampling, and evaluati
 
 ### Persistent parameter-state memory
 
-For 29,318,720 FP32 parameters:
+For 29,206,976 FP32 parameters:
 
 | State | Size |
 |---|---:|
-| Raw FP32 model | 117,274,880 bytes = 111.842 MiB |
-| Raw model + FP32 EMA | 223.684 MiB |
-| Two FP32 Adam moment tensors | 223.684 MiB |
-| FP32 gradients | 111.842 MiB |
-| **Model + EMA + Adam moments + gradients** | **559.210 MiB** |
+| Raw FP32 model | 116,827,904 bytes = 111.416 MiB |
+| Raw model + FP32 EMA | 222.832 MiB |
+| Two FP32 Adam moment tensors | 222.832 MiB |
+| FP32 gradients | 111.416 MiB |
+| **Model + EMA + Adam moments + gradients** | **557.079 MiB** |
 
 These figures deliberately exclude activations, saved tensors, SDPA workspaces, input batches, allocator fragmentation/reservation, and checkpoint serialization. They are not a GPU peak-memory prediction.
 
 ### Measured RTX 3070 training memory
 
-The canonical six-row microbatch was selected with the real full-corpus V3 pipeline, 4,096/4,096 token budgets, BF16 autocast, frozen input K/V, self-conditioning, activation checkpointing, ten persistent workers, and the local RTX 3070. Across a resumed 20-optimizer-step validation, peak live PyTorch allocation was **3.845 GiB**, allocator reservation was at most **4.980 GiB**, and total device use was at most **6.083 GiB**. Warm throughput averaged **13.7k valid tokens/s**.
+The canonical six-row microbatch was selected (before embedding tying, which removed 111,744 parameters and does not materially change these figures) with the real full-corpus V3 pipeline, 4,096/4,096 token budgets, BF16 autocast, frozen input K/V, self-conditioning, activation checkpointing, ten persistent workers, and the local RTX 3070. Across a resumed 20-optimizer-step validation, peak live PyTorch allocation was **3.845 GiB**, allocator reservation was at most **4.980 GiB**, and total device use was at most **6.083 GiB**. Warm throughput averaged **13.7k valid tokens/s**.
 
 The displaced nine-row/five-accumulation profile reached **5.470 GiB** live allocation, **7.262 GiB** reserved, and **8.000 GiB** total device use over four steps, leaving no physical headroom and invoking WDDM shared-memory behavior. The current `max_cuda_reserved_gb: 6.5` ceiling is reclaim-first protection against later allocator growth; it is above the healthy measured reservation and therefore does not trim the normal path.
 
@@ -762,7 +763,7 @@ Timing follows the convention `train/loop.py` already established: `time.perf_co
 
 ## Pretraining versus debut/outcome fine-tuning
 
-Fine-tuning reuses the same model, embeddings, backbone, 291-way token head, and parameter count. It does not add a classification head.
+Fine-tuning reuses the same model, embeddings, backbone, tied 291-way output projection, and parameter count. It does not add a classification head.
 
 The current overfit-V2 fine-tune profile changes the following pipeline behavior:
 
@@ -781,8 +782,8 @@ These are high-consequence implementation facts that must remain explicit in fut
 
 1. **No explicit diffusion-time input.** Training samples `t`, but the model forward signature does not receive it.
 2. **One joint bidirectional stack.** Input and canvas are concatenated; there is no encoder-decoder split or cross-attention. The `model.frozen_input_kv` toggle would split this into two passes and is `false` everywhere.
-3. **Input logits are computed but unsupervised.** The output head runs over the whole sequence, then training slices away `Li` positions.
-4. **Output weights are untied.** Token embedding and output head have equal shapes but are separate parameter tensors.
+3. **Input logits are computed but unsupervised.** The output projection runs over the whole sequence, then training slices away `Li` positions.
+4. **Output weights are tied.** Logits are `H Eᵀ` through the single shared token table; there is no `output_head` module, parameter, or `state_dict` key. The table is registered once, so the EMA update, optimizer, and checkpoints each see it exactly once.
 5. **No region embedding.** There is no learned input-versus-canvas segment ID. The `model.segment_embeddings` toggle would add one and is `false` everywhere; when off, its table is not constructed and contributes no `state_dict` keys.
 6. **Semantic padding is learned.** `[PAD]` inside the canvas is an attended target; batch-shape padding is excluded.
 7. **Every vocabulary row is mapped.** Special IDs are contiguous 0–7 and content IDs contiguous 8–290; no unnamed tensor IDs exist. Uniform replacement support is the explicit 285-state subset `[PAD]`, `[DELIMITER]`, and content.
@@ -795,7 +796,7 @@ These are high-consequence implementation facts that must remain explicit in fut
 
 ## Provenance boundary
 
-Older console logs and vocabulary-v1 checkpoints are historical and must not be used as the current source architecture. A current default-derived checkpoint must stamp `dense-multinomial-SC2-v2+frozen_input_kv`, carry 291-row embedding/head tensors, and pass feature-statistics identity validation.
+Older console logs and vocabulary-v1 checkpoints are historical and must not be used as the current source architecture. A current default-derived checkpoint must stamp `dense-multinomial-SC2-v2-tied+frozen_input_kv`, carry one 291-row tied embedding table and no `output_head.weight`, and pass feature-statistics identity validation.
 
 ## Source-of-truth map
 
@@ -823,4 +824,4 @@ Older console logs and vocabulary-v1 checkpoints are historical and must not be 
 
 When any source above or any model-facing config changes, use `UPDATE_PROMPT.md`, recompute the live values, update every affected section here, edit the canonical `.mmd`, regenerate the SVG/PNG, run the owning focused tests, and refresh the semantic indexes. Do not append a new architecture version; replace stale content in place.
 
-**Diagram scope.** `MODEL_ARCHITECTURE_DIAGRAM.mmd` depicts the current V3 path: embeddings, corruption, expected-embedding self-conditioning, promoted frozen input K/V plus live canvas queries, the block stack, the head, canvas slice, loss decompositions, and the iterative sampler summary. It does not expand the six size profiles into separate graphs because their topology is identical and their exact dimensions/counts are tabulated above. The canonical Mermaid source was regenerated in this change after its schedule/RNG annotations were synchronized.
+**Diagram scope.** `MODEL_ARCHITECTURE_DIAGRAM.mmd` depicts the current V3 path: embeddings, corruption, expected-embedding self-conditioning, promoted frozen input K/V plus live canvas queries, the block stack, the tied output projection, canvas slice, loss decompositions, and the iterative sampler summary. It does not expand the six size profiles into separate graphs because their topology is identical and their exact dimensions/counts are tabulated above. The canonical Mermaid source was regenerated in this change after its schedule/RNG annotations were synchronized.

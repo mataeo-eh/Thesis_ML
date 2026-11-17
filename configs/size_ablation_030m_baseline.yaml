@@ -4,7 +4,7 @@ storage:
   checkpoint_uri: tests/output/SizeAblationTest/030m-baseline/checkpoints
   log_uri: tests/output/SizeAblationTest/030m-baseline/metrics
 
-# Exact current V3 parameterization and effective batch: 29,318,720 parameters,
+# Exact current V3 parameterization and effective batch: 29,206,976 parameters (tied embeddings),
 # 6 x 64-dimensional heads, 42 nominal windows/update.
 model:
   d_model: 384

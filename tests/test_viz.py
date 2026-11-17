@@ -754,8 +754,11 @@ def _write_distinct_weight_checkpoint(
     model = SC2StrategyDiffusionModel(config, vocab_size=vocabulary.vocab_size)
     raw_state = {name: tensor.clone() for name, tensor in model.state_dict().items()}
     ema_state = {name: tensor.clone() for name, tensor in model.state_dict().items()}
-    # Make the EMA output head unmistakably different from the raw one.
-    ema_state["output_head.weight"] = ema_state["output_head.weight"] + 1.0
+    # Make the EMA token table (also the tied output projection) unmistakably
+    # different from the raw one.
+    ema_state["embedding.token_embedding.weight"] = (
+        ema_state["embedding.token_embedding.weight"] + 1.0
+    )
     payload: dict[str, object] = {
         "model": raw_state,
         "config": config,
@@ -784,13 +787,13 @@ def test_load_diagnostic_model_defaults_to_ema_and_raw_switches(tmp_path: Path):
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    stored_ema = checkpoint["ema_model"]["output_head.weight"]
-    stored_raw = checkpoint["model"]["output_head.weight"]
+    stored_ema = checkpoint["ema_model"]["embedding.token_embedding.weight"]
+    stored_raw = checkpoint["model"]["embedding.token_embedding.weight"]
     # Precondition: the fixture really did make the two sets differ.
     assert not torch.equal(stored_ema, stored_raw)
     # Default -> EMA weights; --raw -> raw weights.
-    assert torch.equal(ema_model.output_head.weight.cpu(), stored_ema)
-    assert torch.equal(raw_model.output_head.weight.cpu(), stored_raw)
+    assert torch.equal(ema_model.embedding.token_embedding.weight.cpu(), stored_ema)
+    assert torch.equal(raw_model.embedding.token_embedding.weight.cpu(), stored_raw)
 
 
 @pytest.mark.slow

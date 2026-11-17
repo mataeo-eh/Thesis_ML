@@ -208,7 +208,7 @@ def render() -> None:
     axis.text(
         0.65,
         14.3,
-        "Current smallTrainingTestV3 pipeline · 29,318,720 trainable parameters",
+        "Current smallTrainingTestV3 pipeline · 29,206,976 trainable parameters (tied embeddings)",
         ha="center",
         va="center",
         fontsize=12,
