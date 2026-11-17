@@ -6,6 +6,8 @@
 
 ## Ownership
 
+- `tokenizer_study.py` owns the CPU-only cloud corpus BPE study: one replay per parsing worker, identity-bound scratch word caches, shared incremental BPE, train-only fitting, smallest-vocabulary selection preserving configured overall/per-race dev savings for Protoss/Terran/Zerg, a 32k comparator and vocabulary-cost indicators, then selected-tokenizer full-corpus/per-language metrics and exact decoding checks. Its intended consumer is a generic AR LLM trained from scratch. Outputs stay below `scripts/output/tokenizer_study/`; it creates no training manifests or weights. `config/tokenizer_study.yaml` owns its validated controls. `oscer/` owns the user-operated temporary-archive upload, batch environment, backups and complete manual handoff.
+
 - `preview_sequence.py --config config/sequence_preview_bpe.yaml` fits content BPE on just the named replay and re-windows it. It exports ranked vocabulary/merges, exact round-trip verification, before/after token and vocabulary counts, the original first window, its same-span compression, and the re-windowed first sequence. Full tokenization/windowing/manifest jobs run on cloud compute; this command is local debugging only.
 
 - `bpe_merge_curve.py` fits content BPE on the BPE-preview replay at the fitter's floor (`min_occurrences=2`), replays the ranked merges to count exact tokens deleted per merge (cross-checked against `ContentBPE.encode`), and writes a linear/log-log/cumulative plot, per-merge CSV, and summary with a Kneedle-style elbow hint under `scripts/output/sequence_preview/bpe/merge_curve/`. `--replay-count N` pools N replays (anchor plus the next in sorted order) into `merge_curve_<N>_replays/` so the single-replay output is never overwritten. In-sample; local debugging only.
@@ -57,6 +59,8 @@
 
 ## Verification
 
+- `tests/test_tokenizer_study.py` verifies indexed BPE against a full-recount oracle, fast ranked encoding, restart/identity checks, metrics and framing, dev-only endpoint selection, projected versus canonical single-replay parsing, checksum guards, and a tiny synthetic corpus run/resume.
+
 - `tests/test_context_window_estimator.py` covers the context-window estimator; `tests/test_gpu_smoke_script.py` covers the fabricated benchmark batch grammar without requiring CUDA.
 - `tests/test_canvas_unigram_baseline.py` pins the closed-form weighted optimum and proves that semantic `[PAD]`, clamped BOS, and batch-shape padding match the live loss mask/reduction.
 - `tests/test_training_report.py` covers finish validation, first/best/final extraction, anomalous-row reporting, architecture matching, and exclusion of weights/checkpoints.
@@ -65,4 +69,4 @@
 
 ## Child DOX Index
 
-- No child `AGENTS.md` files currently exist.
+- `oscer/AGENTS.md`: manual cluster probe, temporary uploads, scratch environment, batch execution and durable result/failure retrieval.

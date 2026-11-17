@@ -7,6 +7,7 @@
 ## Ownership
 
 - Research notes own literature summaries, comparisons, evidence, and unresolved implications.
+- `tokenizer-vocabulary-selection.md` owns the primary-source vocabulary-size review, owner/timestep-word adaptation, provisional dev-compression endpoint rule, prospective vocabulary costs and downstream-validation limits; executable controls live in `config/tokenizer_study.yaml`.
 - `diffusiongemma-uniform-migration.md` owns the dated primary-source review and accepted adopt/adapt/reject rationale for the uniform-diffusion migration.
 
 ## Local Contracts

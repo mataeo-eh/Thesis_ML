@@ -727,3 +727,49 @@ def _validate_shared_training_sections(config: ProjectConfig) -> None:
     for field in fields(weights):
         if getattr(weights, field.name) < 0.0:
             raise ConfigError(f"loss.class_loss_weights.{field.name} must be >= 0")
+
+
+@dataclass(frozen=True)
+class TokenizerStudyConfig:
+    """Cloud corpus study controls; never merged into a training profile."""
+
+    project_config: str
+    input_directory: str
+    replay_glob: str
+    vocabulary_sizes: str
+    reference_vocab_size: int
+    selection_rule: str
+    min_occurrences: int
+    retained_dev_savings: float
+    rare_usage_threshold: int
+    reference_width: int
+    workers: int
+
+    @property
+    def sizes(self) -> tuple[int, ...]:
+        return tuple(int(value.strip()) for value in self.vocabulary_sizes.split(","))
+
+
+def load_tokenizer_study_config(path: str | Path) -> TokenizerStudyConfig:
+    """Validate an independent analysis YAML before opening any replay."""
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    settings = _build_dataclass(TokenizerStudyConfig, raw, "tokenizer_study")
+    try:
+        sizes = settings.sizes
+    except ValueError:
+        raise ConfigError("vocabulary_sizes must be comma-separated integers") from None
+    if not sizes or sizes != tuple(sorted(set(sizes))) or min(sizes) < 1:
+        raise ConfigError("vocabulary_sizes must be positive, unique, increasing totals")
+    if settings.reference_vocab_size not in sizes:
+        raise ConfigError("reference_vocab_size must be one of vocabulary_sizes")
+    if settings.selection_rule not in {"reference", "dev_savings", "multilingual_savings"}:
+        raise ConfigError("selection_rule must be reference, dev_savings or multilingual_savings")
+    if settings.min_occurrences < 2:
+        raise ConfigError("min_occurrences must be >= 2")
+    if not 0 < settings.retained_dev_savings <= 1:
+        raise ConfigError("retained_dev_savings must be in (0,1]")
+    if min(settings.rare_usage_threshold, settings.reference_width, settings.workers) < 1:
+        raise ConfigError("rare_usage_threshold, reference_width and workers must be positive")
+    if not all((settings.project_config, settings.input_directory, settings.replay_glob)):
+        raise ConfigError("project_config, input_directory and replay_glob must be nonempty")
+    return settings

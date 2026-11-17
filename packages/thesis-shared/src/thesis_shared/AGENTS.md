@@ -16,7 +16,7 @@
 
 - `sequence_formats/` owns the clean joint two-player preview and shared presentation functions; this path is not yet integrated into either trainer. Its separate explicit profile is `config/sequence_preview.yaml`.
 
-- `config.py` owns the single-YAML-to-dataclass configuration loader (`load_config`, `ConfigError`, deep-merge over `config/default.yaml`). All runtime parameters are read from here; nothing is hardcoded.
+- `config.py` owns the single-YAML-to-dataclass configuration loader (`load_config`, `ConfigError`, deep-merge over `config/default.yaml`) and independent preview/study config validators. `load_tokenizer_study_config` validates corpus vocabulary-study controls without altering training defaults. All runtime parameters are read from here; nothing is hardcoded.
 - `serialize.py` owns tokenization and serialization (`serialize_snapshot`, `serialize_sequence`, `parse_entity_columns`, `TokenRecord`): raw atomic entity-level tokens in the canonical order.
 - `vocab/` owns the shared content vocabulary and the reserved special tokens.
 - `data/windowing.py` owns tokenized replay artifacts and timestep-aligned window manifests.

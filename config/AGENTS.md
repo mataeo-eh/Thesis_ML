@@ -6,6 +6,8 @@
 
 ## Ownership
 
+- `tokenizer_study.yaml` is an independent cloud analysis profile validated by `load_tokenizer_study_config`: total vocabulary candidates through 65536, a 32768-ID comparator, default multilingual-savings selection (overall and per-race dev savings), optional reference/pooled-dev rules, frequency floor, explicit savings tolerance, usage-report threshold, illustrative table width and worker count. It is not merged into production training defaults.
+
 - `sequence_preview_bpe.yaml` extends the atomic preview with optional content BPE, minimum adjacent frequency 3, the original preview replay explicitly pinned with `replay_count: 1`, and separate output below `scripts/output/sequence_preview/bpe/`. It is a local debug profile; full preprocessing belongs on cloud compute.
 
 - `sequence_preview.yaml` is a separate, strictly validated inspection profile, loaded through `load_sequence_preview_config`. It explicitly selects `unconditioned_joint_v1`, an 8192-token budget, `replay_count: 2` and `pack_replays: true` without changing legacy training defaults. Missing `replay_count`/`pack_replays` default to 1/true. Its paths are relative to this configuration file.

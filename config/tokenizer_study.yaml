@@ -1,0 +1,19 @@
+# Analysis only. TOTAL vocabulary sizes include the 297 preserved base IDs.
+# Paths are relative to this YAML. Upload extracts parquet/ and json/ at repo root.
+project_config: default.yaml
+input_directory: ../parquet
+replay_glob: '*_game_state.parquet'
+vocabulary_sizes: '512,1024,2048,4096,8192,16384,32768,49152,65536'
+# One SHARED vocabulary across Protoss/Terran/Zerg, not 32k per race.
+# 32,768 is a comparator, not an automatically selected endpoint.
+reference_vocab_size: 32768
+selection_rule: multilingual_savings
+min_occurrences: 2
+# Smallest vocabulary retaining this fraction of observed dev savings BOTH
+# overall and separately for every represented race language.
+# Project tolerance inspired by multilingual compression/coverage reasoning;
+# these model reports do not prescribe a numeric 99% rule.
+retained_dev_savings: 0.99
+rare_usage_threshold: 100
+reference_width: 384
+workers: 4

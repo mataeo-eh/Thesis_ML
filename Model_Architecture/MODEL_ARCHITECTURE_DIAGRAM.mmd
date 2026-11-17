@@ -1,6 +1,6 @@
 flowchart TD
-    P["Shared joint PREVIEW only<br/>Content: atomic or optional BPE<br/>No fog / no features"] --> JW["Race-headed whole-timestep windows<br/>Packed across replays · optional BPE<br/>297 + merges IDs · budget 8192"]
-    JW --> PO["One replay: text / CSV / JSON<br/>Final outcome footer · all scored<br/>Not connected to training"]
+    P["Joint preview / cloud BPE study<br/>3-language dev savings + cost<br/>Train-only fit · generic AR target"] --> JW["Whole-timestep preview windows<br/>Owner/timestep BPE · no features<br/>297 + merges IDs · budget 8192"]
+    JW --> PO["Preview + corpus token reports<br/>Scratch cache · frozen tokenizer<br/>Not connected to training"]
     %% Training schedule: WSD = 500-step warmup, stable middle, final 20% decay.
     %% Default stop and schedule horizons match; the capacity suite deliberately
     %% stops at epoch 3 while retaining each arm's 50-epoch LR/EMA horizon.

@@ -6,6 +6,8 @@
 
 ## Ownership
 
+- `test_tokenizer_study.py` covers corpus BPE equivalence with a full-recount oracle, ranked encoding, persistent fitting resume/identity guards, framing and pooled token metrics, dev-only selection, upload integrity, single-real-replay projection fidelity and a synthetic end-to-end run/resume. It does not fit the real corpus locally.
+
 - `test_sequence_bpe.py` covers the optional joint-preview content BPE: boundaries, frequency stopping, deterministic merges, decoding, compressed whole-timestep windowing, and backward-compatible configuration.
 
 - `test_sequence_preview.py` covers the shared joint pretraining preview, format validation, legacy vocabulary preservation, race overlay/header and metadata lookup, ascending within-player content order, perspective/outcome placement, complete-timestep boundaries, replay packing, per-arm masks, and that no `thesis_shared` module imports a deep-learning framework.

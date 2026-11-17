@@ -25,6 +25,8 @@
 
 ## Ownership
 
+- `scripts/tokenizer_study.py` and `scripts/oscer/` own the user-operated cloud vocabulary study and temporary-bundle upload: train-only shared BPE fitting, a shared vocabulary across three race languages selected for overall/per-race dev compression with vocabulary-cost reporting, a 32k comparator, exact before/after corpus and per-race metrics, scratch cache/environment state and compact durable result/failure retrieval. The study's intended future consumer is a generic AR LLM trained from scratch; no model training or framework migration is implemented here. `research/tokenizer-vocabulary-selection.md` records the literature and design; `config/tokenizer_study.yaml` owns validated study controls. This does not integrate joint BPE into training.
+
 - `packages/thesis-shared/src/thesis_shared/sequence_formats/` and `data/window_policies/` own the additive unconditioned joint sequence preview. `config/sequence_preview.yaml` explicitly selects its new default; `scripts/preview_sequence.py` inspects a few replays without rebuilding manifests. `PRETRAINING_PIPELINE.md` is the human-readable specification of that format (ordering rule, vocabulary, grammar, packing, per-arm masks). Existing training entry points remain conditioned until joint training integration is implemented.
 
 - `Log.md` and `Timelog.xlsx` hold the research journal and time records. `TACCS_Proposal.docx` and `TACCS_Proposal_V1.docx` hold the original and revised cluster functional-testing proposals; these describe proposed work, not implemented architecture or measured cluster capabilities.
@@ -100,6 +102,14 @@
 - Keep preprocessing incremental and bounded to one replay per worker; memory-map persisted arrays during training.
 - Split train/dev/test by replay before selecting local subsets to prevent window leakage.
 - Preserve the full pretraining target grammar: leading perspective-relative `[WIN]`/`[LOSS]`, bounded in-window reconstruction, whole-timestep future continuation, then `[END] [PAD]*` for game end or direct `[PAD]*` for a boundary-truncated horizon.
+
+### OSCER Manual Handoff
+
+- Agents do not have direct SSH access to OSCER. The user manually handles all OSCER connections, file transfers, job submissions, and other remote operations; do not attempt agent-side SSH access.
+- The user's login is `mataeo@sooner.oscer.ou.edu`. The user's local SSH shortcut is `oscer`, so `ssh oscer` connects to that account.
+- Prepare and validate the required scripts, configurations, and upload artifacts locally before handing work to the user.
+- Whenever work is intended to run on OSCER, provide a complete set of copy-and-paste commands for uploading the required files, logging in, submitting the job, checking job status and completion, and downloading both failure diagnostics (including stdout/stderr logs) and successful results. Include the retrieval commands with the initial job handoff so the user has them whether the job fails or completes.
+- Clearly label commands to run in local PowerShell versus the remote OSCER shell, state the required working directories and source/destination paths, and identify any placeholders such as the returned job ID. Base remote status and completion claims on output or files the user supplies.
 
 ## Verification
 

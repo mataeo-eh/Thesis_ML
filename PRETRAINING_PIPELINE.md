@@ -9,6 +9,21 @@ Status: the grammar, vocabulary, windowing and packing are implemented and
 exercised by `scripts/preview_sequence.py` and `tests/test_sequence_preview.py`.
 Neither training loop consumes this format yet.
 
+The separate cloud vocabulary study (`scripts/tokenizer_study.py`,
+`config/tokenizer_study.yaml`, manual handoff in `scripts/oscer/README.md`)
+fits the same shared content BPE on training replays only. One player's sorted
+content at one timestep is a word; structural tokens and timestep/owner changes
+remain hard boundaries. It explores total vocabulary sizes through 65,536 with
+one shared vocabulary across three race languages, selecting the smallest
+inventory retaining 99% of observed dev savings overall and per race (an explicit
+project tolerance). It also reports a 32k comparator, vocabulary-cost indicators
+and per-race fertility. The intended consumer is a generic AR LLM trained from
+scratch. It reports selected before/after counts over the
+full corpus and creates no training manifests.
+See `research/tokenizer-vocabulary-selection.md` for the literature, exact
+selection rule and model-quality validation boundary. With BPE, ascending order
+applies to decoded atomic content, not to compound token IDs.
+
 ## 1. Pipeline stages
 
 | Stage | Function | Module |
@@ -18,7 +33,7 @@ Neither training loop consumes this format yet.
 | Build one joint timestep | `iter_joint_timesteps` | `sequence_formats/unconditioned_joint.py` |
 | Resolve races and outcomes | `resolve_replay_race`, `resolve_replay_outcome` | `data/replay_outcomes.py` |
 | Replay header and outcome footer | `build_replay_header`, `build_outcome_footer` | `sequence_formats/unconditioned_joint.py` |
-| Optional content BPE | `fit_content_bpe`, `ContentBPE.encode` | `sequence_formats/bpe.py` |
+| Optional content BPE | `fit_content_bpe`, `ContentBPE.encode`, `ContentBPETrainer`, `ContentBPE.encode_ids` | `sequence_formats/bpe.py` |
 | Window and pack | `iter_joint_windows` | `data/window_policies/unconditioned_joint.py` |
 | Arm-specific masks | `SequenceWindow.diffusion_clamp_mask`, `.ar_loss_mask` | `sequence_formats/types.py` |
 
